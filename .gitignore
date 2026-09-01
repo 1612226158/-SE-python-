@@ -1,0 +1,9 @@
+﻿# training artifacts & caches (not committed)
+runs/
+images_cache_*_v2.json
+images_cache_train.json
+images_cache_val.json
+__pycache__/
+*.pyc
+*.pth
+*.log
