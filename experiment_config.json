@@ -1,6 +1,6 @@
 {
   "CONFIG_ID": "G-Full",
-  "SEED": 0,
+  "SEED": 1,
   "SMOKE": false,
   "MAX_EPOCHS": 100,
   "RESUME": false,
