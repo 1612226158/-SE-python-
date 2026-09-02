@@ -17,7 +17,7 @@ import time
 
 # ==================== 阈值与休息时长（按需修改） ====================
 GPU_MAX_C = 85.0      # GPU 超过此值 → 休息（RTX 4060 Laptop 降频线约 87°C）
-CPU_MAX_C = 92.0      # CPU 超过此值 → 休息（笔记本 CPU 降频线约 95~100°C）
+CPU_MAX_C = 90.0      # CPU 超过此值 → 休息（笔记本 CPU 降频线约 95~100°C）
 REST_SECONDS = 600    # 休息 10 分钟
 # ====================================================================
 
@@ -76,11 +76,23 @@ def _fmt(v):
     return "?" if v is None else f"{v:.1f}"
 
 
+def _read_twice(read_fn, interval=3.0):
+    """连续读两次取平均，降低单次偶然测量误差；两次都读不到才返回 None。"""
+    vals = []
+    for i in range(2):
+        v = read_fn()
+        if v is not None:
+            vals.append(v)
+        if i == 0:
+            time.sleep(interval)  # 两次测量之间隔一下，避免读到同一瞬时的抖动
+    return (sum(vals) / len(vals)) if vals else None
+
+
 def check_temps_and_rest(tag="", log_info=logging.info, log_warn=logging.warning):
-    """检测温度，任一超过阈值则休息 REST_SECONDS 秒。返回 True 表示休息过。"""
-    gpu = get_gpu_temp_c()
-    cpu = get_cpu_temp_c()
-    log_info(f"[温度守护{tag}] GPU={_fmt(gpu)}°C, CPU={_fmt(cpu)}°C（阈值 GPU>{GPU_MAX_C} / CPU>{CPU_MAX_C}）")
+    """检测温度（GPU/CPU 各读两次取平均），任一超过阈值则休息 REST_SECONDS 秒。返回 True 表示休息过。"""
+    gpu = _read_twice(get_gpu_temp_c)
+    cpu = _read_twice(get_cpu_temp_c)
+    log_info(f"[温度守护{tag}] GPU={_fmt(gpu)}°C, CPU={_fmt(cpu)}°C（两次均值；阈值 GPU>{GPU_MAX_C} / CPU>{CPU_MAX_C}）")
 
     over = []
     if gpu is not None and gpu > GPU_MAX_C:
@@ -94,3 +106,9 @@ def check_temps_and_rest(tag="", log_info=logging.info, log_warn=logging.warning
         log_info("[温度守护] 休息结束，继续")
         return True
     return False
+
+
+if __name__ == '__main__':
+    gpu = get_gpu_temp_c()
+    cpu = get_cpu_temp_c()
+    print(f"[温度守护] GPU={_fmt(gpu)}°C, CPU={_fmt(cpu)}°C（阈值 GPU>{GPU_MAX_C} / CPU>{CPU_MAX_C}）")
