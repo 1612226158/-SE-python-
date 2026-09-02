@@ -6,6 +6,8 @@ import warnings
 import logging
 import os
 import json
+
+import temp_guard  # 温度守护：关键节点检测 CPU/GPU 温度，过高自动休息 10 分钟
 from functools import partial
 
 import pandas as pd
@@ -568,6 +570,10 @@ def train_and_validate(model,
                     'state': state,
                     'renew_class_to_index': renew_class_to_index},
                    LAST_PTH)
+
+        # 温度守护：关键 epoch（30/50/80，0 起算）后检测 CPU/GPU 温度，过高则休息 10 分钟
+        if epoch in (30, 50, 80):
+            temp_guard.check_temps_and_rest(tag=f" epoch{epoch}")
 
         time.sleep(sleep)
         sleep_all_spend += sleep * 2

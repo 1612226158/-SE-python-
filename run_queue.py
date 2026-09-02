@@ -20,6 +20,8 @@ import sys
 import time
 from datetime import datetime
 
+import temp_guard  # 温度守护：任务切换前检测 CPU/GPU 温度，过高自动休息 10 分钟
+
 SRC_V2 = os.path.dirname(os.path.abspath(__file__))
 RUNS = os.path.join(SRC_V2, "runs")
 CONFIG = os.path.join(SRC_V2, "experiment_config.json")
@@ -131,6 +133,13 @@ def main():
         st = process(config_id, seed)
         if st == "done":
             i += 1
+            # 一个任务跑完、下一个开始前：温度过高则休息 10 分钟
+            if i < len(QUEUE):
+                _nxt_c, _nxt_s = QUEUE[i]
+                temp_guard.check_temps_and_rest(
+                    tag=f" 切换前(下一项 {_nxt_c} seed{_nxt_s})",
+                    log_info=log, log_warn=log,
+                )
         elif st == "running":
             time.sleep(300)  # 5 分钟后再查
         else:  # failed
