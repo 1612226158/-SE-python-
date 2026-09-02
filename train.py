@@ -107,14 +107,35 @@ def seed_all(seed):
 
 # 只关闭特定的警告
 warnings.filterwarnings("ignore", message=".*Palette images with Transparency expressed in bytes.*")
-# 设置日志配置
-logging.basicConfig(
-    # filename='logging_garbage_classification.log',    # 日志文件名
-    level=logging.INFO,  # 设置日志级别
-    format='%(asctime)s - %(levelname)s - %(message)s',  # 设置日志格式
-    datefmt='%Y-%m-%d %H:%M:%S',
-    handlers=[logging.FileHandler(os.path.join(RUNS_DIR, f'logging_{RUN_TAG}.log'), mode='a')]
-)
+# 设置日志配置：文件 + 控制台双写（两者都输出全部 INFO 日志）。
+# 背景：PyCharm「Python 控制台」运行时会先给 root logger 预挂 handler，使 basicConfig 变 no-op，
+#       导致 FileHandler 不生效、日志文件 0 字节。这里改为显式清空 root handler 再挂两个 handler，
+#       无论从 PyCharm 控制台 / 普通 Run / 终端 / 子进程启动，都能同时：
+#         1) 写入 runs\logging_<RUN_TAG>.log（UTF-8，事后定位用）；
+#         2) 打印到 sys.stdout（PyCharm 控制台 / 终端实时可见）。
+def _setup_logging():
+    logger = logging.getLogger()  # 根 logger；train.py 全程用 logging.info() 走这里
+    logger.setLevel(logging.INFO)
+    # 清掉已有 handler（含 PyCharm 控制台预挂的、以及重复运行残留的），避免重复打印或 basicConfig 失效
+    for _h in list(logger.handlers):
+        logger.removeHandler(_h)
+        try:
+            _h.close()
+        except Exception:
+            pass
+    _fmt = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+    _fh = logging.FileHandler(os.path.join(RUNS_DIR, f'logging_{RUN_TAG}.log'), mode='a', encoding='utf-8')
+    _fh.setLevel(logging.INFO)
+    _fh.setFormatter(_fmt)
+    _sh = logging.StreamHandler(sys.stdout)
+    _sh.setLevel(logging.INFO)
+    _sh.setFormatter(_fmt)
+    logger.addHandler(_fh)
+    logger.addHandler(_sh)
+    logging.info(f'[日志] 双写已启用：文件 logging_{RUN_TAG}.log + 控制台 stdout')
+
+
+_setup_logging()
 
 batch_size = 64
 sleep = 5
