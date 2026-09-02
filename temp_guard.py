@@ -77,7 +77,11 @@ def _fmt(v):
 
 
 def _read_twice(read_fn, interval=3.0):
-    """连续读两次取平均，降低单次偶然测量误差；两次都读不到才返回 None。"""
+    """连读两次并按误差决定最终值，降低单次偶然误差、偏向保守：
+    - 两次差 < 5°C       → 取较高值（基本一致，宁高勿低）
+    - 5°C ≤ 差 < 10°C    → 取平均值（平滑波动）
+    - 差 ≥ 10°C          → 取较高值（疑似毛刺，宁高勿低）
+    读不到：一次 None 用另一次；两次都 None 返回 None。"""
     vals = []
     for i in range(2):
         v = read_fn()
@@ -85,14 +89,24 @@ def _read_twice(read_fn, interval=3.0):
             vals.append(v)
         if i == 0:
             time.sleep(interval)  # 两次测量之间隔一下，避免读到同一瞬时的抖动
-    return (sum(vals) / len(vals)) if vals else None
+    if not vals:
+        return None
+    if len(vals) == 1:
+        return vals[0]
+    lo, hi = sorted(vals)
+    diff = hi - lo
+    if diff < 5.0:
+        return hi
+    if diff < 10.0:
+        return (lo + hi) / 2.0
+    return hi
 
 
 def check_temps_and_rest(tag="", log_info=logging.info, log_warn=logging.warning):
-    """检测温度（GPU/CPU 各读两次取平均），任一超过阈值则休息 REST_SECONDS 秒。返回 True 表示休息过。"""
+    """检测温度（GPU/CPU 各读两次并按误差取值），任一超过阈值则休息 REST_SECONDS 秒。返回 True 表示休息过。"""
     gpu = _read_twice(get_gpu_temp_c)
     cpu = _read_twice(get_cpu_temp_c)
-    log_info(f"[温度守护{tag}] GPU={_fmt(gpu)}°C, CPU={_fmt(cpu)}°C（两次均值；阈值 GPU>{GPU_MAX_C} / CPU>{CPU_MAX_C}）")
+    log_info(f"[温度守护{tag}] GPU={_fmt(gpu)}°C, CPU={_fmt(cpu)}°C（双读判定；阈值 GPU>{GPU_MAX_C} / CPU>{CPU_MAX_C}）")
 
     over = []
     if gpu is not None and gpu > GPU_MAX_C:
