@@ -69,8 +69,12 @@ if os.path.exists(CONFIG_FILE):
 CONFIG_ID = _cfg.get('CONFIG_ID', _DEFAULTS['CONFIG_ID'])
 SEED = _cfg.get('SEED', _DEFAULTS['SEED'])
 SMOKE = _cfg.get('SMOKE', _DEFAULTS['SMOKE'])
-MAX_EPOCHS = _cfg.get('MAX_EPOCHS', _DEFAULTS['MAX_EPOCHS'])
-RESUME = _cfg.get('RESUME', _DEFAULTS['RESUME'])
+if SMOKE:
+    MAX_EPOCHS = 100
+    RESUME = False
+else:
+    MAX_EPOCHS = _cfg.get('MAX_EPOCHS', _DEFAULTS['MAX_EPOCHS'])
+    RESUME = _cfg.get('RESUME', _DEFAULTS['RESUME'])
 AUTO = _cfg.get('AUTO', _DEFAULTS['AUTO'])
 UNFREEZE1_EPOCH = _cfg.get('UNFREEZE1_EPOCH', _DEFAULTS['UNFREEZE1_EPOCH'])
 UNFREEZE2_EPOCH = _cfg.get('UNFREEZE2_EPOCH', _DEFAULTS['UNFREEZE2_EPOCH'])
@@ -114,6 +118,8 @@ warnings.filterwarnings("ignore", message=".*Palette images with Transparency ex
 #         1) 写入 runs\logging_<RUN_TAG>.log（UTF-8，事后定位用）；
 #         2) 打印到 sys.stdout（PyCharm 控制台 / 终端实时可见）。
 def _setup_logging():
+    # 只在主进程调用（见 if __name__ == '__main__'）；DataLoader 的 spawn worker 会重新
+    # import 本模块，若在模块层调用则每个 worker 都执行一遍、重复打印。
     logger = logging.getLogger()  # 根 logger；train.py 全程用 logging.info() 走这里
     logger.setLevel(logging.INFO)
     # 清掉已有 handler（含 PyCharm 控制台预挂的、以及重复运行残留的），避免重复打印或 basicConfig 失效
@@ -124,18 +130,17 @@ def _setup_logging():
         except Exception:
             pass
     _fmt = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+    # 文件 handler：INFO 及以上全落盘（事后定位用）
     _fh = logging.FileHandler(os.path.join(RUNS_DIR, f'logging_{RUN_TAG}.log'), mode='a', encoding='utf-8')
     _fh.setLevel(logging.INFO)
     _fh.setFormatter(_fmt)
+    # 控制台 handler：只输出 WARNING 及以上（异常/报错），INFO 不进控制台，避免刷屏；
+    # tqdm 进度条直接写 stderr、不经 logging，不受影响，控制台保持和原本一样只有进度条 + 报错。
     _sh = logging.StreamHandler(sys.stdout)
-    _sh.setLevel(logging.INFO)
+    _sh.setLevel(logging.WARNING)
     _sh.setFormatter(_fmt)
     logger.addHandler(_fh)
     logger.addHandler(_sh)
-    logging.info(f'[日志] 双写已启用：文件 logging_{RUN_TAG}.log + 控制台 stdout')
-
-
-_setup_logging()
 
 batch_size = 64
 sleep = 5
@@ -886,6 +891,7 @@ def main(num_epochs, epoch_start=0, checkpoint=None, optimizer_scheduler_YN=Fals
 
 
 if __name__ == '__main__':
+    _setup_logging()  # 主进程才配置日志；spawn worker 不进入此块，不会重复打印
     preset = PRESETS[CONFIG_ID]
     seed_all(SEED)
     state = 1
