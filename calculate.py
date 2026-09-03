@@ -927,7 +927,7 @@ def get_class_weight(
         parent_name = id_to_main_class.get(str(child_id), f"私有类-{child_id}")
         parent_to_public[parent_name] = [child_id]
 
-    print(f"{parent_to_public=}")
+    # print(f"{parent_to_public=}")
 
     # 计算每个父类的样本数量
     for parent_name in renew_class_to_index:
