@@ -31,18 +31,86 @@ ResNetTransformer.py —— 修正版 Transformer 分类模型（独立路线，
 import torch
 import torch.nn as nn
 from torchvision.models import resnext50_32x4d
-from torch.nn import TransformerEncoder, TransformerEncoderLayer
 
 from src_v2 import merged_dict
 from src_v2.SE_Block import SEBlock as NewSEBlock
 
 
+class DropPath(nn.Module):
+    """随机深度（Stochastic Depth）：训练时按概率丢弃整个残差分支，正则化防过拟合。
+
+    评估模式恒等；训练时以 keep_prob 概率保留、并除以 keep_prob 保持期望不变。
+    """
+    def __init__(self, drop_prob=0.0):
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        if self.drop_prob <= 0.0 or not self.training:
+            return x
+        keep_prob = 1.0 - self.drop_prob
+        # x: [seq, batch, d_model] → 掩码 [1, batch, 1]，逐样本（batch）丢弃整个残差
+        shape = (1, x.shape[1], 1)
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        return x * random_tensor.floor() / keep_prob
+
+
+class _TransformerBlock(nn.Module):
+    """pre-LN Transformer 块：LN→多头注意力→DropPath，LN→FFN(GELU)→DropPath。
+
+    相对 nn.TransformerEncoderLayer（post-LN、默认 relu、无 DropPath）：
+      - pre-LN（norm_first）更稳、深层更鲁棒；
+      - FFN 用 GELU（ViT 标准）；
+      - 两个残差分支都加 DropPath（随机深度）。
+    """
+    def __init__(self, d_model, nhead, dim_feedforward, dropout, drop_path_rate):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=False)
+        self.drop_path1 = DropPath(drop_path_rate)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model),
+            nn.Dropout(dropout),
+        )
+        self.drop_path2 = DropPath(drop_path_rate)
+
+    def forward(self, x):
+        # x: [seq, batch, d_model]
+        x_norm = self.norm1(x)
+        x = x + self.drop_path1(self.attn(x_norm, x_norm, x_norm)[0])
+        x = x + self.drop_path2(self.ffn(self.norm2(x)))
+        return x
+
+
+class TransformerEncoderStack(nn.Module):
+    """堆叠多个 pre-LN 块组成的编码器（替代 nn.TransformerEncoder，支持随机深度）。"""
+    def __init__(self, num_layers, d_model, nhead, dim_feedforward, dropout, drop_path_rate):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            _TransformerBlock(d_model, nhead, dim_feedforward, dropout, drop_path_rate)
+            for _ in range(num_layers)
+        ])
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
 class ResNetTransformerV2(nn.Module):
     """修正版：ViT 式多 token Transformer（替代 ResNet.py 里 seq_len=1 的退化版）。
 
-    与原版的差异只有两点：
+    与原版的核心差异：
       1) __init__ 多一个可学习位置编码 self.pos_embed；
       2) forward 不再 avgpool，而是把 7×7 特征图展平成 49 个 token 再进 Transformer。
+    Transformer 部件做了三处改进（相对 nn.TransformerEncoder）：
+      A) FFN 用 GELU（原默认 relu）；
+      B) pre-LN（更稳、为将来加深留余地）；
+      D) patch-embedding dropout 0.5→0.1 + 每层随机深度 DropPath。
     其余（backbone / 多区域SE / 解耦层 / 分类头 / 渐进式解冻方法）与原版一致，保持可无缝替换。
     """
     def __init__(self, transformer_layers=3,
@@ -52,6 +120,7 @@ class ResNetTransformerV2(nn.Module):
                  regions=[1, 2],       # 多区域SE开关: [1,2]=多区域 / [1]=标准SE / None=无SE(Identity)
                  use_decouple=True,     # 简化解耦层开关: False=直通
                  num_patches=49,        # ResNeXt50@224 → 7×7=49 个 patch token
+                 drop_path_rate=0.1,    # 随机深度：每层残差丢弃概率
                  ):
         super().__init__()
 
@@ -75,15 +144,19 @@ class ResNetTransformerV2(nn.Module):
         # 关键修正：不做 avgpool，直接把每个空间位置当 patch token
         self.projection = nn.Linear(in_features, d_model)                    # 每个 patch: C → d_model
         self.pos_embed = nn.Parameter(torch.randn(1, num_patches, d_model) * 0.02)  # 可学习位置编码
-        self.dropout1 = nn.Dropout(0.5)
+        self.dropout1 = nn.Dropout(0.1)     # patch-embedding dropout（ViT 标准 0.1；原 0.5 偏高）
         self.dropout2 = nn.Dropout(0.5)
 
-        encoder_layer = TransformerEncoderLayer(d_model=d_model,
-                                                nhead=nhead,
-                                                dropout=0.3)
-        # Transformer 开关：layers=0 时直通（消融用）
-        self.transformer = TransformerEncoder(encoder_layer,
-                                              num_layers=transformer_layers) if transformer_layers > 0 else nn.Identity()
+        # Transformer 开关：layers=0 时直通（消融 G-NoTF / 无 Transformer 基线）
+        # 改进（相对 nn.TransformerEncoder）：pre-LN + GELU FFN + 随机深度 DropPath
+        self.transformer = TransformerEncoderStack(
+            num_layers=transformer_layers,
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=4 * d_model,
+            dropout=0.3,
+            drop_path_rate=drop_path_rate,
+        ) if transformer_layers > 0 else nn.Identity()
 
         # 父类分类器
         self.parent_classifier = nn.Linear(d_model, num_parent_classes)
