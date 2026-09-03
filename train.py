@@ -456,6 +456,7 @@ def train_and_validate(model,
             best_epoch = epoch
             train_acc_at_best = train_parent_acc
             torch.save({'epoch': epoch, 'config_id': CONFIG_ID, 'seed': SEED,
+                        'arch': type(model).__name__,
                         'state_dict': model.state_dict(), 'val_acc': val_accuracy[0]},
                        BEST_PTH)
             logging.info(f'best 刷新: epoch {epoch}, val_acc {val_accuracy[0]:.4f}% -> {BEST_PTH}')
@@ -564,6 +565,7 @@ def train_and_validate(model,
 
         # 每轮保存断点（state_dict + optimizer + scheduler），支持中途暂停后续跑
         torch.save({'epoch': epoch, 'config_id': CONFIG_ID, 'seed': SEED,
+                    'arch': type(model).__name__,
                     'state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'scheduler_state_dict': scheduler.state_dict(),
@@ -896,6 +898,21 @@ def main(num_epochs, epoch_start=0, checkpoint=None, optimizer_scheduler_YN=Fals
     # torch.save(checkpoint, pth_file_name)
 
 
+def _check_arch(checkpoint, model):
+    """自适应 arch 校验：断点记录的架构必须与当前模型一致，防止 RESUME 静默跑错模型。
+
+    - 断点有 arch 且与当前模型不同 → 直接报错拒绝续跑；
+    - 断点无 arch（旧格式历史断点）→ 警告并放行（按当前模型加载）。
+    arch 值来自 type(model).__name__，无需硬编码，切 V2 后自动适配。
+    """
+    ck_arch = checkpoint.get('arch')
+    cur_arch = type(model).__name__
+    if ck_arch is None:
+        logging.warning(f'[arch] 断点无 arch 标记（旧格式），按当前模型 {cur_arch} 加载')
+    elif ck_arch != cur_arch:
+        raise SystemExit(f'[arch] 断点架构 {ck_arch} ≠ 当前模型 {cur_arch}，拒绝续跑（防静默跑错模型）')
+
+
 if __name__ == '__main__':
     _setup_logging()  # 主进程才配置日志；spawn worker 不进入此块，不会重复打印
     preset = PRESETS[CONFIG_ID]
@@ -945,6 +962,7 @@ if __name__ == '__main__':
             if 'model' in checkpoint:
                 # 旧格式：整个模型对象
                 model = checkpoint['model']
+                _check_arch(checkpoint, model)
                 model.load_state_dict(checkpoint['model_state_dict'])
             else:
                 # 新格式：state_dict 断点文件
@@ -955,6 +973,7 @@ if __name__ == '__main__':
                                           nhead=nhead,
                                           regions=preset['regions'],
                                           use_decouple=preset['use_decouple'])
+                _check_arch(checkpoint, model)
                 model.load_state_dict(checkpoint['state_dict'])
             logging.info(f'RESUME: 从 {_resume_path} 继续, epoch {epoch_start}, state={state}')
         else:
