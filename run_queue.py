@@ -29,14 +29,19 @@ TRAIN = os.path.join(SRC_V2, "train.py")
 LOG = os.path.join(RUNS, "queue_log.txt")
 PYTHON = sys.executable  # 用启动本脚本的同一个 Python（保证 torch 1.11 环境）
 
-# G 系列执行队列（每配置 2 种子；G-Full seed2 暂缓、S-NoProg seed2 暂缓——用户 2026-09-03 定 S-NoProg 先跑 seed1 再说）
+# G 系列执行队列（动态调整中，2026-09-03 晚更新）
+# 现状：S-NoProg(全解冻) 明显领先 G-Full(渐进式) → 先跑 G-Full-CAWR 裁决"渐进式 vs 全解冻"
+# （CAWR + lr1e-4，与 S-NoProg 对齐、只差解冻变量）；之后续 S-NoProg seed1 到收敛拿主模型数字；
+# G-NoTF / G-SingleSE / G-PureBB 暂缓（等基座定后重排）。
 QUEUE = [
-    ("G-Full", 1),
-    ("G-NoSE", 1), ("G-NoSE", 2),
-    ("S-NoProg", 1),
-    ("G-NoTF", 1), ("G-NoTF", 2),
-    ("G-SingleSE", 1), ("G-SingleSE", 2),
-    ("G-PureBB", 1), ("G-PureBB", 2),
+    ("G-Full", 1),                       # ✅ 已完成
+    ("G-NoSE", 1), ("G-NoSE", 2),       # ✅ 已完成
+    ("G-Full-CAWR", 1),                 # 🔄 下一步：渐进式 + CAWR + lr1e-4，裁决用
+    ("S-NoProg", 1),                    # ⏸ 之后续跑到收敛（全解冻主模型）
+    # 以下暂缓（等 G-Full-CAWR 结果定基座再重排）：
+    # ("G-NoTF", 1), ("G-NoTF", 2),          # Transformer 已定弱化，低价值
+    # ("G-SingleSE", 1), ("G-SingleSE", 2),  # SE 消融（多区域 vs 单尺度），等基座
+    # ("G-PureBB", 1), ("G-PureBB", 2),      # 头部总贡献，等基座
 ]
 
 FRESH_SECONDS = 15 * 60  # checkpoint 最近 15 分钟有写 = 训练进行中
