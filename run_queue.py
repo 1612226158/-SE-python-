@@ -29,11 +29,11 @@ TRAIN = os.path.join(SRC_V2, "train.py")
 LOG = os.path.join(RUNS, "queue_log.txt")
 PYTHON = sys.executable  # 用启动本脚本的同一个 Python（保证 torch 1.11 环境）
 
-# G 系列执行队列（每配置 2 种子；G-Full seed0 已跑、seed1 正在跑，seed2 暂缓）
+# G 系列执行队列（每配置 2 种子；G-Full seed2 暂缓、S-NoProg seed2 暂缓——用户 2026-09-03 定 S-NoProg 先跑 seed1 再说）
 QUEUE = [
     ("G-Full", 1),
     ("G-NoSE", 1), ("G-NoSE", 2),
-    ("S-NoProg", 1), ("S-NoProg", 2),
+    ("S-NoProg", 1),
     ("G-NoTF", 1), ("G-NoTF", 2),
     ("G-SingleSE", 1), ("G-SingleSE", 2),
     ("G-PureBB", 1), ("G-PureBB", 2),
