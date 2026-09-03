@@ -93,6 +93,9 @@ PRESETS = {
 unfreeze_mode = PRESETS[CONFIG_ID]['unfreeze']
 # state2/3 的调度器：'cawr'=余弦退火重启（G-Full-CAWR 用，与 S-NoProg 同类型，隔离"RLRP 地板"混淆）；缺省='rlrp'（原行为）
 SCHEDULER_MODE = PRESETS[CONFIG_ID].get('scheduler', 'rlrp')
+# 渐进式解冻的 backbone/head 学习率：G-Full-CAWR 用 1e-4（对齐 S-NoProg，隔离 lr 幅度混淆）；其余默认 5e-6/5e-5
+BACKBONE_LR = 1e-4 if SCHEDULER_MODE == 'cawr' else 5e-6
+HEAD_LR = 1e-4 if SCHEDULER_MODE == 'cawr' else 5e-5
 
 
 def _make_state_scheduler(optimizer):
@@ -339,7 +342,7 @@ def train_and_validate(model,
             # 固定 epoch 触发解冻（替换原 should_update_simple 自适应判据，保证消融可比）
             if state == 1 and epoch >= UNFREEZE1_EPOCH:
                 model.unfreeze_layer4()
-                optimizer = optim.AdamW(model.get_grouped_params(backbone_lr=5e-6, head_lr=5e-5),
+                optimizer = optim.AdamW(model.get_grouped_params(backbone_lr=BACKBONE_LR, head_lr=HEAD_LR),
                                         weight_decay=1e-2,
                                         )
                 scheduler = _make_state_scheduler(optimizer)
@@ -347,7 +350,7 @@ def train_and_validate(model,
                 logging.info(f'state1 -> state2 于 epoch {epoch}（固定触发）')
             elif state == 2 and epoch >= UNFREEZE2_EPOCH:
                 model.unfreeze_all()
-                optimizer = optim.AdamW(model.get_grouped_params(backbone_lr=5e-6, head_lr=5e-5),
+                optimizer = optim.AdamW(model.get_grouped_params(backbone_lr=BACKBONE_LR, head_lr=HEAD_LR),
                                         weight_decay=1e-2,
                                         )
                 scheduler = _make_state_scheduler(optimizer)
@@ -999,7 +1002,7 @@ if __name__ == '__main__':
                                 weight_decay=5e-4,
                                 )
     else:
-        optimizer = optim.AdamW(model.get_grouped_params(backbone_lr=5e-6, head_lr=5e-5),
+        optimizer = optim.AdamW(model.get_grouped_params(backbone_lr=BACKBONE_LR, head_lr=HEAD_LR),
                                 weight_decay=1e-2,
                                 )
     if key in ['y', 'yes']:
