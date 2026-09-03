@@ -992,7 +992,14 @@ if __name__ == '__main__':
     print(f"设置优化器===")
     for i, m in enumerate(model.resnet_backbone):
         print(i, type(m))
-    # optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4, betas=(0.9, 0.999))
+    # 续跑修复：先把模型解冻到断点记录的 state，再建优化器。
+    # 否则 state=2/3 续跑时 get_grouped_params 拿到的是空 backbone 组，
+    # optimizer.load_state_dict 会报 "parameter group doesn't match the size"。
+    if unfreeze_mode == 'progressive':
+        if state >= 3:
+            model.unfreeze_all()
+        elif state == 2:
+            model.unfreeze_layer4()
     # state
     if unfreeze_mode == 'none':
         # S-NoProg：全程全解冻 + 单一 AdamW（常规训练对照）
