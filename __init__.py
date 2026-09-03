@@ -90,6 +90,7 @@ def save_model_after_epoch(epoch,
         'epoch': epoch,
         'config_id': config_id,  # 实验标识（归档后可溯源）
         'seed': seed,
+        'arch': type(model).__name__,  # 架构标记（与 train.py 的 _check_arch 配合，防静默跑错模型）
         'model': model,  # 保存整个模型对象
         'model_state_dict': model.state_dict(),  # 模型权重
         'scheduler_state_dict': scheduler.state_dict(),  # 修复：续跑恢复调度器状态
