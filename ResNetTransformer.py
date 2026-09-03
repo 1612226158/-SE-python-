@@ -111,6 +111,9 @@ class ResNetTransformerV2(nn.Module):
       A) FFN 用 GELU（原默认 relu）；
       B) pre-LN（更稳、为将来加深留余地）；
       D) patch-embedding dropout 0.5→0.1 + 每层随机深度 DropPath。
+    次级消融开关（做 V2 次级消融时用，见 task_plan 🧪 块）：
+      E) use_cls_token=False/True → V2-Mean(mean-pool) vs V2-CLS([CLS] token 读出)；
+      C) pos_embed_type='1d'/'2d' → V2-1Dpos(1D learned) vs V2-2Dpos(行列解耦)。
     其余（backbone / 多区域SE / 解耦层 / 分类头 / 渐进式解冻方法）与原版一致，保持可无缝替换。
     """
     def __init__(self, transformer_layers=3,
@@ -121,6 +124,8 @@ class ResNetTransformerV2(nn.Module):
                  use_decouple=True,     # 简化解耦层开关: False=直通
                  num_patches=49,        # ResNeXt50@224 → 7×7=49 个 patch token
                  drop_path_rate=0.1,    # 随机深度：每层残差丢弃概率
+                 use_cls_token=False,   # 读出方式（次级消融 V2-Mean vs V2-CLS）：False=mean-pool，True=[CLS]
+                 pos_embed_type='1d',   # 位置编码（次级消融 V2-1Dpos vs V2-2Dpos）：'1d' | '2d' 行列解耦
                  ):
         super().__init__()
 
@@ -143,7 +148,24 @@ class ResNetTransformerV2(nn.Module):
 
         # 关键修正：不做 avgpool，直接把每个空间位置当 patch token
         self.projection = nn.Linear(in_features, d_model)                    # 每个 patch: C → d_model
-        self.pos_embed = nn.Parameter(torch.randn(1, num_patches, d_model) * 0.02)  # 可学习位置编码
+
+        # 位置编码（次级消融 V2-1Dpos vs V2-2Dpos）
+        assert pos_embed_type in ('1d', '2d'), f'pos_embed_type 只支持 1d/2d，收到 {pos_embed_type}'
+        self.pos_embed_type = pos_embed_type
+        if pos_embed_type == '1d':
+            self.pos_embed = nn.Parameter(torch.randn(1, num_patches, d_model) * 0.02)  # 1D learned（ViT-B 做法）
+            self.row_emb = self.col_emb = None
+        else:  # '2d' 行列解耦：位置(r,c) = row[r] + col[c]
+            grid = int(round(num_patches ** 0.5))
+            assert grid * grid == num_patches, f'2D 编码需要 num_patches 为平方数，收到 {num_patches}'
+            self.row_emb = nn.Parameter(torch.randn(1, grid, d_model) * 0.02)
+            self.col_emb = nn.Parameter(torch.randn(1, grid, d_model) * 0.02)
+            self.pos_embed = None
+
+        # [CLS] token（次级消融 V2-Mean vs V2-CLS）：use_cls_token=True 时启用
+        self.use_cls_token = use_cls_token
+        self.cls_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02) if use_cls_token else None
+
         self.dropout1 = nn.Dropout(0.1)     # patch-embedding dropout（ViT 标准 0.1；原 0.5 偏高）
         self.dropout2 = nn.Dropout(0.5)
 
@@ -178,12 +200,28 @@ class ResNetTransformerV2(nn.Module):
         B, C, H, W = x.shape
         x = x.flatten(2).transpose(1, 2)                 # [B, H*W, C] = N 个 patch token
         x = self.projection(x)                           # [B, N, d_model]
-        x = x + self.pos_embed[:, :x.size(1)]            # 加位置编码（按实际 token 数截取，容错）
+
+        # 位置编码：1D（逐 token 加）或 2D（行列解耦 row[r]+col[c]）
+        if self.pos_embed_type == '1d':
+            x = x + self.pos_embed[:, :x.size(1)]
+        else:
+            pos2d = self.row_emb[:, :H].unsqueeze(2) + self.col_emb[:, :W].unsqueeze(1)  # [1, H, W, d_model]
+            x = x + pos2d.flatten(1, 2)                  # [1, H*W, d_model] → 广播到 [B, N, d_model]
+
         x = self.dropout1(x)
-        x = self.transformer(x.transpose(0, 1))          # [N, B, d_model] 多 token 真自注意力
-        x = x.transpose(0, 1)                            # [B, N, d_model]
-        # 平均池化所有 patch token 得到全局特征（也可改用 [CLS] token，此处先用 mean 简化）
-        global_feature = x.mean(dim=1)                   # [B, d_model]
+
+        # 读出方式（次级消融 V2-Mean vs V2-CLS）
+        if self.use_cls_token:
+            cls = self.cls_token.expand(B, -1, -1)        # [B, 1, d_model]
+            x = torch.cat([cls, x], dim=1)                # [B, 1+N, d_model]
+
+        x = self.transformer(x.transpose(0, 1))          # [1+N 或 N, B, d_model] 多 token 真自注意力
+        x = x.transpose(0, 1)                            # [B, 1+N 或 N, d_model]
+
+        if self.use_cls_token:
+            global_feature = x[:, 0]                      # 取 [CLS] 输出作为全局特征
+        else:
+            global_feature = x.mean(dim=1)                # mean-pool 所有 patch token
         global_feature = self.dropout2(global_feature)
         disentangled_feature = self.disentangle_layer(global_feature)
         parent_output = self.parent_classifier(disentangled_feature)
