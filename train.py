@@ -83,6 +83,7 @@ UNFREEZE2_EPOCH = _cfg.get('UNFREEZE2_EPOCH', _DEFAULTS['UNFREEZE2_EPOCH'])
 
 PRESETS = {
     'G-Full':     dict(regions=[1, 2], transformer_layers=3, use_decouple=True,  unfreeze='progressive'),
+    'G-Full-CAWR':dict(regions=[1, 2], transformer_layers=3, use_decouple=True,  unfreeze='progressive', scheduler='cawr'),
     'G-NoTF':     dict(regions=[1, 2], transformer_layers=0, use_decouple=True,  unfreeze='progressive'),
     'G-NoSE':     dict(regions=None,    transformer_layers=3, use_decouple=True,  unfreeze='progressive'),
     'G-SingleSE': dict(regions=[1],     transformer_layers=3, use_decouple=True,  unfreeze='progressive'),
@@ -90,6 +91,16 @@ PRESETS = {
     'S-NoProg':   dict(regions=[1, 2], transformer_layers=3, use_decouple=True,  unfreeze='none'),
 }
 unfreeze_mode = PRESETS[CONFIG_ID]['unfreeze']
+# state2/3 的调度器：'cawr'=余弦退火重启（G-Full-CAWR 用，与 S-NoProg 同类型，隔离"RLRP 地板"混淆）；缺省='rlrp'（原行为）
+SCHEDULER_MODE = PRESETS[CONFIG_ID].get('scheduler', 'rlrp')
+
+
+def _make_state_scheduler(optimizer):
+    """构建 state2/3 的调度器：SCHEDULER_MODE='cawr' 时用 CAWR，否则用 RLRP（原行为不变）。"""
+    if SCHEDULER_MODE == 'cawr':
+        return CosineAnnealingWarmRestarts(optimizer, T_0=5, T_mult=2, eta_min=1e-6)
+    return ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2,
+                             threshold=0.1, min_lr=1e-6, verbose=True)
 
 # 路径全部基于本文件定位（与 PyCharm 工作目录无关）
 SRC_V2_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -331,15 +342,7 @@ def train_and_validate(model,
                 optimizer = optim.AdamW(model.get_grouped_params(backbone_lr=5e-6, head_lr=5e-5),
                                         weight_decay=1e-2,
                                         )
-                scheduler = ReduceLROnPlateau(
-                    optimizer,
-                    mode='max',  # 0-100 越大越好
-                    factor=0.5,  # 降幅温和一点，每次减半
-                    patience=2,
-                    threshold=0.1,  # 提升不到0.1%就算停滞
-                    min_lr=1e-6,
-                    verbose=True
-                )
+                scheduler = _make_state_scheduler(optimizer)
                 state += 1
                 logging.info(f'state1 -> state2 于 epoch {epoch}（固定触发）')
             elif state == 2 and epoch >= UNFREEZE2_EPOCH:
@@ -347,15 +350,7 @@ def train_and_validate(model,
                 optimizer = optim.AdamW(model.get_grouped_params(backbone_lr=5e-6, head_lr=5e-5),
                                         weight_decay=1e-2,
                                         )
-                scheduler = ReduceLROnPlateau(
-                    optimizer,
-                    mode='max',  # 0-100 越大越好
-                    factor=0.5,
-                    patience=2,
-                    threshold=0.1,
-                    min_lr=1e-6,
-                    verbose=True
-                )
+                scheduler = _make_state_scheduler(optimizer)
                 state += 1
                 logging.info(f'state2 -> state3 于 epoch {epoch}（固定触发）')
         TV__time_spend_start = time.time()
@@ -830,16 +825,8 @@ def main(num_epochs, epoch_start=0, checkpoint=None, optimizer_scheduler_YN=Fals
             eta_min=1e-6  # 最低学习率
         )
     else:
-        # 续跑且 state>=2 时：建对应类型的调度器，load_state_dict 才能对上
-        scheduler = ReduceLROnPlateau(
-            optimizer,
-            mode='max',  # 0-100 越大越好
-            factor=0.5,
-            patience=2,
-            threshold=0.1,
-            min_lr=1e-6,
-            verbose=True
-        )
+        # 续跑且 state>=2 时：建对应类型的调度器（G-Full-CAWR 用 CAWR，其余 RLRP），load_state_dict 才能对上
+        scheduler = _make_state_scheduler(optimizer)
     if optimizer_scheduler_YN:
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         if checkpoint is not None and 'scheduler_state_dict' in checkpoint:
