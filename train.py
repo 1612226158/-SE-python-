@@ -59,6 +59,11 @@ _DEFAULTS = {
     'UNFREEZE1_EPOCH': 30,   # 固定解冻触发：state1→2
     'UNFREEZE2_EPOCH': 60,   # state2→3
 }
+
+# temp_guard_lis = (25, 50, 75, 99)
+temp_guard_lis = (10, 20, 30, 40, 50, 60, 70, 80, 90)
+
+
 _cfg = {}
 if os.path.exists(CONFIG_FILE):
     try:
@@ -572,7 +577,7 @@ def train_and_validate(model,
                    LAST_PTH)
 
         # 温度守护：关键 epoch（30/50/80，0 起算）后检测 CPU/GPU 温度，过高则休息 10 分钟
-        if epoch in (30, 50, 80):
+        if epoch in temp_guard_lis:
             temp_guard.check_temps_and_rest(tag=f" epoch{epoch}")
 
         time.sleep(sleep)
