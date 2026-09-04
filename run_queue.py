@@ -15,6 +15,7 @@ run_queue.py —— G 系列实验自动排队器
 import glob
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -50,6 +51,11 @@ LONG_CONFIGS = {
     "G-Full-CAWR-Long": 160,
 }
 SNAPSHOT_EPOCH = 100  # Long 配置跑到该轮时，自动存档 100 轮快照
+
+# Long 配置 → 其续跑的"源配置"：从源配置的 100 轮断点续跑，省去重跑前 100 轮
+LONG_BASE = {
+    "G-Full-CAWR-Long": "G-Full-CAWR",
+}
 
 FRESH_SECONDS = 15 * 60  # checkpoint 最近 15 分钟有写 = 训练进行中
 
@@ -115,6 +121,20 @@ def run_once(config_id, seed, resume):
     return r.returncode
 
 
+def ensure_long_resume(config_id, seed):
+    """Long 配置：若自己没有断点、但源配置有断点，则复制过来续跑（省去重跑前 100 轮）。"""
+    base = LONG_BASE.get(config_id)
+    if base is None:
+        return
+    long_pth = os.path.join(RUNS, f"checkpoint_{config_id}_seed{seed}_last.pth")
+    if os.path.exists(long_pth):
+        return  # 自己已有断点，不覆盖
+    src_pth = os.path.join(RUNS, f"checkpoint_{base}_seed{seed}_last.pth")
+    if os.path.exists(src_pth):
+        shutil.copy(src_pth, long_pth)
+        log(f"📌 {config_id} seed{seed} 从 {base} seed{seed} 的断点续跑（已复制 checkpoint）")
+
+
 def process(config_id, seed):
     if done(config_id, seed):
         log(f"跳过已完成 {config_id} seed{seed}")
@@ -123,6 +143,7 @@ def process(config_id, seed):
         log(f"⏳ {config_id} seed{seed} 正在训练，等待 5 分钟")
         return "running"
 
+    ensure_long_resume(config_id, seed)  # Long 配置：从源配置断点续跑
     resume = os.path.exists(os.path.join(RUNS, f"checkpoint_{config_id}_seed{seed}_last.pth"))
     rc = run_once(config_id, seed, resume)
     if rc == 0 and done(config_id, seed):
