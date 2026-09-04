@@ -29,20 +29,27 @@ TRAIN = os.path.join(SRC_V2, "train.py")
 LOG = os.path.join(RUNS, "queue_log.txt")
 PYTHON = sys.executable  # 用启动本脚本的同一个 Python（保证 torch 1.11 环境）
 
-# G 系列执行队列（动态调整中，2026-09-03 晚更新）
-# 现状：S-NoProg(全解冻) 明显领先 G-Full(渐进式) → 先跑 G-Full-CAWR 裁决"渐进式 vs 全解冻"
-# （CAWR + lr1e-4，与 S-NoProg 对齐、只差解冻变量）；之后续 S-NoProg seed1 到收敛拿主模型数字；
-# G-NoTF / G-SingleSE / G-PureBB 暂缓（等基座定后重排）。
+# G 系列执行队列（2026-09-04 更新：G-Full-CAWR 成主模型，渐进式解冻坐实）
 QUEUE = [
-    ("G-Full", 1),                       # ✅ 已完成
-    ("G-NoSE", 1), ("G-NoSE", 2),       # ✅ 已完成
-    ("G-Full-CAWR", 1),                 # 🔄 下一步：渐进式 + CAWR + lr1e-4，裁决用
-    ("S-NoProg", 1),                    # ⏸ 之后续跑到收敛（全解冻主模型）
-    # 以下暂缓（等 G-Full-CAWR 结果定基座再重排）：
-    # ("G-NoTF", 1), ("G-NoTF", 2),          # Transformer 已定弱化，低价值
-    # ("G-SingleSE", 1), ("G-SingleSE", 2),  # SE 消融（多区域 vs 单尺度），等基座
-    # ("G-PureBB", 1), ("G-PureBB", 2),      # 头部总贡献，等基座
+    ("G-Full", 1),                             # ✅ 已完成（RLRP 旧基线，仅留档）
+    ("G-NoSE", 1), ("G-NoSE", 2),             # ✅ 已完成（RLRP 旧基线，仅留档）
+    ("G-Full-CAWR", 1),                       # ✅ 已完成（70.82%@99，n=1）
+    ("S-NoProg", 1),                          # 🔄 续跑到收敛（渐进式 vs 全解冻对照）
+    ("G-Full-CAWR", 2),                       # 主模型 seed2 → n=2 拿 mean±std
+    ("G-NoSE-CAWR", 1), ("G-NoSE-CAWR", 2),  # SE 消融（CAWR 基线，核心卖点）
+    ("G-Full-CAWR-Long", 1),                  # Long：跑到 160，100 轮自动存档快照
+    # 可选/暂缓：
+    # ("S-NoProg", 2),                        # 渐进式 vs 全解冻 n=2（暂缓）
+    # ("G-NoTF", 1), ("G-NoTF", 2),          # Transformer 已定弱化
+    # ("G-SingleSE", 1), ("G-SingleSE", 2),
+    # ("G-PureBB", 1), ("G-PureBB", 2),
 ]
+
+# Long 配置：目标轮数（默认 100）。这类配置跑到 SNAPSHOT_EPOCH 轮时，train.py 会自动把该轮 checkpoint/metrics 复制存档。
+LONG_CONFIGS = {
+    "G-Full-CAWR-Long": 160,
+}
+SNAPSHOT_EPOCH = 100  # Long 配置跑到该轮时，自动存档 100 轮快照
 
 FRESH_SECONDS = 15 * 60  # checkpoint 最近 15 分钟有写 = 训练进行中
 
@@ -59,8 +66,10 @@ def done(config_id, seed):
     # 主标记：results JSON（训练结束生成，RUN_TAG 命名，不归档）
     if os.path.exists(os.path.join(RUNS, f"results_{tag}.json")):
         return True
-    # 兜底：扫描当前 + 所有归档的 metrics_record*.csv，找该配置该种子的 epoch=99 行
-    prefix = f"{config_id},{seed},99,"
+    # 兜底：扫描当前 + 所有归档的 metrics_record*.csv，找该配置该种子的"最后轮"行
+    # （普通配置=99；Long 配置=目标轮数-1，避免 Long 跑到 99 就被误判"已完成"）
+    target_epoch = LONG_CONFIGS.get(config_id, 100) - 1
+    prefix = f"{config_id},{seed},{target_epoch},"
     for mr in glob.glob(os.path.join(RUNS, "metrics_record*.csv")):
         try:
             with open(mr, encoding="utf-8") as f:
@@ -80,16 +89,21 @@ def in_progress(config_id, seed):
 
 
 def write_config(config_id, seed, resume):
+    max_epochs = LONG_CONFIGS.get(config_id, 100)
     cfg = {
         "CONFIG_ID": config_id,
         "SEED": seed,
         "SMOKE": False,
-        "MAX_EPOCHS": 100,
+        "MAX_EPOCHS": max_epochs,
         "RESUME": resume,
         "AUTO": True,
         "UNFREEZE1_EPOCH": 30,
         "UNFREEZE2_EPOCH": 60,
     }
+    # Long 配置：跑到 SNAPSHOT_EPOCH 轮时，train.py 会自动把该轮 checkpoint/metrics 复制存档
+    if config_id in LONG_CONFIGS:
+        cfg["SNAPSHOT_EPOCH"] = SNAPSHOT_EPOCH
+        log(f"📌 {config_id} 为 Long 配置：MAX_EPOCHS={max_epochs}，跑到第 {SNAPSHOT_EPOCH} 轮自动存档 100 轮快照")
     with open(CONFIG, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 

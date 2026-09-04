@@ -58,6 +58,7 @@ _DEFAULTS = {
     'AUTO': True,            # 无人值守：跳过所有交互输入
     'UNFREEZE1_EPOCH': 30,   # 固定解冻触发：state1→2
     'UNFREEZE2_EPOCH': 60,   # state2→3
+    'SNAPSHOT_EPOCH': None,  # Long 配置跑到该轮时自动存档 100 轮快照（如 100）
 }
 
 # temp_guard_lis = (25, 50, 75, 99)
@@ -85,10 +86,13 @@ else:
 AUTO = _cfg.get('AUTO', _DEFAULTS['AUTO'])
 UNFREEZE1_EPOCH = _cfg.get('UNFREEZE1_EPOCH', _DEFAULTS['UNFREEZE1_EPOCH'])
 UNFREEZE2_EPOCH = _cfg.get('UNFREEZE2_EPOCH', _DEFAULTS['UNFREEZE2_EPOCH'])
+SNAPSHOT_EPOCH = _cfg.get('SNAPSHOT_EPOCH', _DEFAULTS['SNAPSHOT_EPOCH'])
 
 PRESETS = {
     'G-Full':     dict(regions=[1, 2], transformer_layers=3, use_decouple=True,  unfreeze='progressive'),
     'G-Full-CAWR':dict(regions=[1, 2], transformer_layers=3, use_decouple=True,  unfreeze='progressive', scheduler='cawr'),
+    'G-NoSE-CAWR':dict(regions=None,    transformer_layers=3, use_decouple=True,  unfreeze='progressive', scheduler='cawr'),
+    'G-Full-CAWR-Long':dict(regions=[1, 2], transformer_layers=3, use_decouple=True,  unfreeze='progressive', scheduler='cawr'),
     'G-NoTF':     dict(regions=[1, 2], transformer_layers=0, use_decouple=True,  unfreeze='progressive'),
     'G-NoSE':     dict(regions=None,    transformer_layers=3, use_decouple=True,  unfreeze='progressive'),
     'G-SingleSE': dict(regions=[1],     transformer_layers=3, use_decouple=True,  unfreeze='progressive'),
@@ -576,7 +580,23 @@ def train_and_validate(model,
                     'renew_class_to_index': renew_class_to_index},
                    LAST_PTH)
 
-        # 温度守护：关键 epoch（30/50/80，0 起算）后检测 CPU/GPU 温度，过高则休息 10 分钟
+        # Long 配置：跑到 SNAPSHOT_EPOCH 轮时，把该轮的 checkpoint + metrics 单独复制存档（100 轮快照）
+        if SNAPSHOT_EPOCH is not None and epoch == SNAPSHOT_EPOCH - 1:
+            try:
+                import shutil
+                _snap_last = os.path.join(RUNS_DIR, f'checkpoint_{RUN_TAG}_epoch{SNAPSHOT_EPOCH}.pth')
+                _snap_best = os.path.join(RUNS_DIR, f'checkpoint_{RUN_TAG}_best_epoch{SNAPSHOT_EPOCH}.pth')
+                _snap_metrics = os.path.join(RUNS_DIR, f'metrics_record_{RUN_TAG}_epoch{SNAPSHOT_EPOCH}.csv')
+                shutil.copy(LAST_PTH, _snap_last)
+                if os.path.exists(BEST_PTH):
+                    shutil.copy(BEST_PTH, _snap_best)
+                if os.path.exists(os.path.join(RUNS_DIR, 'metrics_record.csv')):
+                    shutil.copy(os.path.join(RUNS_DIR, 'metrics_record.csv'), _snap_metrics)
+                logging.info(f'[Long快照] 第 {SNAPSHOT_EPOCH} 轮快照已存档：checkpoint/metrics 各复制一份')
+            except Exception as _e:
+                logging.warning(f'[Long快照] 存档失败({_e})，不影响训练')
+
+        # 温度守护：关键 epoch（10-90，0 起算）后检测 CPU/GPU 温度，过高则休息 10 分钟
         if epoch in temp_guard_lis:
             temp_guard.check_temps_and_rest(tag=f" epoch{epoch}")
 
