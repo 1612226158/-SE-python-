@@ -34,7 +34,9 @@
 ## 一、怎么跑（PyCharm）
 
 1. 用 PyCharm 打开本文件同目录的 `experiment_config.json`，**只改这个 JSON**（不用再改 train.py）：
-   - `CONFIG_ID`：`G-Full` / `G-NoTF` / `G-NoSE` / `G-SingleSE` / `G-PureBB` / `S-NoProg`
+   - `CONFIG_ID`：`S-NoProg` / `S-NoSE` / `G-Full-CAWR` / `G-Full-CAWR-Long`（当前在用）
+     ⚠️ **命名速查**：`G-`=渐进式解冻、`S-`=全解冻、`-CAWR`=CAWR调度、无后缀=RLRP旧时代（数字过时，勿再跑）。
+     ⚠️ **SE 消融用 `S-NoSE`**（全解冻无SE，对照 S-NoProg）；`G-NoSE`/`G-NoSE-CAWR` 是渐进式无SE，已弃用。
    - `SEED`：`0` / `1` / `2`
    - `SMOKE`：先 `true` 冒烟（3 轮）→ 通过后改 `false` 挂正式 100 轮
    - `RESUME`：`false` = 全新训练；`true` = 从上次断点继续（**中途暂停后继续就改这个**）
@@ -71,16 +73,19 @@
 6. **metrics 双写**：原 `add_record_metrics` 照旧写 metrics.csv；新增 `add_record_metrics_v2` 写 metrics_record.csv；
 7. **续跑三件套**：checkpoint 存 `scheduler_state_dict`；续跑按 state 建对应类型调度器并 load；`RESUME=True` 一键续跑（无交互）。
 
-## 五、预设与消融矩阵（每配置跑 SEED 0/1/2）
+## 五、预设与消融矩阵（2026-09-05 更新：主模型候选 = S-NoProg 全解冻）
 
-| CONFIG_ID | SE | Transformer | 解耦层 | 解冻 |
-|---|---|---|---|---|
-| G-Full | [1,2] | 3 | ✓ | 渐进(30/60) |
-| G-NoTF | [1,2] | **0** | ✓ | 渐进 |
-| G-NoSE | **无** | 3 | ✓ | 渐进 |
-| G-SingleSE | **[1]** | 3 | ✓ | 渐进 |
-| G-PureBB | 无 | 0 | 无 | 渐进 |
-| S-NoProg | [1,2] | 3 | ✓ | **全程全解冻** |
+**命名族谱**：`G-`=渐进式解冻（30/60 触发三层解冻）；`S-`=全解冻；`-CAWR`=state2/3 用 CAWR 调度（lr 1e-4）；无后缀=RLRP 旧时代（已过时仅留档）。
+
+| CONFIG_ID | SE | Transformer | 解耦层 | 解冻 | 状态 |
+|---|---|---|---|---|---|
+| **S-NoProg** | [1,2] | 3 | ✓ | **全程全解冻** | ★主模型候选（82.63%@74，n=1，seed2 排队） |
+| **S-NoSE** | **无** | 3 | ✓ | **全程全解冻** | ★SE 消融（对照 S-NoProg）——**SE 消融认准这个** |
+| G-Full-CAWR | [1,2] | 3 | ✓ | 渐进(30/60)+CAWR | 渐进式主对照（70.82%@99，seed2 排队复现） |
+| G-Full-CAWR-Long | [1,2] | 3 | ✓ | 渐进+CAWR | Long：100→160 断点续跑 |
+| ~~G-NoSE-CAWR~~ | ~~无~~ | 3 | ✓ | ~~渐进+CAWR~~ | ❌ 弃用（渐进式 SE 消融不再需要） |
+| ~~G-Full~~ | [1,2] | 3 | ✓ | ~~渐进(RLRP)~~ | ❌ RLRP 时代旧基线（56.88 过时，仅留档） |
+| ~~G-NoSE~~ / G-NoTF / G-SingleSE / G-PureBB | — | — | — | — | ❌ 弃用/暂缓（PRESETS 已注释） |
 
 ## 六、自动归档（防误操作覆盖，绝不删除）
 

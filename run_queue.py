@@ -2,15 +2,18 @@
 """
 run_queue.py —— G 系列实验自动排队器
 
-用法（在 G-Full seed1 手动跑完之后）：
+用法（确认 PyCharm 没有手动训练在跑，二者互斥）：
     D:\\Python\\Python3.10.7\\python.exe E:\\DataSet\\垃圾分类图片-2\\src_v2\\run_queue.py
 
-它会按 QUEUE 顺序依次：
-  1. 检查该 (CONFIG_ID, SEED) 是否已完成（有 results_*.json，或 metrics_record.csv 里有 epoch=99 行）→ 跳过
-  2. 检查是否正在训练（checkpoint_last.pth 最近 15 分钟还在写）→ 等待 5 分钟重查
-  3. 有断点但已停 → 自动 RESUME=true 续跑；无断点 → RESUME=false 全新跑
-  4. 运行 train.py（阻塞等待自然结束）；失败自动用 RESUME=true 重试一次，再失败则停队
-进度/报错写入 src_v2/runs/queue_log.txt。
+它会按 QUEUE 顺序依次处理每个 (CONFIG_ID, SEED)：
+  1. 已完成（有 results_<tag>.json，或 metrics_record*.csv 里存在"最后轮"行：
+     普通配置=99 行，Long 配置=目标轮数-1 行）→ 跳过
+  2. 正在训练（checkpoint_<tag>_last.pth 最近 15 分钟还在写）→ 等待 5 分钟重查
+  3. Long 配置且自己无断点 → 从源配置断点复制续跑（ensure_long_resume，省重跑前 100 轮）
+  4. 有断点但已停 → 自动 RESUME=true 续跑；无断点 → RESUME=false 全新跑
+  5. 运行 train.py（阻塞等待自然结束）；失败自动用 RESUME=true 重试一次，再失败则停队
+进度/报错写入 src_v2/runs/queue_log.txt；任务切换前经 temp_guard 温度守护。
+队列"已完成"项仅作留档（会被自动跳过），实际待跑顺序见 QUEUE 的"待跑"分组。
 """
 import glob
 import json
@@ -30,17 +33,29 @@ TRAIN = os.path.join(SRC_V2, "train.py")
 LOG = os.path.join(RUNS, "queue_log.txt")
 PYTHON = sys.executable  # 用启动本脚本的同一个 Python（保证 torch 1.11 环境）
 
-# G 系列执行队列（2026-09-04 更新：G-Full-CAWR 成主模型，渐进式解冻坐实）
+# G 系列执行队列（2026-09-05 用户定序：先补齐实验 → Long → 再补 seed2 复现；seed 复现次要、隔开跑）
+# 命名速查（与 train.py PRESETS 顶部族谱一致）：
+#   G- = 渐进式解冻；S- = 全解冻；-CAWR = state2/3 CAWR 调度；无后缀 = RLRP 旧时代（已过时仅留档）
+#   SE 消融用的是 S-NoSE（全解冻无SE），不是 G-NoSE/G-NoSE-CAWR（渐进式，弃用）！
+# 注1：S-NoProg seed1（全解冻）best 82.63%@74 已远超渐进式 G-Full-CAWR 70.82%@99 → 主模型候选=全解冻。
+# 注2：SE 消融必须对准主模型候选（全解冻），故用 S-NoSE（全解冻无SE）替代 G-NoSE-CAWR（渐进式无SE，仅留档）。
 QUEUE = [
-    ("G-Full", 1),                             # ✅ 已完成（RLRP 旧基线，仅留档）
-    ("G-NoSE", 1), ("G-NoSE", 2),             # ✅ 已完成（RLRP 旧基线，仅留档）
-    ("G-Full-CAWR", 1),                       # ✅ 已完成（70.82%@99，n=1）
-    ("S-NoProg", 1),                          # 🔄 续跑到收敛（渐进式 vs 全解冻对照）
-    ("G-Full-CAWR", 2),                       # 主模型 seed2 → n=2 拿 mean±std
-    ("G-NoSE-CAWR", 1), ("G-NoSE-CAWR", 2),  # SE 消融（CAWR 基线，核心卖点）
-    ("G-Full-CAWR-Long", 1),                  # Long：跑到 160，100 轮自动存档快照
+    # —— 已完成，仅留档（done() 会自动跳过）——
+    ("G-Full", 1),                             # ✅ 完成（RLRP 旧基线）
+    ("G-NoSE", 1), ("G-NoSE", 2),             # ✅ 完成（RLRP 旧基线）
+    ("G-Full-CAWR", 1),                       # ✅ 完成（70.82%@99，渐进式，n=1）
+    ("S-NoProg", 1),                          # ✅ 完成（82.63%@74，全解冻，主模型候选）
+    # —— 待跑（按优先级排序）——
+    ("S-NoSE", 1),                            # 🔬 SE 消融（全解冻基线，对齐主模型候选 S-NoProg），先补齐实验
+    ("G-Full-CAWR-Long", 1),                  # ⏱ Long：从 G-Full-CAWR seed1 断点续跑至 160，100 轮自动存档快照
+    ("S-NoProg", 2),                          # 📊 全解冻主结果 seed2 → n=2 拿 mean±std
+    ("G-Full-CAWR", 2),                       # 📊 渐进式对照 seed2 → n=2（渐进式是否稳定复现）
+    ("S-NoSE", 2),                            # 📊 SE 消融 seed2
+    ("V2-Full", 1),                           # 🧪 V2 修正版 Transformer（49-token 真注意力，全解冻基线）：种子1验证
+    ("V2-NoTF", 1),                           # 🧪 V2 无 Transformer 对照（同架构去注意力栈）：V2-Full - V2-NoTF = 纯注意力增益
+    ("V2-Full", 2), ("V2-NoTF", 2),           # 🧪 V2 种子2（趋势验证通过后才值得跑）
     # 可选/暂缓：
-    # ("S-NoProg", 2),                        # 渐进式 vs 全解冻 n=2（暂缓）
+    # ("G-NoSE-CAWR", 1), ("G-NoSE-CAWR", 2), # 渐进式无SE（留档，不再排）
     # ("G-NoTF", 1), ("G-NoTF", 2),          # Transformer 已定弱化
     # ("G-SingleSE", 1), ("G-SingleSE", 2),
     # ("G-PureBB", 1), ("G-PureBB", 2),

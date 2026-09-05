@@ -33,6 +33,7 @@ import psutil
 # import cv2  # 通常与 Albumentations 配合使用
 
 from ResNet import ResNetTransformer
+from ResNetTransformer import ResNetTransformerV2  # 修正版 ViT 式多 token Transformer（独立路线；配置加 model='v2' 时启用）
 from calculate import (calculate_mean_and_std,
                        SafeImageFolder,
                        FocalLoss, add_record_metrics, add_record_metrics_v2,
@@ -88,16 +89,35 @@ UNFREEZE1_EPOCH = _cfg.get('UNFREEZE1_EPOCH', _DEFAULTS['UNFREEZE1_EPOCH'])
 UNFREEZE2_EPOCH = _cfg.get('UNFREEZE2_EPOCH', _DEFAULTS['UNFREEZE2_EPOCH'])
 SNAPSHOT_EPOCH = _cfg.get('SNAPSHOT_EPOCH', _DEFAULTS['SNAPSHOT_EPOCH'])
 
+# ==================== 预设配置表 PRESETS ====================
+# 【命名族谱（2026-09-05，防混淆必读）】
+#   前缀：G- = 渐进式解冻家族（unfreeze='progressive'，30/60 触发三层解冻）
+#         S- = 全解冻家族    （unfreeze='none'，从头到尾全参数训练）
+#   后缀：-CAWR = state2/3 用 CAWR 调度（+ backbone/head lr 提为 1e-4）
+#         无后缀 = state2/3 用 RLRP 调度（早期 RLRP 时代，数字已过时，仅留档）
+#   SE 开关：regions=[1,2]=有多区域SE；regions=None=无SE（消融用）
+# 【"无SE"三兄弟——最容易混淆，务必按前缀区分】
+#   G-NoSE       = 渐进式+RLRP+无SE（早期消融，已完成留档，勿再跑）
+#   G-NoSE-CAWR  = 渐进式+CAWR+无SE（早期对照，已弃用——主模型候选已转全解冻，见下）
+#   S-NoSE       = 全解冻+CAWR+无SE（★当前 SE 消融，对照 S-NoProg）
+# 【当前主模型候选 = S-NoProg（全解冻+SE，82.63%@74）；其 SE 消融 = S-NoSE】
 PRESETS = {
-    'G-Full':     dict(regions=[1, 2], transformer_layers=3, use_decouple=True,  unfreeze='progressive'),
-    'G-Full-CAWR':dict(regions=[1, 2], transformer_layers=3, use_decouple=True,  unfreeze='progressive', scheduler='cawr'),
-    'G-NoSE-CAWR':dict(regions=None,    transformer_layers=3, use_decouple=True,  unfreeze='progressive', scheduler='cawr'),
-    'G-Full-CAWR-Long':dict(regions=[1, 2], transformer_layers=3, use_decouple=True,  unfreeze='progressive', scheduler='cawr'),
-    'G-NoTF':     dict(regions=[1, 2], transformer_layers=0, use_decouple=True,  unfreeze='progressive'),
-    'G-NoSE':     dict(regions=None,    transformer_layers=3, use_decouple=True,  unfreeze='progressive'),
-    'G-SingleSE': dict(regions=[1],     transformer_layers=3, use_decouple=True,  unfreeze='progressive'),
-    'G-PureBB':   dict(regions=None,    transformer_layers=0, use_decouple=False, unfreeze='progressive'),
-    'S-NoProg':   dict(regions=[1, 2], transformer_layers=3, use_decouple=True,  unfreeze='none'),
+    # —— G 系列：渐进式解冻家族 ——
+    'G-Full':     dict(regions=[1, 2], transformer_layers=3, use_decouple=True,  unfreeze='progressive'),  # RLRP时代主结果（56.88过时，仅留档）
+    'G-Full-CAWR':dict(regions=[1, 2], transformer_layers=3, use_decouple=True,  unfreeze='progressive', scheduler='cawr'),  # 渐进式+CAWR 主对照（70.82%@99，n=1，seed2 排队复现）
+    'G-Full-CAWR-Long':dict(regions=[1, 2], transformer_layers=3, use_decouple=True,  unfreeze='progressive', scheduler='cawr'),  # G-Full-CAWR 拉长到 160 轮（100→160 断点续跑）
+    # —— S 系列：全解冻家族（主模型候选方向）——
+    'S-NoProg':   dict(regions=[1, 2], transformer_layers=3, use_decouple=True,  unfreeze='none'),  # ★主模型候选：全解冻+SE（82.63%@74，n=1）
+    'S-NoSE':     dict(regions=None,    transformer_layers=3, use_decouple=True,  unfreeze='none'),  # ★SE 消融：全解冻+无SE（对照 S-NoProg，2026-09-05 新增）
+    # —— V2 路线：修正版 49-token Transformer（2026-09-05 立项，全解冻基线对齐 S-NoProg）——
+    'V2-Full':    dict(model='v2', regions=[1, 2], transformer_layers=3, use_decouple=True,  unfreeze='none'),  # V2 全解冻+真多token注意力（核心对照：vs S-NoProg 看修正Transformer净增益）
+    'V2-NoTF':    dict(model='v2', regions=[1, 2], transformer_layers=0, use_decouple=True,  unfreeze='none'),  # V2 架构去掉Transformer栈（Identity直通）：V2-Full vs V2-NoTF = 纯注意力增益
+    # —— 已弃用 / 暂缓（勿排队列；如需复跑先取消注释并确认键名唯一）——
+    # 'G-NoSE-CAWR':dict(regions=None, transformer_layers=3, use_decouple=True, unfreeze='progressive', scheduler='cawr'),  # 渐进式无SE（弃用：SE消融须对准全解冻主模型）
+    # 'G-NoTF':     dict(regions=[1, 2], transformer_layers=0, use_decouple=True,  unfreeze='progressive'),  # Transformer 消融（已定弱化，暂缓）
+    # 'G-NoSE':     dict(regions=None,    transformer_layers=3, use_decouple=True,  unfreeze='progressive'),  # RLRP 旧消融（已完成，勿再跑）
+    # 'G-SingleSE': dict(regions=[1],     transformer_layers=3, use_decouple=True,  unfreeze='progressive'),  # 单尺度SE（暂缓）
+    # 'G-PureBB':   dict(regions=None,    transformer_layers=0, use_decouple=False, unfreeze='progressive'),  # 纯骨干（暂缓）
 }
 unfreeze_mode = PRESETS[CONFIG_ID]['unfreeze']
 # state2/3 的调度器：'cawr'=余弦退火重启（G-Full-CAWR 用，与 S-NoProg 同类型，隔离"RLRP 地板"混淆）；缺省='rlrp'（原行为）
@@ -928,6 +948,26 @@ def _check_arch(checkpoint, model):
         raise SystemExit(f'[arch] 断点架构 {ck_arch} ≠ 当前模型 {cur_arch}，拒绝续跑（防静默跑错模型）')
 
 
+def _build_model(preset, transformer_layers, d_model, nhead, id_to_main_class, renew_class_to_index):
+    """按 PRESET 构建模型：preset['model']=='v2' → ResNetTransformerV2（修正版49-token Transformer）；
+    缺省/'v1' → ResNetTransformer（原版，seq_len=1）。两版构造参数签名兼容。"""
+    if preset.get('model') == 'v2':
+        return ResNetTransformerV2(transformer_layers=transformer_layers,
+                                   d_model=d_model,
+                                   id_to_main_class=id_to_main_class,
+                                   renew_class_to_index=renew_class_to_index,
+                                   nhead=nhead,
+                                   regions=preset['regions'],
+                                   use_decouple=preset['use_decouple'])
+    return ResNetTransformer(transformer_layers=transformer_layers,
+                             d_model=d_model,
+                             id_to_main_class=id_to_main_class,
+                             renew_class_to_index=renew_class_to_index,
+                             nhead=nhead,
+                             regions=preset['regions'],
+                             use_decouple=preset['use_decouple'])
+
+
 if __name__ == '__main__':
     _setup_logging()  # 主进程才配置日志；spawn worker 不进入此块，不会重复打印
     preset = PRESETS[CONFIG_ID]
@@ -981,13 +1021,8 @@ if __name__ == '__main__':
                 model.load_state_dict(checkpoint['model_state_dict'])
             else:
                 # 新格式：state_dict 断点文件
-                model = ResNetTransformer(transformer_layers=transformer_layers,
-                                          d_model=d_model,
-                                          id_to_main_class=id_to_main_class,
-                                          renew_class_to_index=renew_class_to_index,
-                                          nhead=nhead,
-                                          regions=preset['regions'],
-                                          use_decouple=preset['use_decouple'])
+                model = _build_model(preset, transformer_layers, d_model, nhead,
+                                     id_to_main_class, renew_class_to_index)
                 _check_arch(checkpoint, model)
                 model.load_state_dict(checkpoint['state_dict'])
             logging.info(f'RESUME: 从 {_resume_path} 继续, epoch {epoch_start}, state={state}')
@@ -995,13 +1030,8 @@ if __name__ == '__main__':
             logging.warning('RESUME=True 但未找到断点文件，改为全新训练')
     if not use_old_model:
         # 从头开始训练（按 PRESETS 预设开关）
-        model = ResNetTransformer(transformer_layers=transformer_layers,
-                                  d_model=d_model,
-                                  id_to_main_class=id_to_main_class,
-                                  renew_class_to_index=renew_class_to_index,
-                                  nhead=nhead,
-                                  regions=preset['regions'],
-                                  use_decouple=preset['use_decouple'])
+        model = _build_model(preset, transformer_layers, d_model, nhead,
+                             id_to_main_class, renew_class_to_index)
 
     # 设置优化器
     print(f"设置优化器===")
