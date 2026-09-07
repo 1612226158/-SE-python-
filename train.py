@@ -367,6 +367,7 @@ def train_and_validate(model,
             time.sleep(EPOCH_PERIOD_time)
             sleep_all_spend += EPOCH_PERIOD_time
             print("开始继续工作！")
+            time.sleep(5)  # 防止print信息串行
         if unfreeze_mode == 'progressive':
             # 固定 epoch 触发解冻（替换原 should_update_simple 自适应判据，保证消融可比）
             if state == 1 and epoch >= UNFREEZE1_EPOCH:
@@ -478,7 +479,8 @@ def train_and_validate(model,
                                                                            val_loader,
                                                                            parent_criterion)
         # 实时保存 best（只存 state_dict，刷新才覆盖；最后用 best.pth 测测试集）
-        if val_accuracy[0] > best_val_acc:
+        # 冒烟（SMOKE）不存任何 pth：避免留下断点让 run_queue 误判"中断需续跑"；metrics 记录已足够验证管线
+        if val_accuracy[0] > best_val_acc and not SMOKE:
             best_val_acc = val_accuracy[0]
             best_epoch = epoch
             train_acc_at_best = train_parent_acc
@@ -489,7 +491,10 @@ def train_and_validate(model,
             logging.info(f'best 刷新: epoch {epoch}, val_acc {val_accuracy[0]:.4f}% -> {BEST_PTH}')
         # scheduler.step(val_loss)
         print(val_accuracy)
-        if unfreeze_mode == 'none':
+        # 调度器 step：CAWR 的 step(epoch=None) 无参递增；RLRP 才需要传 val 指标。
+        # ⚠️ 2026-09-07 修复：原代码 state2/3 一律 step(val_accuracy[0])，对 RLRP 正确，
+        #    但对 CAWR 会把 val_acc 误当 epoch → CAWR 永不重启、lr 贴地板（G-Full-CAWR 70.82 被污染）。
+        if unfreeze_mode == 'none' or SCHEDULER_MODE == 'cawr':
             scheduler.step()
         elif state in [2, 3]:
             scheduler.step(val_accuracy[0])
@@ -591,14 +596,16 @@ def train_and_validate(model,
                                   state=state)
 
         # 每轮保存断点（state_dict + optimizer + scheduler），支持中途暂停后续跑
-        torch.save({'epoch': epoch, 'config_id': CONFIG_ID, 'seed': SEED,
-                    'arch': type(model).__name__,
-                    'state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict(),
-                    'state': state,
-                    'renew_class_to_index': renew_class_to_index},
-                   LAST_PTH)
+        # 冒烟（SMOKE）跳过：不留 checkpoint_*_last.pth，run_queue 才不会被误导而 RESUME
+        if not SMOKE:
+            torch.save({'epoch': epoch, 'config_id': CONFIG_ID, 'seed': SEED,
+                        'arch': type(model).__name__,
+                        'state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict(),
+                        'state': state,
+                        'renew_class_to_index': renew_class_to_index},
+                       LAST_PTH)
 
         # Long 配置：跑到 SNAPSHOT_EPOCH 轮时，把该轮的 checkpoint + metrics 单独复制存档（100 轮快照）
         if SNAPSHOT_EPOCH is not None and epoch == SNAPSHOT_EPOCH - 1:

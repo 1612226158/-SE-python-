@@ -37,24 +37,29 @@ PYTHON = sys.executable  # 用启动本脚本的同一个 Python（保证 torch 
 # 命名速查（与 train.py PRESETS 顶部族谱一致）：
 #   G- = 渐进式解冻；S- = 全解冻；-CAWR = state2/3 CAWR 调度；无后缀 = RLRP 旧时代（已过时仅留档）
 #   SE 消融用的是 S-NoSE（全解冻无SE），不是 G-NoSE/G-NoSE-CAWR（渐进式，弃用）！
-# 注1：S-NoProg seed1（全解冻）best 82.63%@74 已远超渐进式 G-Full-CAWR 70.82%@99 → 主模型候选=全解冻。
-# 注2：SE 消融必须对准主模型候选（全解冻），故用 S-NoSE（全解冻无SE）替代 G-NoSE-CAWR（渐进式无SE，仅留档）。
+# 注1：S-NoProg seed1（全解冻）best 82.63%@74；S-NoSE seed1（无SE）82.53%@73（SE 增益≈0）。
+# 注2：G-Full-CAWR（渐进式）旧 70.82 为调度器 bug 脏数据（已存档），修复后重跑中（ep84 时已 79.05，趋势待最终确认）。
+# 注3：SE 消融用 S-NoSE（全解冻无SE）；G-NoSE-CAWR（渐进式无SE）已弃用仅留档。
+# G 系列执行队列（2026-09-07 更新：调度器 bug 修复；G-Full-CAWR seed1 重跑中，RERUN 机制处理完成判定）
+# ⚠️ 2026-09-07 调度器 bug：CAWR 被误传 val_acc（原 step(val_accuracy[0])），state2/3 从未重启、lr 贴地板。
+#    旧 G-Full-CAWR 70.82 为脏数据（已存档 runs\DIRTY_scheduler_bug_20260907\），修复后代码重跑 seed1。
 QUEUE = [
     # —— 已完成，仅留档（done() 会自动跳过）——
     ("G-Full", 1),                             # ✅ 完成（RLRP 旧基线）
     ("G-NoSE", 1), ("G-NoSE", 2),             # ✅ 完成（RLRP 旧基线）
-    ("G-Full-CAWR", 1),                       # ✅ 完成（70.82%@99，渐进式，n=1）
     ("S-NoProg", 1),                          # ✅ 完成（82.63%@74，全解冻，主模型候选）
+    ("S-NoSE", 1),                            # ✅ 完成（82.53%@73，SE 消融）
     # —— 待跑（按优先级排序）——
-    ("S-NoSE", 1),                            # 🔬 SE 消融（全解冻基线，对齐主模型候选 S-NoProg），先补齐实验
-    ("G-Full-CAWR-Long", 1),                  # ⏱ Long：从 G-Full-CAWR seed1 断点续跑至 160，100 轮自动存档快照
-    ("S-NoProg", 2),                          # 📊 全解冻主结果 seed2 → n=2 拿 mean±std
-    ("G-Full-CAWR", 2),                       # 📊 渐进式对照 seed2 → n=2（渐进式是否稳定复现）
-    ("S-NoSE", 2),                            # 📊 SE 消融 seed2
+    ("G-Full-CAWR", 1),                       # 🔄 重跑（调度器修复后干净版；旧 70.82 脏数据已存档）
+    ("G-Full-CAWR-Long", 1),                # ⏱ Long：等干净 G-Full-CAWR seed1 跑完后再决定（脏断点已存档 DIRTY_scheduler_bug_20260907）
     ("V2-Full", 1),                           # 🧪 V2 修正版 Transformer（49-token 真注意力，全解冻基线）：种子1验证
+    ("S-NoProg", 2),                          # 📊 全解冻主结果 seed2 → n=2 拿 mean±std
+    ("G-Full-CAWR", 2),                       # 📊 渐进式对照 seed2 → n=2
+    ("S-NoSE", 2),                            # 📊 SE 消融 seed2
     ("V2-NoTF", 1),                           # 🧪 V2 无 Transformer 对照（同架构去注意力栈）：V2-Full - V2-NoTF = 纯注意力增益
     ("V2-Full", 2), ("V2-NoTF", 2),           # 🧪 V2 种子2（趋势验证通过后才值得跑）
     # 可选/暂缓：
+
     # ("G-NoSE-CAWR", 1), ("G-NoSE-CAWR", 2), # 渐进式无SE（留档，不再排）
     # ("G-NoTF", 1), ("G-NoTF", 2),          # Transformer 已定弱化
     # ("G-SingleSE", 1), ("G-SingleSE", 2),
@@ -84,6 +89,15 @@ def log(msg):
 
 def done(config_id, seed):
     tag = f"{config_id}_seed{seed}"
+    # 强制重跑集合（2026-09-07）：仅当"还没有 results JSON"时无视归档 metrics 判定已完成。
+    # 目的：调度器修复后重跑 G-Full-CAWR seed1（旧 70.82 脏数据已存档），但跑完后 results 生成即恢复正常，
+    #      避免 run_once 完成后 done() 仍返回 False 导致被误判"失败"停队。
+    RERUN = {("G-Full-CAWR", 1)}
+    if (config_id, seed) in RERUN:
+        results_p = os.path.join(RUNS, f"results_{tag}.json")
+        if not os.path.exists(results_p):
+            return False  # 重跑中且尚未出 results → 视为未完成（跳过归档 metrics 的"已完成"误判）
+        # results 已生成（本次重跑完成）→ 继续走正常判断，视为完成
     # 主标记：results JSON（训练结束生成，RUN_TAG 命名，不归档）
     if os.path.exists(os.path.join(RUNS, f"results_{tag}.json")):
         return True

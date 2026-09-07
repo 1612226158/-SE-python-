@@ -1,10 +1,11 @@
 {
-  "CONFIG_ID": "S-NoSE",
+  "CONFIG_ID": "G-Full-CAWR-Long",
   "SEED": 1,
   "SMOKE": false,
-  "MAX_EPOCHS": 100,
-  "RESUME": false,
+  "MAX_EPOCHS": 160,
+  "RESUME": true,
   "AUTO": true,
   "UNFREEZE1_EPOCH": 30,
-  "UNFREEZE2_EPOCH": 60
+  "UNFREEZE2_EPOCH": 60,
+  "SNAPSHOT_EPOCH": 100
 }
