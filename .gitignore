@@ -13,3 +13,7 @@ ReportChart/*.pdf
 ReportChart/*.png
 ReportChart/*.csv
 ReportChart/*.json
+
+# 本地自检/临时脚本（不入库）
+_check_predict_registry.py
+_*.py
