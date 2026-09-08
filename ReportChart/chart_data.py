@@ -29,6 +29,32 @@ import pandas as pd
 _HERE = os.path.dirname(os.path.abspath(__file__))
 RUNS = os.path.join(os.path.dirname(_HERE), 'runs')
 
+# ---------- 输出文件名推导（2026-09-08 会话8 加：消灭 out*.pdf 硬编码） ----------
+
+# 论文已引用的历史对比标签（document_new.tex \includegraphics 依赖这些文件名，不能变）
+# 键 = (模型A, 模型B)（顺序无关，内部排序后匹配）；值 = 论文文件名里的对比段
+PAIR_TAGS = {
+    ('G-Full-CAWR', 'S-NoProg'): 'progressive_vs_full',
+    ('S-NoProg', 'S-NoSE'):      'snoprog_vs_snose',
+    ('G-Full-CAWR-Long', 'S-NoProg'): 'long_vs_full',
+}
+
+
+def pair_tag(model_a, model_b):
+    """由模型对推导文件名对比段：优先命中论文历史标签，否则自动拼 modelA_vs_modelB。"""
+    key = tuple(sorted([model_a, model_b]))
+    if key in PAIR_TAGS:
+        return PAIR_TAGS[key]
+    return f'{model_a}_vs_{model_b}'
+
+
+def fig_out(fig_type, model_a, model_b, out_dir=None):
+    """生成绘图输出路径：<out_dir>/<fig_type>_<对比段>.pdf
+    fig_type ∈ {loss_curve, val_acc, time_acc, ...}（由调用脚本传图类名）；
+    模型对只需在脚本顶部声明一次，文件名（含论文历史标签）自动匹配，无需手写。"""
+    out_dir = out_dir or _HERE
+    return os.path.join(out_dir, f'{fig_type}_{pair_tag(model_a, model_b)}.pdf')
+
 
 # ---------- 基础扫描 ----------
 
