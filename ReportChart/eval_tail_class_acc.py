@@ -47,11 +47,24 @@ from ResNet import ResNetTransformer
 RUNS = os.path.join(_SRC, 'runs')
 VAL_ROOT = os.path.join(_ROOT, 'val')
 TRAIN_ROOT = os.path.join(_ROOT, 'train')
-CKPT = {
-    'S-NoProG':  os.path.join(RUNS, 'checkpoint_S-NoProG_seed1_best.pth'),    # 全解冻 82.63@74
-    'G-Full-CAWR': os.path.join(RUNS, 'checkpoint_G-Full-CAWR_seed1_best.pth'),  # 渐进式 80.96@92
-}
-OVERALL_ACC = {'S-NoProG': 82.63, 'G-Full-CAWR': 80.96}   # checkpoint 自带 val_acc（全254类）
+# 对比的模型（输入模型英文名即可，checkpoint 路径与整体 acc 由 chart_data 动态解析）
+COMPARE_MODELS = ['S-NoProG', 'G-Full-CAWR']
+from chart_data import best_ckpt_path, results_best, model_best  # noqa: E402
+
+def _build_ckpt_and_overall():
+    """动态生成 {模型名: best checkpoint 路径} 与 {模型名: 整体254类 val_acc}。
+    整体 acc 论文口径优先 results JSON（82.63/80.96），无 results 退回 metrics best。"""
+    ckpt, overall = {}, {}
+    for name in COMPARE_MODELS:
+        p = best_ckpt_path(name)
+        if p is None:
+            raise FileNotFoundError(f'[tail] 找不到 {name} 的 best checkpoint（runs/ 下）')
+        ckpt[name] = p
+        va, _, _ = results_best(name)
+        overall[name] = va if va is not None else model_best(name)[0]
+    return ckpt, overall
+
+CKPT, OVERALL_ACC = _build_ckpt_and_overall()
 TAIL_JSON = os.path.join(_HERE, 'tail_classes.json')
 PER_CLASS_CSV = os.path.join(_HERE, 'per_class_acc.csv')
 

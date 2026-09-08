@@ -3,9 +3,8 @@
 plot_snoprog_vs_snose.py —— S-NoProG(全解冻+SE) vs S-NoSE(全解冻无SE) 对比图
 论文图：SE 消融对比（loss 曲线 / 验证集准确率 / 耗时-准确率）
 
-数据源（runs 下归档 metrics_record csv，每行含 config_id/seed/epoch/...）：
-  S-NoProG: runs/metrics_record_archive_20260905_230315.csv  (0~99)
-  S-NoSE:   runs/metrics_record_archive_20260907_003544.csv  (0~99)
+数据源：自动扫描 runs/ 下全部 metrics_record*.csv（当前+归档），按模型英文名取数据
+  S-NoProG / S-NoSE —— 见 chart_data.py（数据读取模块化，无需手写归档文件名）
 
 用法：
   D:\\Python\\Python3.10.7\\python.exe E:\\DataSet\\垃圾分类图片-2\\src_v2\\ReportChart\\plot_snoprog_vs_snose.py
@@ -14,13 +13,11 @@ plot_snoprog_vs_snose.py —— S-NoProG(全解冻+SE) vs S-NoSE(全解冻无SE)
 风格与 statistics\\ 下既有脚本保持一致：seaborn-v0_8-whitegrid + SimHei + 蓝/橙配色。
 """
 import os
-import sys
-import pandas as pd
 import matplotlib.pyplot as plt
+from chart_data import load_model
 
-# ============ 路径（与本文件位置无关，全部绝对化） ============
+# ============ 路径与本模块无关（数据读取交给 chart_data） ============
 _HERE = os.path.dirname(os.path.abspath(__file__))
-RUNS = os.path.join(os.path.dirname(_HERE), 'runs')
 
 # ============ 绘图风格（与既有论文图一致） ============
 plt.style.use('seaborn-v0_8-whitegrid')
@@ -40,36 +37,11 @@ C_VAL = '#ff7f0e'
 C_NOPROG = '#4c72b0'   # S-NoProG 主色
 C_NOSE = '#c44e52'     # S-NoSE 主色（去 SE 用红区分）
 
-# ============ 数据加载 ============
-def load(config_id, archive_names):
-    """从归档 csv 取某 config 的完整记录（可跨多个归档合并，S-NoProG 0-7 与 8-99 分处两档）。"""
-    frames = []
-    if isinstance(archive_names, str):
-        archive_names = [archive_names]
-    for an in archive_names:
-        path = os.path.join(RUNS, an)
-        if not os.path.exists(path):
-            print(f'警告: 找不到归档 {an}，跳过')
-            continue
-        df = pd.read_csv(path)
-        df.columns = df.columns.str.strip()
-        sub = df[df['config_id'] == config_id].copy()
-        if len(sub):
-            frames.append(sub)
-    if not frames:
-        raise FileNotFoundError(f'未找到 config={config_id} 的任何记录')
-    df = pd.concat(frames, ignore_index=True)
-    df = df.sort_values('epoch').reset_index(drop=True)
-    # 去重（同 epoch 只保留一条，防跨档重叠）
-    df = df.drop_duplicates(subset='epoch', keep='first').reset_index(drop=True)
-    return df
-
+# ============ 数据加载（模块化：chart_data 自动扫全部归档） ============
 def main():
-    # —— S-NoProG 完整记录：0-7 在 20260903_225916，8-99 在 20260905_230315 ——
-    df_noprog = load('S-NoProg', ['metrics_record_archive_20260903_225916.csv',
-                                  'metrics_record_archive_20260905_230315.csv'])
-    # —— S-NoSE 完整记录（0~99 单档）——
-    df_nose = load('S-NoSE', 'metrics_record_archive_20260907_003544.csv')
+    # —— 按模型英文名取数据：S-NoProG / S-NoSE（自动选最完整 seed，无需手写归档名）——
+    df_noprog = load_model('S-NoProg')
+    df_nose = load_model('S-NoSE')
 
     print(f'S-NoProG 行数: {len(df_noprog)}, S-NoSE 行数: {len(df_nose)}')
 

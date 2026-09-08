@@ -3,10 +3,8 @@
 plot_progressive_vs_full.py —— 渐进式解冻(G-Full-CAWR修复后) vs 全解冻(S-NoProG) 对比图（仅 100 轮）
 论文图：解冻策略对比（loss 曲线 / 验证集准确率 / 耗时-准确率）
 
-数据源（runs 下 metrics_record csv，每行含 config_id/seed/epoch/...）：
-  G-Full-CAWR(渐进式, 修复后干净数据): runs/metrics_record.csv  当前文件（0~99，seed1 刚跑完）
-  S-NoProG(全解冻): 跨两档合并 runs/metrics_record_archive_20260903_225916.csv(0~7)
-                    + runs/metrics_record_archive_20260905_230315.csv(8~99)
+数据源：自动扫描 runs/ 下全部 metrics_record*.csv（当前+归档），按模型英文名取数据
+  G-Full-CAWR / S-NoProG —— 见 chart_data.py（数据读取模块化，无需手写归档文件名）
 
 用法：
   D:\\Python\\Python3.10.7\\python.exe E:\\DataSet\\垃圾分类图片-2\\src_v2\\ReportChart\\plot_progressive_vs_full.py
@@ -14,11 +12,10 @@ plot_progressive_vs_full.py —— 渐进式解冻(G-Full-CAWR修复后) vs 全�
 风格与 statistics\\ 既有脚本一致：seaborn-v0_8-whitegrid + SimHei。
 """
 import os
-import pandas as pd
 import matplotlib.pyplot as plt
+from chart_data import load_model
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-RUNS = os.path.join(os.path.dirname(_HERE), 'runs')
 
 # ============ 绘图风格（与既有论文图一致） ============
 plt.style.use('seaborn-v0_8-whitegrid')
@@ -37,42 +34,11 @@ C_VAL = '#ff7f0e'
 C_PROG = '#4c72b0'   # 渐进式主色（蓝）
 C_FULL = '#8172b3'   # 全解冻主色（紫，与渐进式区分）
 
-# ============ 数据加载 ============
-def load_from_list(config_id, sources):
-    """sources: 列表 of (csv路径, 行前缀)。支持当前文件与多个归档合并。"""
-    frames = []
-    for path, _ in sources:
-        if not os.path.exists(path):
-            print(f'警告: 找不到 {path}，跳过')
-            continue
-        df = pd.read_csv(path)
-        df.columns = df.columns.str.strip()
-        sub = df[df['config_id'] == config_id].copy()
-        if len(sub):
-            frames.append(sub)
-    if not frames:
-        raise FileNotFoundError(f'未找到 config={config_id} 的任何记录')
-    df = pd.concat(frames, ignore_index=True)
-    df = df.sort_values('epoch').reset_index(drop=True)
-    df = df.drop_duplicates(subset='epoch', keep='first').reset_index(drop=True)
-    return df
-
-def load(config_id, archive_names, current_csv=False):
-    if isinstance(archive_names, str):
-        archive_names = [archive_names]
-    paths = []
-    if current_csv:
-        paths.append(os.path.join(RUNS, 'metrics_record.csv'))
-    for an in archive_names:
-        paths.append(os.path.join(RUNS, an))
-    return load_from_list(config_id, [(p, '') for p in paths])
-
+# ============ 数据加载（模块化：chart_data 自动扫全部归档） ============
 def main():
-    # G-Full-CAWR(渐进式): 当前 metrics_record.csv（刚重跑完成 0~99）
-    df_prog = load('G-Full-CAWR', [], current_csv=True)
-    # S-NoProG(全解冻): 跨两档合并
-    df_full = load('S-NoProg', ['metrics_record_archive_20260903_225916.csv',
-                                'metrics_record_archive_20260905_230315.csv'])
+    # —— 按模型英文名取数据：G-Full-CAWR(渐进式) / S-NoProG(全解冻) ——
+    df_prog = load_model('G-Full-CAWR')
+    df_full = load_model('S-NoProg')
 
     print(f'渐进式 G-Full-CAWR 行数: {len(df_prog)}, 全解冻 S-NoProG 行数: {len(df_full)}')
 
