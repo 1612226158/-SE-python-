@@ -112,6 +112,7 @@ PRESETS = {
     # —— V2 路线：修正版 49-token Transformer（2026-09-05 立项，全解冻基线对齐 S-NoProg）——
     'V2-Full':    dict(model='v2', regions=[1, 2], transformer_layers=3, use_decouple=True,  unfreeze='none'),  # V2 全解冻+真多token注意力（核心对照：vs S-NoProg 看修正Transformer净增益）
     'V2-NoTF':    dict(model='v2', regions=[1, 2], transformer_layers=0, use_decouple=True,  unfreeze='none'),  # V2 架构去掉Transformer栈（Identity直通）：V2-Full vs V2-NoTF = 纯注意力增益
+    'G-V2':       dict(model='v2', regions=[1, 2], transformer_layers=3, use_decouple=True,  unfreeze='progressive', scheduler='cawr'),  # 【2026-09-09 立项】渐进式解冻(30/60)+V2修正头：2×2网格第四格（头修正×解冻策略），对照 G-Full-CAWR(v1头渐进 80.96) / V2-Full(V2头全解冻 83.353)——验证 V2 修正头下渐进式的小样本优势与预算收益是否保持
     # —— 已弃用 / 暂缓（勿排队列；如需复跑先取消注释并确认键名唯一）——
     # 'G-NoSE-CAWR':dict(regions=None, transformer_layers=3, use_decouple=True, unfreeze='progressive', scheduler='cawr'),  # 渐进式无SE（弃用：SE消融须对准全解冻主模型）
     # 'G-NoTF':     dict(regions=[1, 2], transformer_layers=0, use_decouple=True,  unfreeze='progressive'),  # Transformer 消融（已定弱化，暂缓）

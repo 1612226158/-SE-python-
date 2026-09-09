@@ -33,35 +33,46 @@ TRAIN = os.path.join(SRC_V2, "train.py")
 LOG = os.path.join(RUNS, "queue_log.txt")
 PYTHON = sys.executable  # 用启动本脚本的同一个 Python（保证 torch 1.11 环境）
 
-# G 系列执行队列（2026-09-05 用户定序：先补齐实验 → Long → 再补 seed2 复现；seed 复现次要、隔开跑）
+# —— 执行队列总览（2026-09-09 更新）——
 # 命名速查（与 train.py PRESETS 顶部族谱一致）：
-#   G- = 渐进式解冻；S- = 全解冻；-CAWR = state2/3 CAWR 调度；无后缀 = RLRP 旧时代（已过时仅留档）
-#   SE 消融用的是 S-NoSE（全解冻无SE），不是 G-NoSE/G-NoSE-CAWR（渐进式，弃用）！
-# 注1：S-NoProg seed1（全解冻）best 82.63%@74；S-NoSE seed1（无SE）82.53%@73（SE 增益≈0）。
-# 注2：G-Full-CAWR（渐进式）旧 70.82 为调度器 bug 脏数据（已存档），修复后重跑中（ep84 时已 79.05，趋势待最终确认）。
-# 注3：SE 消融用 S-NoSE（全解冻无SE）；G-NoSE-CAWR（渐进式无SE）已弃用仅留档。
-# G 系列执行队列（2026-09-07 更新：调度器 bug 修复；G-Full-CAWR seed1 重跑中，RERUN 机制处理完成判定）
-# ⚠️ 2026-09-07 调度器 bug：CAWR 被误传 val_acc（原 step(val_accuracy[0])），state2/3 从未重启、lr 贴地板。
-#    旧 G-Full-CAWR 70.82 为脏数据（已存档 runs\DIRTY_scheduler_bug_20260907\），修复后代码重跑 seed1。
+#   G- = 渐进式解冻（state1→2 @30轮、state2→3 @60轮）；S- = 全解冻（unfreeze='none'，标准微调）
+#   -CAWR = CAWR 调度（T_0=5, T_mult=2, eta_min=1e-6）；无后缀 = RLRP 旧时代（已过时仅留档）
+#   V2- = 修正版 Transformer 头（ResNetTransformerV2：7×7=49 patch token + pos_embed + patch-emb dropout 0.1，
+#        替代 v1 头 avgpool 1×1 单 token + dropout 0.5 + 退化 seq_len=1 注意力的组合）
+#   SE 消融 = S-NoSE（全解冻无SE）；G-NoSE / G-NoSE-CAWR（渐进式系）已弃用，仅留档勿再排
+# 已完成基线（results JSON 权威，254 类/CAWR 口径）：
+#   S-NoProg 82.63@74 / S-NoSE 82.53@73（SE 增益≈0.10pp）/ G-Full-CAWR 80.96@92（调度器修复后干净重跑）
+#   G-Full-CAWR-Long 83.565@132（160 轮预算）/ V2-Full 83.353@74（vs S-NoProG +0.72pp，n=1 初步）
+# ⚠️ 调度器 bug 史（2026-09-07）：CAWR 曾被误传 val_acc（原 step(val_accuracy[0])）→ state2/3 从不重启、
+#    lr 贴 1e-6 地板 → 旧 G-Full-CAWR 70.82 是脏数据（已存档 runs\DIRTY_scheduler_bug_20260907\）。
+# 🧪 V2-NoTF 提前到 seed2 复现之前（2026-09-09 用户重排）：它是 V2 归因的关键对照
+#    （V2-Full − V2-NoTF = 纯注意力栈增益；S-NoProg 停跑~10轮留断点，RESUME 补跑）。
+#    早期观测：V2-NoTF 拟合速度 ≈ V2-Full >> v1 头(S-NoProg) → 初期提速主要来自 V2 侧头部修正
+#    （49-token 化 + patch-emb dropout 0.5→0.1），不是注意力栈本身；注意力净增益待 V2-NoTF 收官对比。
+# 🆕 G-V2（2026-09-09 立项）：渐进式解冻(30/60) + V2 修正头 = 2×2 网格第四格（头 v1/V2 × 解冻 全/渐进），
+#    排在 V2-NoTF 之后（100轮 n=1）：回答"V2 修正头下渐进式的小样本优势与预算收益是否保持"。
 QUEUE = [
     # —— 已完成，仅留档（done() 会自动跳过）——
-    ("G-Full", 1),                             # ✅ 完成（RLRP 旧基线）
-    ("G-NoSE", 1), ("G-NoSE", 2),             # ✅ 完成（RLRP 旧基线）
-    ("S-NoProg", 1),                          # ✅ 完成（82.63%@74，全解冻，主模型候选）
+    ("G-Full", 1),                             # ✅ 完成（RLRP 旧基线，56.93/56.82 过时勿用）
+    ("G-NoSE", 1), ("G-NoSE", 2),             # ✅ 完成（RLRP 旧基线，过时勿用）
+    ("S-NoProg", 1),                          # ✅ 完成（82.63%@74，全解冻主基线）
     ("S-NoSE", 1),                            # ✅ 完成（82.53%@73，SE 消融）
-    # —— 待跑（按优先级排序）——
-    ("G-Full-CAWR", 1),                       # 🔄 重跑（调度器修复后干净版；旧 70.82 脏数据已存档）
-    ("G-Full-CAWR-Long", 1),                # ⏱ Long：等干净 G-Full-CAWR seed1 跑完后再决定（脏断点已存档 DIRTY_scheduler_bug_20260907）
-    ("V2-Full", 1),                           # 🧪 V2 修正版 Transformer（49-token 真注意力，全解冻基线）：种子1验证
-    ("S-NoProg", 2),                          # 📊 全解冻主结果 seed2 → n=2 拿 mean±std
-    ("G-Full-CAWR", 2),                       # 📊 渐进式对照 seed2 → n=2
+    ("G-Full-CAWR", 1),                       # ✅ 完成（修复后干净重跑 80.96@92；旧脏 70.82 已存档）
+    ("G-Full-CAWR-Long", 1),                  # ✅ 完成（83.565@132，160 轮预算断点续跑）
+    ("V2-Full", 1),                           # ✅ 完成（83.353@74，全解冻+V2 修正头；vs S-NoProg +0.72pp n=1）
+    # —— 待跑（按优先级排序；2026-09-09 起 V2-NoTF 优先于 seed2 复现）——
+    ("V2-NoTF", 1),                           # 🧪【跑中 09-09】V2 架构去掉 Transformer 栈（Identity 直通）：
+                                              #    V2-Full − V2-NoTF = 纯注意力增益；同 dropout/pos_embed 设置
+    ("G-V2", 1),                              # 🧪【新 09-09 立项】渐进式解冻(30/60)+V2修正头 = 2×2网格第四格：
+                                              #    对照 G-Full-CAWR(v1头渐进) / V2-Full(V2头全解冻)，100轮 n=1 验证趋势
+    ("S-NoProg", 2),                          # 📊 全解冻主结果 seed2 → n=2（09-09 曾跑 ~10 轮被停，RESUME 补跑）
+    ("G-Full-CAWR", 2),                       # 📊 渐进式对照 seed2 → n=2（长尾反转复现用）
     ("S-NoSE", 2),                            # 📊 SE 消融 seed2
-    ("V2-NoTF", 1),                           # 🧪 V2 无 Transformer 对照（同架构去注意力栈）：V2-Full - V2-NoTF = 纯注意力增益
     ("V2-Full", 2), ("V2-NoTF", 2),           # 🧪 V2 种子2（趋势验证通过后才值得跑）
     # 可选/暂缓：
 
     # ("G-NoSE-CAWR", 1), ("G-NoSE-CAWR", 2), # 渐进式无SE（留档，不再排）
-    # ("G-NoTF", 1), ("G-NoTF", 2),          # Transformer 已定弱化
+    # ("G-NoTF", 1), ("G-NoTF", 2),          # v1 头 Transformer 消融（v1 头已整体退场，不再排）
     # ("G-SingleSE", 1), ("G-SingleSE", 2),
     # ("G-PureBB", 1), ("G-PureBB", 2),
 ]
