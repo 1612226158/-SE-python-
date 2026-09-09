@@ -15,7 +15,7 @@ plot_progressive_vs_full.py —— 渐进式解冻 vs 全解冻 三图对比（l
 """
 import os
 import matplotlib.pyplot as plt
-from chart_data import load_model, fig_out
+from chart_data import load_model, fig_out, is_known, model_cn
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -37,6 +37,11 @@ plt.rcParams.update({
 # 图内中文名/主色是"本图的显示样式"，可按图意改，不会影响任何其他脚本。
 MODEL_A = ('G-Full-CAWR', '渐进式解冻 (G-Full-CAWR)', '#4c72b0')   # 蓝
 MODEL_B = ('S-NoProg',    '全解冻 (S-NoProg)',      '#8172b3')   # 紫
+
+# —— 模型链接自检：id 必须在 model_registry.py 注册（数据/中文全称由 chart_data 按 id 解析）——
+for _m in (MODEL_A[0], MODEL_B[0]):
+    if not is_known(_m):
+        raise SystemExit(f'[plot] 模型 {_m} 未在 model_registry.py 注册：请先在注册表加条目再画')
 MAX_EPOCH = 99             # 截取公共轮数上限（此脚本仅 100 轮协议对比）
 C_TRAIN = '#1f77b4'
 C_VAL = '#ff7f0e'

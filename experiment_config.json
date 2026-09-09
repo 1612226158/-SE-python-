@@ -3,7 +3,7 @@
   "SEED": 1,
   "SMOKE": false,
   "MAX_EPOCHS": 100,
-  "RESUME": false,
+  "RESUME": true,
   "AUTO": true,
   "UNFREEZE1_EPOCH": 30,
   "UNFREEZE2_EPOCH": 60

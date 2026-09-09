@@ -47,9 +47,20 @@ from ResNet import ResNetTransformer
 RUNS = os.path.join(_SRC, 'runs')
 VAL_ROOT = os.path.join(_ROOT, 'val')
 TRAIN_ROOT = os.path.join(_ROOT, 'train')
-# 对比的模型（输入模型英文名即可，checkpoint 路径与整体 acc 由 chart_data 动态解析）
-COMPARE_MODELS = ['S-NoProG', 'G-Full-CAWR']
-from chart_data import best_ckpt_path, results_best, model_best  # noqa: E402
+# 对比的模型：id 必须全部在 src_v2\model_registry.py 注册（key 一律用规范写法，如 S-NoProg；
+# 论文叙述里的 "S-NoProG" 只是显示写法，由下方 _META['label'] 呈现，不进 key）。
+# checkpoint 路径 / 整体 acc / 中文全称均由 chart_data(+注册表) 按 id 动态解析。
+COMPARE_MODELS = ['S-NoProg', 'G-Full-CAWR']
+# 本图固定比较"全解冻(v1头) vs 渐进式(v1头)"；换对比模型时同步改 _META（显示名/主色/csv列字母）。
+_META = {
+    'S-NoProg':    {'letter': 'S', 'label': 'S-NoProG（全解冻）',    'color': '#4c72b0'},
+    'G-Full-CAWR': {'letter': 'G', 'label': 'G-Full-CAWR（渐进式）', 'color': '#dd8452'},
+}
+from chart_data import best_ckpt_path, results_best, model_best, is_known, model_cn  # noqa: E402
+_unknown = [m for m in COMPARE_MODELS if not is_known(m)]
+if _unknown:
+    raise SystemExit(f'[tail] 未在 model_registry.py 注册的模型: {_unknown}')
+_LETTER_OF = {cid: _META[cid]['letter'] for cid in COMPARE_MODELS}
 
 def _build_ckpt_and_overall():
     """动态生成 {模型名: best checkpoint 路径} 与 {模型名: 整体254类 val_acc}。
@@ -246,18 +257,20 @@ def stage_infer():
         print(f'[{tag}] tail100 覆盖全部完成: {total} 张, 原始聚合 acc={correct/total*100:.2f}%')
         torch.cuda.empty_cache()
 
-    # 存每类结果
+    # 存每类结果（列字母 = _META['letter']：当前 S=全解冻 S-NoProg、G=渐进式 G-Full-CAWR）
     with open(PER_CLASS_CSV, 'w', encoding='utf-8', newline='') as f:
         w = csv.writer(f)
-        w.writerow(['class_name', 'train_n', 'val_n', 'member_ids',
-                    'S_correct', 'S_total', 'G_correct', 'G_total'])
+        w.writerow(['class_name', 'train_n', 'val_n', 'member_ids'] +
+                   [f'{_LETTER_OF[c]}_correct' for c in COMPARE_MODELS] +
+                   [f'{_LETTER_OF[c]}_total' for c in COMPARE_MODELS])
         for cls in sorted(class_table):
             r = results.get(cls, {})
             ct = class_table[cls]
-            s = r.get('S-NoProG', [0, 0])
-            g = r.get('G-Full-CAWR', [0, 0])
-            w.writerow([cls, ct['train_n'], ct['val_n'], str(ct['ids']),
-                        s[0], s[1], g[0], g[1]])
+            row = [cls, ct['train_n'], ct['val_n'], str(ct['ids'])]
+            for cid in COMPARE_MODELS:
+                cell = r.get(cid, [0, 0])
+                row += [cell[0], cell[1]]
+            w.writerow(row)
     print(f'[infer] 每类结果已存 {PER_CLASS_CSV}')
     print('[infer] 注意: 非 tail100 的类 S_total=0（本脚本只推最少100类）')
 
@@ -342,7 +355,7 @@ def stage_plot():
 
     # ---- 左面板：三组聚合柱状 ----
     labels = ['最少50类\n(聚合)', '最少100类\n(聚合)', '全部254类\n(整体参考)']
-    full = OVERALL_ACC['S-NoProG']
+    full = OVERALL_ACC['S-NoProg']
     prog = OVERALL_ACC['G-Full-CAWR']
     s_vals = [a50, a100, full]
     g_vals = [b50, b100, prog]
