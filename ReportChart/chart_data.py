@@ -30,6 +30,18 @@ import pandas as pd
 _HERE = os.path.dirname(os.path.abspath(__file__))
 RUNS = os.path.join(os.path.dirname(_HERE), 'runs')
 
+# ============ 已知脏记录登记（2026-09-09 加，用户指出"只按文件新旧掩盖症状是严重bug"） ============
+# 背景：调度器 bug（CAWR 误传 val_acc → state2/3 从不重启、lr 贴 1e-6 地板）期间的
+#       G-Full-CAWR seed1 run（70.82 脏成绩）与修复后干净重跑**同名同 seed**并存于归档。
+# 规则：以下 = {归档文件名: {(config_id, seed), ...}}，命中的行一律剔除（行级，不影响
+#       同文件里其他配置的合法数据——该归档还存着 S-NoProg/S-NoSE 等正常 run 的记录）。
+# 今后再出现"已作废重跑的 run"：要么归档时把 csv 放进 runs\DIRTY* 子目录（本模块不扫），
+#       要么在此登记 (文件名, 配置, seed) —— 二者等价，都保证画图/统计永远不会吃到脏数据。
+DIRTY_RECORDS = {
+    # 调度器 bug 期 G-Full-CAWR seed1 脏 run（与 20260908 干净重跑同 tag；val 封顶 ~70.82）
+    'metrics_record_archive_20260905_230315.csv': {('G-Full-CAWR', 1)},
+}
+
 # ---------- 模型名 → 元数据（中文全称/短说明）唯一来源 = src_v2\model_registry.py ----------
 # 新增/改模型名一律去 model_registry.py；本模块按 id 索引，注册表缺失时优雅降级为原名。
 _SRC_V2 = os.path.dirname(_HERE)
@@ -99,18 +111,32 @@ def all_metrics_files():
 
 
 def _read_all(config_id=None):
-    """扫全部 metrics 文件，过滤出 config_id（可选）。返回单 DataFrame（未排序、未去重）。"""
+    """扫全部 metrics 文件，过滤出 config_id（可选）+ 剔除 DIRTY_RECORDS 已知脏行。
+    返回单 DataFrame（未排序、未去重）。附加列 _fidx = 来源文件序号（越新越大）——
+    供 load_model 去重时"同一 epoch 确定性保留最新文件"（同 epoch 多份记录时的兜底规则；
+    已知脏 run 已在上面按 (文件, 配置, seed) 行级剔除，不依赖"恰好最新"）。"""
     frames = []
-    for f in all_metrics_files():
+    for fidx, f in enumerate(all_metrics_files()):
         try:
             df = pd.read_csv(f)
             df.columns = df.columns.str.strip()
         except Exception as e:
             print(f'[chart_data] 跳过无法读取的 {os.path.basename(f)}: {e}')
             continue
+        tag = os.path.basename(f)
+        dirty = DIRTY_RECORDS.get(tag)
+        if dirty:
+            before = len(df)
+            mask = df.apply(lambda r: (str(r['config_id']), int(r['seed'])) in dirty, axis=1)
+            df = df[~mask]
+            dropped = before - len(df)
+            if dropped:
+                print(f'[chart_data] 剔除脏记录 {dropped} 行（{tag}: 已知作废 run {sorted(dirty)}）')
         if config_id is not None:
             df = df[df['config_id'] == config_id]
         if len(df):
+            df = df.copy()
+            df['_fidx'] = fidx
             frames.append(df)
     if not frames:
         return pd.DataFrame()
@@ -173,8 +199,9 @@ def load_model(config_id, seed=None, verbose=True):
         if verbose:
             print(f'[chart_data] {config_id}: 自动选用 seed={int(best_seed)} '
                   f'（共 {len(df)} 行，最高 ep{int(df["epoch"].max())}）')
-    df = df.sort_values('epoch').reset_index(drop=True)
-    df = df.drop_duplicates(subset='epoch', keep='last').reset_index(drop=True)
+    df = df.sort_values(['epoch', '_fidx'], kind='stable').reset_index(drop=True)
+    df = df.drop_duplicates(subset='epoch', keep='last').reset_index(drop=True)   # 同 epoch 保留最新文件
+    df = df.drop(columns=['_fidx'], errors='ignore')
     # 数值列尽量转 float（seed 保留原样）
     for col in ('epoch', 'train_acc', 'train_loss', 'val_acc', 'val_loss',
                 'val_macro_f1', 'val_weighted_f1', 'lr', 'time_spend_s'):

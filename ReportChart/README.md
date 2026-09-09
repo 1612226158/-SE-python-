@@ -77,10 +77,11 @@ fig_out('val_acc', 'G-Full-CAWR', 'S-NoProg')
 
 ## 四、口径与纪律（改脚本必读）
 
-1. **论文表格/正文数字用 `results_best`（results JSON 口径）**；`load_model`/`model_best` 是 metrics 口径，两者在个别模型上有小差（如 G-Full-CAWR：metrics 80.89@94 vs results 80.96@92），别混用；
+1. **论文表格/正文数字用 `results_best`（results JSON 口径）**；`load_model`/`model_best` 是 metrics 口径。⚠ 两者在个别模型上曾有差（如 G-Full-CAWR 旧记录 metrics 80.89@94 vs results 80.96@92）——**根因是合并去重 bug**（脏run与干净重跑两套 0~99 记录同存时不稳定排序随机取档，2026-09-09 已修：同 epoch 确定性保留最新归档），修复后 metrics 与 results 已对齐（G-Full-CAWR 80.96@92）。
 2. **论文历史文件名不可变**（document_new.tex 的 \includegraphics 依赖）：`progressive_vs_full` 与 `snoprog_vs_snose` 两组标签已锁在 chart_data.PAIR_TAGS；
 3. 只读纪律：脚本只读 runs/ 与 train/val（统计用），产物只写本目录；不碰训练、不改数据集；
 4. 中文字体：SimHei（脚本已设），若缺字体图内中文会变方块。
+5. **脏数据隔离（2026-09-09 用户指出后补强）**：`chart_data.DIRTY_RECORDS` 按 `(归档文件名, 配置, seed)` 登记"已作废重跑"的 run，命中行**行级剔除**（不依赖文件新旧、不影响同文件里其他配置的合法记录）。今后作废 run 的 csv 归档到 `runs\DIRTY*` 子目录（本模块不扫），或在 DIRTY_RECORDS 里登记，二者等价。
 
 ## 五、模型链接架构（2026-09-09 会话9 起）
 
