@@ -50,46 +50,22 @@ from ResNetTransformer import ResNetTransformerV2
 from calculate import calculate_mean_and_std, generate_mappings, get_classnames
 from src_v2 import merged_dict
 
-# ==================== 模型配置表（镜像 run_queue.py QUEUE 全集 + train.py PRESETS） ====================
-# 键 = QUEUE 中的 CONFIG_ID；值 = (模型家族, regions, transformer_layers, use_decouple, 显示说明)
-#   model: 'v1' = ResNetTransformer（seq_len=1 退化版）/ 'v2' = ResNetTransformerV2（49-token 真注意力）
-#   regions: [1,2]=多区域SE / None=无SE；transformer_layers: 3/0；use_decouple: True/False
-# ⚠ 与 train.py PRESETS / run_queue.py QUEUE 同步维护；若某配置结构改过，这里必须跟着改。
+# ==================== 模型配置（唯一真源 = src_v2\model_registry.py，2026-09-09 拆出） ====================
+# 本表 = (arch, regions, transformer_layers, use_decouple, 短说明)，全部由注册表派生；
+# 以后改模型参数 / 中文名 / 新增模型 → 只改 model_registry.py，本 GUI 自动跟随。
+import model_registry as _mr
 MODEL_REGISTRY = {
-    # —— 已完成（QUEUE"已完成留档"区）——
-    'G-Full':         ('v1', [1, 2], 3, True,  '渐进式·RLRP旧基线'),
-    'G-NoSE':         ('v1', None,   3, True,  '渐进式·无SE·RLRP'),
-    'S-NoProg':       ('v1', [1, 2], 3, True,  '全程全解冻·含多区域SE'),
-    'S-NoSE':         ('v1', None,   3, True,  '全程全解冻·无多区域SE'),
-    'G-Full-CAWR':    ('v1', [1, 2], 3, True,  '渐进式+CAWR调度'),
-    # —— 进行中/待跑（QUEUE"待跑"区；没跑出 best 时 GUI 会提示"暂无模型"）——
-    'G-Full-CAWR-Long': ('v1', [1, 2], 3, True, '渐进式+CAWR·Long160轮'),
-    'V2-Full':        ('v2', [1, 2], 3, True,  '修正版49-token注意力'),
-    'V2-NoTF':        ('v2', [1, 2], 0, True,  'V2架构去Transformer'),
-    # —— 曾出现/弃用（若想留测试入口可保留，没跑出 best 会提示暂无模型）——
-    # 'G-NoSE-CAWR':  ('v1', None, 3, True, '渐进式无SE(弃用)'),
-    # 'G-NoTF':       ('v1', [1, 2], 0, True, 'v1去Transformer(弃用)'),
-    # 'G-SingleSE':   ('v1', [1], 3, True, '单尺度SE(暂缓)'),
-    # 'G-PureBB':     ('v1', None, 0, False, '纯骨干(暂缓)'),
+    cid: (_mr.arch_of(cid), _mr.regions_of(cid), _mr.tf_of(cid), _mr.dec_of(cid), _mr.short_of(cid))
+    for cid in _mr.ORDER
 }
-DEFAULT_CONFIG = 'V2-Full'     # 下拉默认值（与旧版行为一致）
+DEFAULT_CONFIG = _mr.DEFAULT_MODEL     # 下拉默认值（与旧版行为一致）
 D_MODEL = 512
 NHEAD = 8
 SEEDS = (1, 2)                  # 主实验约定 seed1/2（G-Full 旧 seed0 也可被 glob 命中，不限此表）
 
-# —— 下拉列表显示用的"完整中文名称"（与论文/PRESETS 语义一致，2026-09-08 加）——
-CN_NAMES = {
-    'G-Full':           '渐进式解冻·RLRP调度·含多区域SE（历史基线）',
-    'G-NoSE':           '渐进式解冻·RLRP调度·无多区域SE（历史基线）',
-    'S-NoProg':         '全程全解冻·含多区域SE·CAWR调度',
-    'S-NoSE':           '全程全解冻·无多区域SE·CAWR调度（SE消融）',
-    'G-Full-CAWR':      '渐进式解冻·CAWR调度·含多区域SE',
-    'G-Full-CAWR-Long': '渐进式解冻·CAWR调度·Long160轮·含多区域SE',
-    'V2-Full':          'V2修正Transformer·全程全解冻·含多区域SE（49-token真注意力）',
-    'V2-NoTF':          'V2架构去Transformer·全程全解冻·含多区域SE（纯注意力消融对照）',
-}
-# —— 完整轮数目标（镜像 run_queue LONG_CONFIGS：Long=160，其余=100）——
-TARGET_EPOCHS = {'G-Full-CAWR-Long': 160}
+# —— 完整中文名称 / 完整轮数目标（注册表派生；G-Full-CAWR-Long=160，其余 100）——
+CN_NAMES = dict(_mr.MODEL_CN)
+TARGET_EPOCHS = dict(_mr.MODEL_TARGET_EPOCHS)
 RUNS_DIR = os.path.join(_HERE, 'runs')
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -255,6 +231,7 @@ class Predictor:
     未跑出 best 的配置 → __init__ 抛 ModelNotReadyError（GUI 捕获后提示"暂无模型"）。"""
 
     def __init__(self, config_id=DEFAULT_CONFIG, verbose=True, device=None):
+        config_id = _mr.normalize(config_id)   # 兼容 'S-NoProG' 等显示写法 → 规范 key
         self.config_id = config_id
         if config_id not in MODEL_REGISTRY:
             raise ValueError(f'未知配置 {config_id}（可选: {", ".join(MODEL_REGISTRY)}）')

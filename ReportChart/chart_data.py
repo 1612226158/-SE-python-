@@ -22,12 +22,43 @@ chart_data.py —— ReportChart 统一实验数据读取模块（2026-09-08 会
   - G-Full 历史 seed0/1 并存：load_model 默认取"行数最完整"的 seed（可显式传 seed 覆盖）。
 """
 import os
+import sys
 import glob
 import pandas as pd
 
 # ============ 路径（基于本文件定位，与 cwd 无关） ============
 _HERE = os.path.dirname(os.path.abspath(__file__))
 RUNS = os.path.join(os.path.dirname(_HERE), 'runs')
+
+# ---------- 模型名 → 元数据（中文全称/短说明）唯一来源 = src_v2\model_registry.py ----------
+# 新增/改模型名一律去 model_registry.py；本模块按 id 索引，注册表缺失时优雅降级为原名。
+_SRC_V2 = os.path.dirname(_HERE)
+if _SRC_V2 not in sys.path:
+    sys.path.insert(0, _SRC_V2)
+try:
+    import model_registry as _mr
+except Exception:          # 注册表被隔离/未生成时降级：不查元数据，仅按原名使用
+    _mr = None
+
+
+def _cid(name):
+    """显示写法 → 规范 key（如 S-NoProG → S-NoProg）；注册表不可用时原样返回。"""
+    return _mr.normalize(name) if _mr is not None else name
+
+
+def model_cn(name):
+    """模型中文全称（GUI 说明行 / 汇报 / 图注用）。"""
+    return _mr.cn_of(name) if _mr is not None else name
+
+
+def model_short(name):
+    """模型短说明。"""
+    return _mr.short_of(name) if _mr is not None else name
+
+
+def is_known(name):
+    """该模型 id 是否已在 model_registry.py 注册。"""
+    return _mr.is_known(name) if _mr is not None else True
 
 # ---------- 输出文件名推导（2026-09-08 会话8 加：消灭 out*.pdf 硬编码） ----------
 
@@ -41,8 +72,9 @@ PAIR_TAGS = {
 
 
 def pair_tag(model_a, model_b):
-    """由模型对推导文件名对比段：优先命中论文历史标签，否则自动拼 modelA_vs_modelB。"""
-    key = tuple(sorted([model_a, model_b]))
+    """由模型对推导文件名对比段：优先命中论文历史标签，否则自动拼 modelA_vs_modelB。
+    输入接受显示写法（自动归一化到规范 key）。"""
+    key = tuple(sorted([_cid(model_a), _cid(model_b)]))
     if key in PAIR_TAGS:
         return PAIR_TAGS[key]
     return f'{model_a}_vs_{model_b}'
@@ -118,6 +150,7 @@ def load_model(config_id, seed=None, verbose=True):
     - 返回按 epoch 升序、同 epoch 去重（保留最后一条）的 DataFrame；
     - 无数据 → 抛 FileNotFoundError（提示该模型还没跑 / config_id 拼错）。
     """
+    config_id = _cid(config_id)   # 兼容 'S-NoProG' 等显示写法
     df = _read_all(config_id)
     if df.empty:
         raise FileNotFoundError(
@@ -174,8 +207,9 @@ def model_final(config_id, seed=None, verbose=False):
 def results_best(config_id):
     """从 results_<config>_seed*.json 读该模型的论文口径最佳值（跑完才生成）。
     返回 (best_val_acc, best_val_epoch, seed) 取最高 seed；无 results → (None, None, None)。
-    注：results 的 best 是训练结束时汇总的"正式成绩"（如 S-NoProG 82.63@74）；
+    注：results 的 best 是训练结束时汇总的"正式成绩"（如 S-NoProg 82.63@74）；
     与 model_best()（metrics 口径，如 82.634）可能差 0.00x，引用论文数字请用本函数。"""
+    config_id = _cid(config_id)
     best = None
     for p in sorted(glob.glob(os.path.join(RUNS, f'results_{config_id}_seed*.json'))):
         try:
@@ -198,6 +232,7 @@ def best_ckpt_path(config_id, verbose=False):
     """返回该模型应加载的 best checkpoint 绝对路径（与 results_best 的 seed 对齐；
     无 results 时退回 glob 到的最高 val_acc 那个 best.pth）。无 → None。
     论文图/推理脚本只需输入模型英文名即可拿到正确 checkpoint。"""
+    config_id = _cid(config_id)
     _, _, seed = results_best(config_id)
     cands = sorted(glob.glob(os.path.join(RUNS, f'checkpoint_{config_id}_seed*_best.pth')))
     if not cands:

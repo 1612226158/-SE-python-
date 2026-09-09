@@ -101,25 +101,11 @@ SNAPSHOT_EPOCH = _cfg.get('SNAPSHOT_EPOCH', _DEFAULTS['SNAPSHOT_EPOCH'])
 #   G-NoSE-CAWR  = 渐进式+CAWR+无SE（早期对照，已弃用——主模型候选已转全解冻，见下）
 #   S-NoSE       = 全解冻+CAWR+无SE（★当前 SE 消融，对照 S-NoProg）
 # 【当前主模型候选 = S-NoProg（全解冻+SE，82.63%@74）；其 SE 消融 = S-NoSE】
-PRESETS = {
-    # —— G 系列：渐进式解冻家族 ——
-    'G-Full':     dict(regions=[1, 2], transformer_layers=3, use_decouple=True,  unfreeze='progressive'),  # RLRP时代主结果（56.88过时，仅留档）
-    'G-Full-CAWR':dict(regions=[1, 2], transformer_layers=3, use_decouple=True,  unfreeze='progressive', scheduler='cawr'),  # 渐进式+CAWR 主对照（70.82%@99，n=1，seed2 排队复现）
-    'G-Full-CAWR-Long':dict(regions=[1, 2], transformer_layers=3, use_decouple=True,  unfreeze='progressive', scheduler='cawr'),  # G-Full-CAWR 拉长到 160 轮（100→160 断点续跑）
-    # —— S 系列：全解冻家族（主模型候选方向）——
-    'S-NoProg':   dict(regions=[1, 2], transformer_layers=3, use_decouple=True,  unfreeze='none'),  # ★主模型候选：全解冻+SE（82.63%@74，n=1）
-    'S-NoSE':     dict(regions=None,    transformer_layers=3, use_decouple=True,  unfreeze='none'),  # ★SE 消融：全解冻+无SE（对照 S-NoProg，2026-09-05 新增）
-    # —— V2 路线：修正版 49-token Transformer（2026-09-05 立项，全解冻基线对齐 S-NoProg）——
-    'V2-Full':    dict(model='v2', regions=[1, 2], transformer_layers=3, use_decouple=True,  unfreeze='none'),  # V2 全解冻+真多token注意力（核心对照：vs S-NoProg 看修正Transformer净增益）
-    'V2-NoTF':    dict(model='v2', regions=[1, 2], transformer_layers=0, use_decouple=True,  unfreeze='none'),  # V2 架构去掉Transformer栈（Identity直通）：V2-Full vs V2-NoTF = 纯注意力增益
-    'G-V2':       dict(model='v2', regions=[1, 2], transformer_layers=3, use_decouple=True,  unfreeze='progressive', scheduler='cawr'),  # 【2026-09-09 立项】渐进式解冻(30/60)+V2修正头：2×2网格第四格（头修正×解冻策略），对照 G-Full-CAWR(v1头渐进 80.96) / V2-Full(V2头全解冻 83.353)——验证 V2 修正头下渐进式的小样本优势与预算收益是否保持
-    # —— 已弃用 / 暂缓（勿排队列；如需复跑先取消注释并确认键名唯一）——
-    # 'G-NoSE-CAWR':dict(regions=None, transformer_layers=3, use_decouple=True, unfreeze='progressive', scheduler='cawr'),  # 渐进式无SE（弃用：SE消融须对准全解冻主模型）
-    # 'G-NoTF':     dict(regions=[1, 2], transformer_layers=0, use_decouple=True,  unfreeze='progressive'),  # Transformer 消融（已定弱化，暂缓）
-    # 'G-NoSE':     dict(regions=None,    transformer_layers=3, use_decouple=True,  unfreeze='progressive'),  # RLRP 旧消融（已完成，勿再跑）
-    # 'G-SingleSE': dict(regions=[1],     transformer_layers=3, use_decouple=True,  unfreeze='progressive'),  # 单尺度SE（暂缓）
-    # 'G-PureBB':   dict(regions=None,    transformer_layers=0, use_decouple=False, unfreeze='progressive'),  # 纯骨干（暂缓）
-}
+# 【模型定义唯一真源 = src_v2\model_registry.py（2026-09-09 会话9 拆出）】
+# 改模型参数 / 中文名 / 家族 / 目标轮数 / 新增模型 → 去 model_registry.py 改 MODELS 条目；
+# 本文件只做别名导入（行为与旧 PRESETS 完全一致），不再单独维护字典。
+# 命名族谱与"无SE 三兄弟"防混淆说明见 model_registry.py 顶部 docstring。
+from model_registry import MODEL_PARAMS as PRESETS
 unfreeze_mode = PRESETS[CONFIG_ID]['unfreeze']
 # state2/3 的调度器：'cawr'=余弦退火重启（G-Full-CAWR 用，与 S-NoProg 同类型，隔离"RLRP 地板"混淆）；缺省='rlrp'（原行为）
 SCHEDULER_MODE = PRESETS[CONFIG_ID].get('scheduler', 'rlrp')

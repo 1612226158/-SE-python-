@@ -34,6 +34,8 @@ LOG = os.path.join(RUNS, "queue_log.txt")
 PYTHON = sys.executable  # 用启动本脚本的同一个 Python（保证 torch 1.11 环境）
 
 # —— 执行队列总览（2026-09-09 更新）——
+# 模型"参数/中文名/家族/目标轮数"唯一真源 = src_v2\model_registry.py（train.py PRESETS / GUI / ReportChart 共用）；
+# 本文件只维护 QUEUE 顺序与 Long 机制——"选队列/换顺序"改这里，"改模型定义/新增模型"改 model_registry.py。
 # 命名速查（与 train.py PRESETS 顶部族谱一致）：
 #   G- = 渐进式解冻（state1→2 @30轮、state2→3 @60轮）；S- = 全解冻（unfreeze='none'，标准微调）
 #   -CAWR = CAWR 调度（T_0=5, T_mult=2, eta_min=1e-6）；无后缀 = RLRP 旧时代（已过时仅留档）
