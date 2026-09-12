@@ -376,7 +376,7 @@ def stage_plot():
     ax1.set_xticks(x)
     ax1.set_xticklabels(labels)
     ax1.set_ylim(0, 100)
-    ax1.legend(loc='lower right', fontsize=9)
+    ax1.legend(loc='upper left', fontsize=9)
     ax1.set_title('(a) 聚合准确率：小样本切片', fontsize=12)
 
     # ---- 右面板：前缀趋势（前 k 个最少类的聚合 acc，k=10..100 + 全体）----
@@ -409,7 +409,7 @@ def stage_plot():
     ax2.set_xticks(xs_all)
     ax2.set_xticklabels([str(k) for k in xs] + ['全体254'])
     ax2.set_ylim(0, 100)
-    ax2.legend(loc='lower right', fontsize=9)
+    ax2.legend(loc='upper left', fontsize=9)
     ax2.set_title('(b) 前缀趋势：差距随类样本量变化', fontsize=12)
     ax2.grid(True, alpha=0.4)
 

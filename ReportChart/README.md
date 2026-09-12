@@ -65,6 +65,17 @@ fig_out('val_acc', 'G-Full-CAWR', 'S-NoProg')
 - **论文对应**：fig:tail-class-acc（长尾反转：最少50类渐进式 +3.64pp、最少100类 +2.15pp、全体 254 全解冻仍 +1.67pp → 互补）
 - ⚠ infer 阶段需要 GPU/CPU 推理较久（~1817 张 × 2 模型），平时只重跑 `plot` 即可（读已有 csv）。
 
+### 4. `eval_confusion_matrix.py` —— 混淆矩阵与逐类错误分析（2026-09-12 建）
+- **回答的问题**：模型到底错在哪（254×254 混淆矩阵）／哪些类最差（逐类 P/R/F1/support）／最典型混淆对（"真值→误判" top-N）
+- **设备**：默认 **CPU**（不抢训练 GPU；val 14,603 张全量约 17-20 分钟，`--threads` 可调）
+- **五阶段用法**：
+  - `smoke --model S-NoProG`（5 个文件夹自检，~0.5 分钟）
+  - `infer --model S-NoProG` → `confusion_<model>.npz`（含类名）
+  - `report` → 控制台总成绩/最差类/top 混淆对 + `per_class_metrics_*.csv` + `top_confusions_*.csv`
+  - `plot` → `confusion_top_pairs_<model>.pdf`（top 混淆对条形 + 高混淆类子矩阵热力图）、`per_class_recall_<model>.pdf`（逐类召回+最差类）
+  - `all` = infer + report + plot
+- **链接**：模型名用 `model_registry.py` 注册 key；checkpoint 由 `chart_data.best_ckpt_path` 解析；**自动分派 v1 头（ResNetTransformer）/ v2 头（ResNetTransformerV2）**并用 checkpoint 的 `arch` 字段校验
+
 ## 三、怎么画一张新对比图（模板步骤）
 
 ```python

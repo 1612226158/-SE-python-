@@ -89,25 +89,18 @@ def main():
     ba, bb = df_a['val_acc'].idxmax(), df_b['val_acc'].idxmax()
     ax2.plot(ep[ba], df_a['val_acc'][ba], 'o', color=color_a, markersize=6, zorder=6)
     ax2.plot(ep[bb], df_b['val_acc'][bb], 's', color=color_b, markersize=6, zorder=6)
-    # best 标注（视觉诊断后定稿：峰点就近小标注+白底；ep92-99 曲线交叉区用左上方偏移，避免长引线压线）
-    if df_b['val_acc'][bb] > df_a['val_acc'][ba]:   # 通常 MODEL_B 峰更高，标其上方
-        ax2.annotate(f"{cn_b}: {df_b['val_acc'][bb]:.2f}%@ep{int(ep[bb])}",
-                     xy=(ep[bb], df_b['val_acc'][bb]), xytext=(ep[bb] - 2, df_b['val_acc'][bb] + 2.6),
-                     color=color_b, fontsize=10, fontweight='bold', va='bottom', ha='center',
-                     bbox=dict(boxstyle='round,pad=0.25', facecolor='white', edgecolor=color_b, alpha=0.95))
-        ax2.annotate(f"{cn_a}: {df_a['val_acc'][ba]:.2f}%@ep{int(ep[ba])}",
-                     xy=(ep[ba], df_a['val_acc'][ba]), xytext=(ep[ba] - 1, df_a['val_acc'][ba] + 2.8),
-                     color=color_a, fontsize=10, fontweight='bold', va='bottom', ha='center',
-                     bbox=dict(boxstyle='round,pad=0.25', facecolor='white', edgecolor=color_a, alpha=0.95))
-    else:
-        ax2.annotate(f"{cn_a}: {df_a['val_acc'][ba]:.2f}%@ep{int(ep[ba])}",
-                     xy=(ep[ba], df_a['val_acc'][ba]), xytext=(ep[ba] - 2, df_a['val_acc'][ba] + 2.6),
-                     color=color_a, fontsize=10, fontweight='bold', va='bottom', ha='center',
-                     bbox=dict(boxstyle='round,pad=0.25', facecolor='white', edgecolor=color_a, alpha=0.95))
-        ax2.annotate(f"{cn_b}: {df_b['val_acc'][bb]:.2f}%@ep{int(ep[bb])}",
-                     xy=(ep[bb], df_b['val_acc'][bb]), xytext=(ep[bb] - 1, df_b['val_acc'][bb] + 2.8),
-                     color=color_b, fontsize=10, fontweight='bold', va='bottom', ha='center',
-                     bbox=dict(boxstyle='round,pad=0.25', facecolor='white', edgecolor=color_b, alpha=0.95))
+    # best 标注：文字精简为"数值@ep"（模型全名已在图例），两框按峰高错开 + 细引线指向峰点，
+    # 避免长文本框互相重叠或整片盖住曲线（2026-09-09 视觉诊断后重构）
+    best_a = (int(ep[ba]), df_a['val_acc'][ba], color_a)
+    best_b = (int(ep[bb]), df_b['val_acc'][bb], color_b)
+    high, low = sorted([best_a, best_b], key=lambda t: -t[1])
+    for (x, y, color), dy in ((high, 3.8), (low, 3.4)):
+        xl = x + (0 if dy == 3.8 else 0.6)   # 低峰框略右移，避免贴其右侧上行曲线
+        ax2.annotate(f'{y:.2f}%@ep{x}',
+                     xy=(x, y), xytext=(xl, y + dy),
+                     fontsize=10, fontweight='bold', va='bottom', ha='center', color=color,
+                     bbox=dict(boxstyle='round,pad=0.22', facecolor='white', edgecolor=color, alpha=0.92),
+                     arrowprops=dict(arrowstyle='-', color=color, lw=0.9, alpha=0.5))
     ax2.set_xlabel('训练轮次 (Epoch)')
     ax2.set_ylabel('验证集准确率 (%)')
     ax2.set_ylim(10, 90)
