@@ -22,3 +22,6 @@ _*.py
 predict_gui_snoprog-old-ui.py
 predict_gui_snoprog.py.bak_qt_migration
 ReportChart/*.npz
+
+# human_loop: 只入库脚本与说明；导出包（图片副本/标注表/κ 报告）不入库
+human_loop/exports/
