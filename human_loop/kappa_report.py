@@ -122,6 +122,13 @@ def main():
     pack = a.pack if os.path.isabs(a.pack) else os.path.join(EXPORT_ROOT, a.pack)
     if not os.path.isdir(pack):
         pack = a.pack
+    if not os.path.isdir(pack) and not os.path.isabs(a.pack):
+        # 兜底：允许在任意 CWD 下用 "exports/<包名>" 或 "<包名>" 调用（此前只在 human_loop 目录下才行）
+        cand = os.path.join(os.path.dirname(os.path.abspath(__file__)), a.pack)
+        if os.path.isdir(cand):
+            pack = cand
+    if not os.path.isdir(pack):
+        raise SystemExit(f'[hl] 找不到抽样包目录：{a.pack}（已尝试 {EXPORT_ROOT} 与脚本目录）')
     key_rows = read_csv(os.path.join(pack, '_key.csv'))
     if key_rows is None:
         raise SystemExit(f'[hl] {pack} 下找不到 _key.csv（请确认是 make_kappa_pack 的产物）')

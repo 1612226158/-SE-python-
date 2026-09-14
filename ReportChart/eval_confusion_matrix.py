@@ -29,6 +29,7 @@ import sys
 import json
 import csv
 import time
+import hashlib
 import argparse
 
 # —— 路径注入（等效 PyCharm Sources Root）——
@@ -124,18 +125,26 @@ def _transform(mean, std):
     ])
 
 
-def val_folders():
-    """val/ 下数字文件夹（按 id 升序）。"""
+def val_folders(count_skipped=None):
+    """val/ 下数字文件夹（按 id 升序）。count_skipped 为 dict 时，统计被丢弃的非数字项。"""
     out = []
     for name in os.listdir(VAL_ROOT):
         fp = os.path.join(VAL_ROOT, name)
         if name.isdigit() and os.path.isdir(fp):
             out.append(int(name))
+        elif count_skipped is not None:
+            count_skipped['nonnumeric'] = count_skipped.get('nonnumeric', 0) + 1
     return sorted(out)
 
 
 # ============ 推理 ============
-def stage_infer(model_name, limit=None, threads=8, verbose=True):
+def stage_infer(model_name, limit=None, threads=8, verbose=True, dump=False):
+    """CPU 全量推理 → 混淆矩阵 npz。
+
+    dump=True 时额外落盘逐图预测 `preds_<model>.csv`（fid,name,true_index,pred_index），
+    用于离线合并模拟的"分割稳定性"分析（仅凭聚合 CM 无法反推逐图）；
+    同时把**类别顺序哈希**与**四个跳过计数器**写入 npz，供溯源与分母核对。
+    """
     torch.set_num_threads(threads)
     net, ck, renew, idx2name, ckpt_path = build_and_load(model_name, verbose=verbose)
     fid2cls, _renew, n_cls = build_truth_map()
@@ -143,14 +152,25 @@ def stage_infer(model_name, limit=None, threads=8, verbose=True):
     tf = _transform(mean.tolist() if hasattr(mean, 'tolist') else mean,
                     std.tolist() if hasattr(std, 'tolist') else std)
 
-    fids = [f for f in val_folders() if f in fid2cls]
+    skip = {'nonnumeric': 0, 'not_in_map': 0, 'ext_filtered': 0, 'open_failed': 0}
+    all_folders = val_folders(count_skipped=skip)
+    fids = [f for f in all_folders if f in fid2cls]
+    skip['not_in_map'] = len(all_folders) - len(fids)
     if limit:
         fids = fids[:limit]
-    total_imgs = sum(len([n for n in os.listdir(os.path.join(VAL_ROOT, str(f)))
-                          if n.lower().endswith(VALID_EXTS)]) for f in fids)
+    total_imgs = 0
+    for f in fids:
+        folder = os.path.join(VAL_ROOT, str(f))
+        entries = os.listdir(folder)
+        keep = [n for n in entries if n.lower().endswith(VALID_EXTS)]
+        skip['ext_filtered'] += len(entries) - len(keep)
+        total_imgs += len(keep)
     print(f'[cm] val 文件夹 {len(fids)} 个，待推理图像 {total_imgs} 张（CPU, threads={threads}）', flush=True)
+    if dump:
+        print(f'[cm] --dump-preds：将落盘逐图预测；跳过计数 {skip}', flush=True)
 
     cm = np.zeros((n_cls, n_cls), dtype=np.int64)
+    rows = [] if dump else None
     done, t0 = 0, time.time()
     with torch.no_grad():
         for k, fid in enumerate(fids, 1):
@@ -162,10 +182,13 @@ def stage_infer(model_name, limit=None, threads=8, verbose=True):
                 try:
                     img = Image.open(os.path.join(folder, name)).convert('RGB')
                 except Exception:
+                    skip['open_failed'] += 1
                     continue
                 out = net(tf(img).unsqueeze(0))
                 pi = int(out.argmax(dim=1).item())
                 cm[ti, pi] += 1
+                if dump:
+                    rows.append((fid, name, ti, pi))
                 done += 1
             if verbose and (k % 20 == 0 or k == len(fids)):
                 acc = np.trace(cm) / max(1, cm.sum())
@@ -173,11 +196,33 @@ def stage_infer(model_name, limit=None, threads=8, verbose=True):
                 print(f'  [{k}/{len(fids)}] 图 {done}/{total_imgs} 累计acc={acc*100:.2f}% '
                       f'用时{el/60:.1f}min 预计剩余{el/max(1,done)*(total_imgs-done)/60:.1f}min', flush=True)
     names = [idx2name[i] for i in range(n_cls)]
+    # 类别顺序哈希（冻结口径：json.dumps(sort_keys,ensure_ascii=False,separators) + sha256；值为 str）
+    order = {idx2name[i]: str(i) for i in range(n_cls)}
+    order_sha = hashlib.sha256(json.dumps(order, sort_keys=True, ensure_ascii=False,
+                                          separators=(',', ':')).encode('utf-8')).hexdigest()
     np.savez_compressed(_out('confusion', model_name, 'npz'),
                         cm=cm, names=np.array(names, dtype=object),
                         model=model_name, ckpt=os.path.basename(ckpt_path),
-                        limit=(-1 if not limit else limit))
-    print(f'[cm] 已保存 {_out("confusion", model_name, "npz")}')
+                        limit=(-1 if not limit else limit),
+                        order_sha256=order_sha,
+                        n_skip_nonnumeric=skip['nonnumeric'],
+                        n_skip_not_in_map=skip['not_in_map'],
+                        n_skip_ext_filtered=skip['ext_filtered'],
+                        n_skip_open_failed=skip['open_failed'],
+                        n_inferred=done)
+    print(f'[cm] 已保存 {_out("confusion", model_name, "npz")}'
+          + (f'｜order_sha256={order_sha[:16]}…｜跳过 {skip}' if dump else ''))
+    if dump:
+        outp = _out('preds', model_name, 'csv')
+        with open(outp, 'w', encoding='utf-8-sig', newline='') as f:
+            f.write(f'# model={model_name} ckpt={os.path.basename(ckpt_path)} '
+                    f'n_inferred={done} order_sha256={order_sha} '
+                    f'skip_nonnumeric={skip["nonnumeric"]} skip_not_in_map={skip["not_in_map"]} '
+                    f'skip_ext_filtered={skip["ext_filtered"]} skip_open_failed={skip["open_failed"]}\n')
+            w = csv.writer(f)
+            w.writerow(['fid', 'filename', 'true_index', 'pred_index'])
+            w.writerows(rows)
+        print(f'[cm] 已保存逐图预测 {outp}（{len(rows)} 行）')
     return cm, names
 
 
@@ -361,21 +406,23 @@ def main():
     ap.add_argument('stage', choices=['smoke', 'infer', 'report', 'plot', 'all'])
     ap.add_argument('--model', default='S-NoProG', help='注册表模型 key（如 S-NoProG / V2-Full / G-Full-CAWR）')
     ap.add_argument('--limit', type=int, default=None, help='只推理前 N 个 val 文件夹（冒烟用）')
-    ap.add_argument('--threads', type=int, default=8, help='CPU 线程数（默认 8，避免抢占训练）')
+    ap.add_argument('--threads', type=int, default=8, help='CPU 线程数（默认 8；与训练共存建议 2~4）')
+    ap.add_argument('--dump-preds', action='store_true',
+                    help='额外落盘逐图预测 preds_<model>.csv（供合并模拟的分割稳定性分析）')
     a = ap.parse_args()
 
     if a.stage == 'smoke':
-        cm, names = stage_infer(a.model, limit=a.limit or 5, threads=a.threads)
+        cm, names = stage_infer(a.model, limit=a.limit or 5, threads=a.threads, dump=a.dump_preds)
         acc = np.trace(cm) / max(1, cm.sum()) * 100
         print(f'[cm] 冒烟完成：{cm.sum()} 张，acc={acc:.2f}%（仅前 {a.limit or 5} 个文件夹，非正式成绩）')
     elif a.stage == 'infer':
-        stage_infer(a.model, limit=a.limit, threads=a.threads)
+        stage_infer(a.model, limit=a.limit, threads=a.threads, dump=a.dump_preds)
     elif a.stage == 'report':
         stage_report(a.model)
     elif a.stage == 'plot':
         stage_plot(a.model)
     else:
-        stage_infer(a.model, limit=a.limit, threads=a.threads)
+        stage_infer(a.model, limit=a.limit, threads=a.threads, dump=a.dump_preds)
         stage_report(a.model)
         stage_plot(a.model)
 

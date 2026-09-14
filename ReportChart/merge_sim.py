@@ -34,6 +34,7 @@ import sys
 import csv
 import json
 import math
+import random
 import hashlib
 import zipfile
 import pickle
@@ -43,6 +44,11 @@ import itertools
 from datetime import datetime
 
 import numpy as np
+
+try:                      # 默认 GBK 控制台下自证 #2b 的 "−" 会抛 UnicodeEncodeError（同目录其它脚本亦如此处理）
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
 
 HERE = os.path.dirname(os.path.abspath(__file__))          # src_v2/ReportChart
 SRCV2 = os.path.dirname(HERE)                              # src_v2
@@ -184,19 +190,27 @@ def tie_envelope(cm, pairs, K):
         a = acc_part(cm, g)
         return dict(n_solutions=1, acc_min=a, acc_max=a, comp_min=len(g), comp_max=len(g),
                     classes_min=sum(1 for x in g if len(x) > 1), classes_max=sum(1 for x in g if len(x) > 1))
-    combos = itertools.combinations(range(len(cand)), need)
     total = math.comb(len(cand), need)
-    cap = 200                                  # 枚举上限：超过则确定性抽样，并如实标注 n_sampled
+    # K=50 共 715 解 → 全枚举（必须！否则给不出论文表注的真上界 89.17%，真极大在第 272 个组合）；
+    # 更大规模（如 K=100 的 8855 解）改为**确定性随机抽样**（前缀抽样有偏，不用），并如实标注 sampled。
+    cap = 900
+    if total <= cap:
+        sel = list(itertools.combinations(range(len(cand)), need))
+        sampled = False
+    elif total <= 200000:
+        sel = random.Random(12345).sample(list(itertools.combinations(range(len(cand)), need)), cap)
+        sampled = True
+    else:
+        sel = list(itertools.islice(itertools.combinations(range(len(cand)), need), cap))
+        sampled = True
     accs, comps, cover = [], [], []
-    for k, idx in enumerate(combos):
-        if k >= cap:
-            break
+    for idx in sel:
         sub = above + [cand[t] for t in idx]
         g = groups_from_pairs(len(cm), sub, len(sub))
         accs.append(acc_part(cm, g))
         comps.append(len(g))
         cover.append(sum(1 for x in g if len(x) > 1))
-    return dict(n_solutions=total, n_sampled=len(accs),
+    return dict(n_solutions=total, n_sampled=len(accs), sampled=sampled,
                 acc_min=min(accs), acc_max=max(accs), comp_min=min(comps), comp_max=max(comps),
                 classes_min=min(cover), classes_max=max(cover))
 
@@ -609,8 +623,9 @@ def stage_stats(a):
         extra = ''
         if env and env['n_solutions'] > 1:
             extra = (f'｜并列解 {env["n_solutions"]}'
-                     + (f'（抽样 {env["n_sampled"]}）' if env['n_sampled'] < env['n_solutions'] else '')
-                     + f'：C-part {env["acc_min"] * 100:.2f}~{env["acc_max"] * 100:.2f}%、组 {env["comp_min"]}~{env["comp_max"]}')
+                     + ('（全枚举）' if not env.get('sampled') else f'（随机抽样 {env["n_sampled"]}）')
+                     + f'：C-part {env["acc_min"] * 100:.2f}~{env["acc_max"] * 100:.2f}%、'
+                       f'组 {env["comp_min"]}~{env["comp_max"]}')
         add(f'top{K} C-tol / C-part / 组数',
             f'{t:.2f}% / {p:.2f}% / {len(g)}（宏 F1 {macro_f1(merge_cm(cm, g)) * 100:.2f}%）', extra)
 
@@ -622,6 +637,140 @@ def stage_stats(a):
         w.writerow(['item', 'value', 'note'])
         w.writerows(rows)
     print(f'  已写 {os.path.basename(out)}')
+    return 0
+
+
+def stage_null(a):
+    """随机类对零分布（按期望混淆量分层匹配）——回答"增益是否只是选对了类对"。
+
+    口径（v4 §3.5）：候选对来自同一 CM，故 Δacc 恒 ≥0 且属 in-sample；本阶段给出"随机挑同样数量的
+    类对"的增益分布（报分位而非均值）与观测值的百分位。
+      · 分层：按期望混淆量 E_ij = row_i·col_j/N 的**十分位**匹配；
+      · 双版本：exclusive（两两不共享类别，与 spec A 同构）与 shared（允许共享，符合真实 top-K）。
+    """
+    cm, names, meta = load_cm(a.npz)
+    n = len(names)
+    N = int(cm.sum())
+    pairs = ranked_pairs(cm)
+    row = cm.sum(axis=1).astype(float)
+    col = cm.sum(axis=0).astype(float)
+    E = np.array([row[i] * col[j] / N for (_, i, j) in pairs])
+    order = np.argsort(E)
+    dec = np.empty(len(E), dtype=int)
+    for rank, idx in enumerate(order):
+        dec[idx] = min(9, int(rank / max(1, len(E)) * 10))
+    by_dec = collections.defaultdict(list)
+    for k, d in enumerate(dec):
+        by_dec[d].append(k)
+
+    idx = {nm: i for i, nm in enumerate(names)}
+    spec_pairs = []
+    if a.spec and os.path.exists(a.spec):
+        for x, y in load_spec(a.spec)['pairs']:
+            spec_pairs.append((idx[x], idx[y]))
+    else:
+        for x, y in SPEC_A_PAIRS:
+            spec_pairs.append((idx[x], idx[y]))
+    obs_dec, obs_delta = [], 0.0
+    for (i, j) in spec_pairs:
+        e = row[i] * col[j] / N
+        obs_dec.append(int(dec[int(np.argmin(np.abs(E - e)))]))
+        obs_delta += (int(cm[i, j]) + int(cm[j, i])) / N
+    print(f'[null] 池 {len(pairs)} 个无向对；观测 K={len(spec_pairs)}、Δacc={obs_delta * 100:.4f}pp；'
+          f'观测所属十分位 {obs_dec}')
+    rng = np.random.default_rng(a.seed)
+    out = []
+    for label, exclusive in (('exclusive', True), ('shared', False)):
+        vals = []
+        for _ in range(a.null):
+            chosen, used, tries = [], set(), 0
+            for d in obs_dec:
+                while tries <= 5000:
+                    tries += 1
+                    _, i, j = pairs[int(rng.choice(by_dec[d]))]
+                    if exclusive and (i in used or j in used):
+                        continue
+                    chosen.append((i, j))
+                    used.update((i, j))
+                    break
+            vals.append(sum(int(cm[i, j]) + int(cm[j, i]) for (i, j) in chosen) / N)
+        v = np.array(vals)
+        out.append((label, v))
+        print(f'  [{label:9s}] n={a.null}：p50 {np.percentile(v, 50) * 100:.4f}pp、'
+              f'p95 {np.percentile(v, 95) * 100:.4f}pp、max {v.max() * 100:.4f}pp；'
+              f'观测值百分位 {(v < obs_delta).mean() * 100:.1f}%')
+    outp = os.path.join(HERE, f'merge_sim_{a.model}_null.csv')
+    with open(outp, 'w', encoding='utf-8-sig', newline='') as f:
+        w = csv.writer(f)
+        w.writerow([f'# observed_delta_pp={obs_delta * 100:.4f}', f'K={len(spec_pairs)}',
+                    f'obs_deciles={obs_dec}', f'n={a.null}', f'seed={a.seed}'])
+        w.writerow(['variant', 'p50_pp', 'p95_pp', 'max_pp', 'observed_percentile'])
+        for label, v in out:
+            w.writerow([label, f'{np.percentile(v, 50) * 100:.4f}', f'{np.percentile(v, 95) * 100:.4f}',
+                        f'{v.max() * 100:.4f}', f'{(v < obs_delta).mean() * 100:.1f}'])
+    print(f'  已写 {os.path.basename(outp)}')
+    print('  定位：图像级 winner\'s curse 检查；**不能**界定类级候选挖掘偏置（后者由"语义 π vs oracle π 缺口"刻画）。')
+    return 0
+
+
+def stage_split(a):
+    """分割稳定性：逐图预测按**文件夹内图像**对半（保证每类两半都有代表），在半 A 选 top-K 类对、
+    在另半评估其增益 → 报"选择—评估差"分布。前置：`infer --dump-preds` 的 `preds_<model>.csv`。"""
+    preds = os.path.join(HERE, f'preds_{a.model}.csv')
+    if not os.path.exists(preds):
+        print(f'[split] 找不到 {os.path.basename(preds)}；请先跑 '
+              f'`eval_confusion_matrix.py infer --model {a.model} --dump-preds`。'
+              f'按 v5 约定：不执行则删除本条，不标【待补】。')
+        return 0
+    rows = []
+    with open(preds, encoding='utf-8-sig', newline='') as f:
+        for line in f:
+            if line.startswith('#'):
+                continue
+            parts = line.rstrip('\n').split(',')
+            if len(parts) != 4 or parts[0] == 'fid':
+                continue
+            rows.append((int(parts[0]), parts[1], int(parts[2]), int(parts[3])))
+    n_cls = max(max(r[2], r[3]) for r in rows) + 1
+    print(f'[split] 逐图记录 {len(rows)} 条；类数 {n_cls}；K={a.top}；重复 {a.reps} 次')
+    by_folder = collections.defaultdict(list)
+    for r in rows:
+        by_folder[r[0]].append(r)
+    rng = np.random.default_rng(a.seed)
+    gaps, deltas_B = [], []
+    for _ in range(a.reps):
+        A = np.zeros((n_cls, n_cls), dtype=np.int64)
+        B = np.zeros((n_cls, n_cls), dtype=np.int64)
+        for fid, recs in by_folder.items():
+            order = list(range(len(recs)))
+            rng.shuffle(order)
+            half = len(order) // 2
+            for pos, t in enumerate(order):
+                _, _, ti, pi = recs[t]
+                (A if pos < half else B)[ti, pi] += 1
+        pairsA = ranked_pairs(A)
+        if len(pairsA) < a.top:
+            continue
+        sel = pairsA[:a.top]
+        dA = sum(int(A[i, j]) + int(A[j, i]) for _, i, j in sel) / max(1, A.sum())
+        dB = sum(int(B[i, j]) + int(B[j, i]) for _, i, j in sel) / max(1, B.sum())
+        gaps.append((dA - dB) * 100)
+        deltas_B.append(dB * 100)
+    if not gaps:
+        print('[split] 分割后类对不足，未产出。')
+        return 0
+    g, dB = np.array(gaps), np.array(deltas_B)
+    print(f'  选取半增益 → 评估半：Δacc 均值 {dB.mean():.4f}pp；"选择—评估差" 均值 {g.mean():.4f}pp、'
+          f'sd {g.std(ddof=1):.4f}pp、95% [{np.percentile(g, 2.5):.4f}, {np.percentile(g, 97.5):.4f}]pp')
+    outp = os.path.join(HERE, f'merge_sim_{a.model}_split.csv')
+    with open(outp, 'w', encoding='utf-8-sig', newline='') as f:
+        w = csv.writer(f)
+        w.writerow([f'# K={a.top}', f'reps={len(g)}', f'seed={a.seed}', f'n_images={len(rows)}'])
+        w.writerow(['delta_acc_eval_mean_pp', 'gap_mean_pp', 'gap_sd_pp', 'gap_ci_lo', 'gap_ci_hi'])
+        w.writerow([f'{dB.mean():.4f}', f'{g.mean():.4f}', f'{g.std(ddof=1):.4f}',
+                    f'{np.percentile(g, 2.5):.4f}', f'{np.percentile(g, 97.5):.4f}'])
+    print(f'  已写 {os.path.basename(outp)}')
+    print('  定位：**图像级**分割稳定性检查；不能界定类级候选挖掘偏置。')
     return 0
 
 
@@ -702,12 +851,15 @@ def stage_direction(a):
 # ------------------------------------------------------------------ CLI
 def main():
     ap = argparse.ArgumentParser(description='标签体系口径评估（离线合并模拟）')
-    ap.add_argument('stage', choices=['selfcheck', 'stats', 'report', 'ranking', 'direction', 'all'])
+    ap.add_argument('stage', choices=['selfcheck', 'stats', 'report', 'ranking', 'direction',
+                                      'null', 'split', 'all'])
     ap.add_argument('--model', default=MODEL)
     ap.add_argument('--npz', default=None)
     ap.add_argument('--spec', default=None)
     ap.add_argument('--top', type=int, default=20)
     ap.add_argument('--bootstrap', type=int, default=2000)
+    ap.add_argument('--null', type=int, default=2000)
+    ap.add_argument('--reps', type=int, default=200)
     ap.add_argument('--seed', type=int, default=0)
     a = ap.parse_args()
     if a.npz is None:
@@ -720,6 +872,10 @@ def main():
         return stage_selfcheck(a)
     if a.stage in ('stats', 'all'):
         stage_stats(a)
+    if a.stage in ('null', 'all'):
+        stage_null(a)
+    if a.stage in ('split', 'all'):
+        stage_split(a)
     if a.stage in ('report', 'all'):
         if not os.path.exists(a.spec):
             raise SystemExit(f'[merge_sim] 找不到 spec：{a.spec}')
