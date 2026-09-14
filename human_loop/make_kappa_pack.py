@@ -38,9 +38,14 @@ ANNOTATOR_README = """【标注须知】请严格按以下规则操作，不要�
    - 看 images/<pair_id>/<image> 这张图；
    - 在两个候选类 option_1 / option_2 中二选一，choice 填 1 或 2（不要填类名）；
    - 若实在无法判断，choice 填 0，并在 notes 里写一句原因。
-2. 只能依据图片内容判断；可以放大看细节，但不要搜索、不要与人讨论（两人须独立标注）。
+1b. 【重要】**同一个类对（pair_id）内，左右两个候选类的顺序是固定的**（例如 P01 左永远是"锅"、右永远是"电饭煲"），
+    不会逐张颠倒；不同类对之间的左右顺序是随机分配的（用于抵消位置偏好）。所以请**按图片内容判断，不要按位置猜**。
+    若在界面上填错：回到该题重新点另一个选项即可覆盖（界面会显示"↻ 已改答"），或 Delete 清除本题（Ctrl+Z 撤销）。
+2. 只能依据图片内容判断；可以放大看细节，但不要搜索、不要与人讨论（两轮/两人须独立）。
+2b. 两个候选类都不属于、或图片本身有问题时：按 X（或点「图外·异常」按钮）写入标记 [图外]，
+    该标记不影响 choice（仍可另选 0 无法判断），再按一次 X 取消。
 3. 每张图都必须给出选择（允许 0，但请尽量少用）。
-4. 同一 pair_id 内的图片来自两个相似类、顺序已随机打乱，不要试图猜测规律。
+4. 同一 pair_id 内图片的排列顺序已打乱（与真实类别无关），不要试图按图片先后顺序猜测规律。
 5. 建议节奏：每次 20-30 分钟，避免疲劳导致的系统性偏差；如中途休息，保存 CSV 后继续。
 
 文件说明：
@@ -61,6 +66,8 @@ def main():
     ap.add_argument('--source', choices=['val', 'train'], default='val',
                     help='图片来源（默认 val；train 图更多但会与训练集重叠，一般不用）')
     ap.add_argument('--out', default=None, help='输出目录（默认 exports/<时间戳>_kappa_pack）')
+    ap.add_argument('--per-image-order', action='store_true',
+                    help='旧行为：逐张随机候选顺序（不推荐——标注者会看错位置；默认改为“类对内固定、类对间随机”）')
     a = ap.parse_args()
 
     root = VAL_ROOT if a.source == 'val' else TRAIN_ROOT
@@ -88,14 +95,23 @@ def main():
                   [(p, cls_b) for p in rng.sample(pool_b, k)])
         rng.shuffle(picked)
         os.makedirs(os.path.join(img_root, pid), exist_ok=True)
+        # 候选顺序策略（2026-09-12 用户反馈后修改）：
+        #   默认：**类对内固定**左右顺序（同一个类对的 30 张图都是 左=o1 / 右=o2，标注者不会逐张看错），
+        #         而**类对之间随机**（8 个类对里哪些是 A 左哪些是 B 左随机）→ 仍能避免位置偏置。
+        #   --per-image-order：旧行为，逐张随机（不推荐）。
+        ord_rng = random.Random(f'{a.seed}-{pid}')
+        pair_opts = [cls_a, cls_b]
+        ord_rng.shuffle(pair_opts)
         for i, (src, cls) in enumerate(picked, 1):
             ext = os.path.splitext(src)[1].lower() or '.jpg'
             name = f'{pid}_{i:03d}{ext}'
             shutil.copy2(src, os.path.join(img_root, pid, name))
-            # 每张图的两个候选顺序独立随机，避免位置偏置；两张标注表共用同一顺序
-            opts = [cls_a, cls_b]
-            rng.shuffle(opts)
-            o1, o2 = short_name(opts[0]), short_name(opts[1])
+            if a.per_image_order:
+                opts = [cls_a, cls_b]
+                rng.shuffle(opts)
+                o1, o2 = short_name(opts[0]), short_name(opts[1])
+            else:
+                o1, o2 = short_name(pair_opts[0]), short_name(pair_opts[1])
             rows.append(dict(pair_id=pid, image=f'{pid}/{name}', option_1=o1, option_2=o2,
                              choice='', notes=''))
             key_rows.append(dict(pair_id=pid, image=f'{pid}/{name}', true_class=cls,
