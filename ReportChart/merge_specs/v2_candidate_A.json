@@ -1,0 +1,42 @@
+{
+  "name": "A",
+  "description": "最小可辩护合并规范 spec A：由 6.5.6 人工盲标判定的『重叠型』类对（人工与模型均接近随机水平）构成，三对同属可回收物、处置方式一致，且三对互不共享类别（故 C-tol 与 C-part 结果相同）。",
+  "basis": "6.5.6 盲标『重叠型』分类 + 语义闸门（同属一类垃圾/同一处置方式）；CM 可测量指标（双向计数、两侧行率）仅作描述性并列，不作为入选门槛。",
+  "pairs": [
+    ["私有类-可回收物-锅", "私有类-可回收物-电饭煲"],
+    ["公共类-可回收物-鞋", "私有类-可回收物-拖鞋"],
+    ["私有类-可回收物-插头电线", "私有类-可回收物-充电线"]
+  ],
+  "reasons": {
+    "锅↔电饭煲": "外观高度同形，区分依据是功能而非视觉线索（6.5.5：46.2% 的锅被判为电饭煲）",
+    "鞋↔拖鞋": "同属鞋类、上下位/形态近似（6.5.5：38 张鞋→拖鞋、11 张反向；6.5.6 人工 46.7%）",
+    "插头电线↔充电线": "同为线缆类，区分依据是使用场景（6.5.5：54 张插头电线→充电线；6.5.6 人工 40.0%）"
+  },
+  "disclaimer": "本 spec 仅为『口径重算』的模拟输入，不构成任何合并建议；合并与否须由业务语义与处置规则决定，且不得据此修改数据集。收益为本验证集样本上的 in-sample 重算值，非重训期望、非噪声总量。",
+  "key_facts": {
+    "pairs_n": 3,
+    "involved_classes": 6,
+    "in_group_offdiag_images": 144,
+    "delta_acc_pp": 0.9861,
+    "acc_after_pct": 83.613,
+    "groups_after": 251,
+    "macro_f1_before_pct": 80.3544,
+    "macro_f1_after_pct": 80.9568,
+    "image_level_ci95_pp": [0.835, 1.157],
+    "class_cluster_sd_pp": 0.2469,
+    "class_cluster_zero_share_pct": 11.0,
+    "selection_gap_same_budget_pp": 0.41
+  },
+  "stable": {
+    "npz": "src_v2/ReportChart/confusion_S-NoProG.npz",
+    "npz_sha256": "df7ba9354058f9aace33b2a8c01ad7920a1fdd2fa50f6d474d9c183e9b13a6ab",
+    "model": "S-NoProG",
+    "ckpt": "checkpoint_S-NoProg_seed1_best.pth",
+    "limit": -1,
+    "renew_sha256": "9f5b34616614f67b8f01d850070725295308927ba5a62bc285ade8ce77e3ba8f",
+    "id2main_sha256": "5820f457f6a1b381d1390d92ad75c3bb9d79b0efce229e382750670c8319c2fa",
+    "hash_convention": "sha256(json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(',',':')))；renew/id2main 取原始 str 值，不做 int 转换",
+    "python": "3.10.6",
+    "numpy": "1.26.4"
+  }
+}

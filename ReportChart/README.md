@@ -1,7 +1,7 @@
 # ReportChart 目录说明（2026-09-08 会话8 建立）
 
 > 本目录是论文图表脚本目录（SCI 风格）。本文档说明各文件用途；**新会话画图前先读本文件 + chart_data.py 的用法**，不要重新发明数据读取。
-> 注意：本目录的 **PDF/PNG/CSV/JSON 产物不入 git**（.gitignore），只入库 .py 脚本；但产物是本机论文编译依赖（document_new.tex 从 `images/` 引用，部分图需手动复制过去）。
+> 注意：本目录 **顶层**的 **PDF/PNG/CSV/NPZ/JSON 产物不入 git**（.gitignore 只匹配直接子文件），只入库 .py 脚本；**子目录例外**——`merge_specs/*.json` 是"合并规范"文件，**需要入库**（`ReportChart/*.json` 的 `*` 不跨 `/`）。产物是本机论文编译依赖（document_new.tex 从 `images/` 引用，部分图需手动复制过去）。
 
 ## 一、chart_data.py —— 数据读取模块（画任何图的第一步）
 
@@ -36,7 +36,7 @@ fig_out('val_acc', 'G-Full-CAWR', 'S-NoProg')
 **模型英文名（key）唯一真源 = `src_v2\model_registry.py`（2026-09-09 拆出；train.py PRESETS / 预测 GUI / 本目录脚本共用）**：
 `G-Full`(渐进RLRP旧) / `G-NoSE` / `S-NoProg`(全解冻；显示写法常作 S-NoProG，自动归一化) / `S-NoSE`(全解冻无SE) / `G-Full-CAWR`(渐进CAWR) / `G-Full-CAWR-Long`(160轮) / `V2-Full`(修正版Transformer) / `V2-NoTF`(V2去Transformer) / `G-V2`(渐进+V2修正头，2×2第四格)。
 
-## 二、三个绘图脚本各画什么
+## 二、各分析脚本画什么（当前 4 个 + 1 个待建）
 
 ### 1. `plot_progressive_vs_full.py` —— 解冻策略对比（渐进式 vs 全解冻）
 - **对比**：`G-Full-CAWR`（渐进式解冻） vs `S-NoProg`（全程全解冻），各 100 轮
@@ -67,7 +67,7 @@ fig_out('val_acc', 'G-Full-CAWR', 'S-NoProg')
 
 ### 4. `eval_confusion_matrix.py` —— 混淆矩阵与逐类错误分析（2026-09-12 建）
 - **回答的问题**：模型到底错在哪（254×254 混淆矩阵）／哪些类最差（逐类 P/R/F1/support）／最典型混淆对（"真值→误判" top-N）
-- **设备**：默认 **CPU**（不抢训练 GPU；val 14,603 张全量约 17-20 分钟，`--threads` 可调）
+- **设备**：默认 **CPU**（不抢训练 GPU；val 14,603 张全量**实测约 20.1 分钟**，论文时限按保守 40 分钟预算；`--threads` 可调，与训练共存建议 2~4）
 - **五阶段用法**：
   - `smoke --model S-NoProG`（5 个文件夹自检，~0.5 分钟）
   - `infer --model S-NoProG` → `confusion_<model>.npz`（含类名）

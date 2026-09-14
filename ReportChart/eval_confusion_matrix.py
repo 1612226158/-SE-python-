@@ -12,7 +12,8 @@ eval_confusion_matrix.py —— 混淆矩阵 + 逐类错误分析（254 合并�
   checkpoint 与整体成绩由 chart_data 按名解析（best_ckpt_path / results_best）；
   支持 v1 头（ResNetTransformer）与 v2 头（ResNetTransformerV2）自动分派。
 
-【设备】默认 CPU（训练占着 GPU 时也不抢；val 14,603 张，CPU 全量约 20-40 分钟）。
+【设备】默认 CPU（训练占着 GPU 时也不抢；val 14,603 张，CPU 全量**实测约 20.1 分钟**，
+  多模型/论文时限请按保守 40 分钟预算；与训练共存时建议 --threads 2~4）。
 
 用法（分阶段，避免重复推理）：
   python eval_confusion_matrix.py smoke  --model S-NoProG             # 5 个文件夹快速自检
