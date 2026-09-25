@@ -51,7 +51,7 @@ from src_v2 import (device, DynamicMeanPad,
 # ==================== 实验配置：编辑同目录 experiment_config.json（无需改本文件） ====================
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'experiment_config.json')
 _DEFAULTS = {
-    'CONFIG_ID': 'G-Full',   # G-Full / G-NoTF / G-NoSE / G-SingleSE / G-PureBB / S-NoProg
+    'CONFIG_ID': 'G-Full',   # 配置 id 以 model_registry.py 的 MODELS 为准（含 S-StdSE）
     'SEED': 0,               # 随机种子 0/1/2，每配置跑 3 次取 mean±std
     'SMOKE': True,           # True=冒烟只跑 3 轮验证管线；正式训练 False
     'MAX_EPOCHS': 100,
@@ -60,10 +60,12 @@ _DEFAULTS = {
     'UNFREEZE1_EPOCH': 30,   # 固定解冻触发：state1→2
     'UNFREEZE2_EPOCH': 60,   # state2→3
     'SNAPSHOT_EPOCH': None,  # Long 配置跑到该轮时自动存档 100 轮快照（如 100）
+    'ALLOW_LEGACY_PROTOCOL_RESUME': False,  # 仅诊断旧实验时手动开启；正式实验禁止混合 AMP 协议
 }
 
 # temp_guard_lis = (25, 50, 75, 99)
-temp_guard_lis = (10, 20, 30, 40, 50, 60, 70, 80, 90)
+# temp_guard_lis = (10, 20, 30, 40, 50, 60, 70, 80, 90)
+temp_guard_lis = [i for i in range(100)]
 
 
 _cfg = {}
@@ -88,6 +90,8 @@ AUTO = _cfg.get('AUTO', _DEFAULTS['AUTO'])
 UNFREEZE1_EPOCH = _cfg.get('UNFREEZE1_EPOCH', _DEFAULTS['UNFREEZE1_EPOCH'])
 UNFREEZE2_EPOCH = _cfg.get('UNFREEZE2_EPOCH', _DEFAULTS['UNFREEZE2_EPOCH'])
 SNAPSHOT_EPOCH = _cfg.get('SNAPSHOT_EPOCH', _DEFAULTS['SNAPSHOT_EPOCH'])
+ALLOW_LEGACY_PROTOCOL_RESUME = _cfg.get('ALLOW_LEGACY_PROTOCOL_RESUME',
+                                        _DEFAULTS['ALLOW_LEGACY_PROTOCOL_RESUME'])
 
 # ==================== 预设配置表 PRESETS ====================
 # 【命名族谱（2026-09-05，防混淆必读）】
@@ -95,7 +99,7 @@ SNAPSHOT_EPOCH = _cfg.get('SNAPSHOT_EPOCH', _DEFAULTS['SNAPSHOT_EPOCH'])
 #         S- = 全解冻家族    （unfreeze='none'，从头到尾全参数训练）
 #   后缀：-CAWR = state2/3 用 CAWR 调度（+ backbone/head lr 提为 1e-4）
 #         无后缀 = state2/3 用 RLRP 调度（早期 RLRP 时代，数字已过时，仅留档）
-#   SE 开关：regions=[1,2]=有多区域SE；regions=None=无SE（消融用）
+#   SE 开关：regions=[1,2]=多区域SE；regions=[1]=标准全局SE；regions=None=无SE（消融用）
 # 【"无SE"三兄弟——最容易混淆，务必按前缀区分】
 #   G-NoSE       = 渐进式+RLRP+无SE（早期消融，已完成留档，勿再跑）
 #   G-NoSE-CAWR  = 渐进式+CAWR+无SE（早期对照，已弃用——主模型候选已转全解冻，见下）
@@ -132,6 +136,8 @@ VAL_ROOT = os.path.join(PROJECT_ROOT, 'val')
 RUN_TAG = f'{CONFIG_ID}_seed{SEED}'
 BEST_PTH = os.path.join(RUNS_DIR, f'checkpoint_{RUN_TAG}_best.pth')
 LAST_PTH = os.path.join(RUNS_DIR, f'checkpoint_{RUN_TAG}_last.pth')
+# 训练协议版本 2：AMP 梯度裁剪前显式 unscale，并在断点中保存全局 best / GradScaler 状态。
+TRAINING_PROTOCOL_VERSION = 2
 
 
 def seed_all(seed):
@@ -140,6 +146,55 @@ def seed_all(seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def _restore_best_state(checkpoint, epoch_start):
+    """恢复全局 best；兼容旧断点（旧格式缺字段时从历史 metrics CSV 回查）。"""
+    if checkpoint is not None:
+        required = ('best_val_acc', 'best_epoch', 'train_acc_at_best')
+        if all(key in checkpoint for key in required):
+            return (float(checkpoint['best_val_acc']),
+                    int(checkpoint['best_epoch']),
+                    float(checkpoint['train_acc_at_best']))
+
+    if epoch_start <= 0:
+        return -1.0, -1, -1.0
+
+    history = []
+    for name in os.listdir(RUNS_DIR):
+        if not (name.startswith('metrics_record') and name.endswith('.csv')):
+            continue
+        path = os.path.join(RUNS_DIR, name)
+        try:
+            df = pd.read_csv(path)
+            required_columns = {'config_id', 'seed', 'epoch', 'val_acc', 'train_acc'}
+            if not required_columns.issubset(df.columns):
+                continue
+            matched = df[(df['config_id'].astype(str) == str(CONFIG_ID)) &
+                         (pd.to_numeric(df['seed'], errors='coerce') == SEED) &
+                         (pd.to_numeric(df['epoch'], errors='coerce') < epoch_start)].copy()
+            if not matched.empty:
+                history.append(matched)
+        except Exception as exc:
+            logging.warning(f'回查历史 best 时跳过 {name}: {exc}')
+
+    if not history:
+        logging.warning('旧断点不含全局 best，且 metrics 中未找到历史记录；best 将从当前续跑段重新计算')
+        return -1.0, -1, -1.0
+
+    merged = pd.concat(history, ignore_index=True)
+    merged['val_acc'] = pd.to_numeric(merged['val_acc'], errors='coerce')
+    merged['epoch'] = pd.to_numeric(merged['epoch'], errors='coerce')
+    merged['train_acc'] = pd.to_numeric(merged['train_acc'], errors='coerce')
+    merged = merged.dropna(subset=['val_acc', 'epoch', 'train_acc'])
+    if merged.empty:
+        logging.warning('历史 metrics 中 best 字段无法解析；best 将从当前续跑段重新计算')
+        return -1.0, -1, -1.0
+
+    row = merged.loc[merged['val_acc'].idxmax()]
+    restored = float(row['val_acc']), int(row['epoch']), float(row['train_acc'])
+    logging.info(f'已从历史 metrics 恢复全局 best: epoch {restored[1]}, val_acc {restored[0]:.4f}%')
+    return restored
 
 # 只关闭特定的警告
 warnings.filterwarnings("ignore", message=".*Palette images with Transparency expressed in bytes.*")
@@ -327,6 +382,7 @@ def train_and_validate(model,
                        beta=0.5,
                        state=1,
                        optimizer=None,
+                       resume_checkpoint=None,
                        ):
     """
     :param model: 模型
@@ -343,9 +399,7 @@ def train_and_validate(model,
     sleep_all_spend = 0
     EPOCH_PERIOD = 50
     EPOCH_PERIOD_time = 600
-    best_val_acc = -1.0
-    best_epoch = -1
-    train_acc_at_best = -1.0
+    best_val_acc, best_epoch, train_acc_at_best = _restore_best_state(resume_checkpoint, epoch_start)
     # num_epochs 即目标总轮数：续跑时自动"补到目标轮"，而非"再跑 MAX_EPOCHS 轮"
     for epoch in range(epoch_start, num_epochs):
         # 休息一下吧
@@ -416,6 +470,8 @@ def train_and_validate(model,
 
                 scaler.scale(loss).backward()  # 反向传播
 
+                # AMP 下 backward 得到的是缩放后的梯度；必须先还原，再按真实范数裁剪。
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
 
                 scaler.step(optimizer)  # 更新权重
@@ -473,7 +529,11 @@ def train_and_validate(model,
             train_acc_at_best = train_parent_acc
             torch.save({'epoch': epoch, 'config_id': CONFIG_ID, 'seed': SEED,
                         'arch': type(model).__name__,
-                        'state_dict': model.state_dict(), 'val_acc': val_accuracy[0]},
+                        'state_dict': model.state_dict(), 'val_acc': val_accuracy[0],
+                        'best_val_acc': best_val_acc,
+                        'best_epoch': best_epoch,
+                        'train_acc_at_best': train_acc_at_best,
+                        'training_protocol_version': TRAINING_PROTOCOL_VERSION},
                        BEST_PTH)
             logging.info(f'best 刷新: epoch {epoch}, val_acc {val_accuracy[0]:.4f}% -> {BEST_PTH}')
         # scheduler.step(val_loss)
@@ -590,6 +650,11 @@ def train_and_validate(model,
                         'state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
                         'scheduler_state_dict': scheduler.state_dict(),
+                        'scaler_state_dict': scaler.state_dict(),
+                        'best_val_acc': best_val_acc,
+                        'best_epoch': best_epoch,
+                        'train_acc_at_best': train_acc_at_best,
+                        'training_protocol_version': TRAINING_PROTOCOL_VERSION,
                         'state': state,
                         'renew_class_to_index': renew_class_to_index},
                        LAST_PTH)
@@ -630,6 +695,8 @@ def train_and_validate(model,
         'best_val_epoch': best_epoch,
         'best_val_acc': round(best_val_acc, 4),
         'train_acc_at_best': round(train_acc_at_best, 4),
+        'training_protocol_version': TRAINING_PROTOCOL_VERSION,
+        'amp_gradient_clipping': 'unscale_before_clip',
         'peak_gpu_mb': round(torch.cuda.max_memory_allocated() / 1024 ** 2, 1) if torch.cuda.is_available() else 0,
         'unfreeze_mode': unfreeze_mode,
         'save_time': datetime.strftime(datetime.now(), '%Y-%m-%d %H:%M:%S'),
@@ -874,11 +941,20 @@ def main(num_epochs, epoch_start=0, checkpoint=None, optimizer_scheduler_YN=Fals
         if checkpoint is not None and 'scheduler_state_dict' in checkpoint:
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             logging.info('已恢复 scheduler 状态（续跑无 LR 跳变）')
-        current_lr = optimizer.param_groups[0]['lr']
-        if current_lr < 1e-5:
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = max(param_group['lr'], 1e-5)
-                param_group['lr'] = min(param_group['lr'], 1e-3)
+        # ⚠️ 2026-09-22 移除"续跑时把 lr 抬到 ≥1e-5"的补丁（src 时代遗留）：
+        #    它存在的理由是当时 scheduler 状态不恢复（见 src/train.py 第 697 行被注释），
+        #    续跑只能靠抬 lr 以避免永久卡在 eta_min=1e-6 地板；v2 已能恢复 scheduler 状态
+        #    （上一行），根因消除，而该补丁会在续跑后第 1 个 epoch 静默覆盖刚恢复的调度值，
+        #    与论文声明的 CAWR(eta_min=1e-6) 不一致（上一句还打印"续跑无 LR 跳变"）。
+        #    核查依据：被抬过的轮次 lr 恰好等于 1e-05，可当指纹；全量 13 份 metrics 归档中
+        #    仅 5 处命中，且全部落在已废弃/已排除的 run（脏跑 G-Full-CAWR、废弃的 Long 第 1 次、
+        #    RLRP 时代 G-NoSE seed2）——论文用到的每个 run 都未执行过该分支，
+        #    故本次移除不改变任何已得结果（详见 findings.md §十七）。
+        # current_lr = optimizer.param_groups[0]['lr']
+        # if current_lr < 1e-5:
+        #     for param_group in optimizer.param_groups:
+        #         param_group['lr'] = max(param_group['lr'], 1e-5)
+        #         param_group['lr'] = min(param_group['lr'], 1e-3)
 
     # raw_dataset = SafeImageFolder(root=file, transform=transform)
 
@@ -895,7 +971,8 @@ def main(num_epochs, epoch_start=0, checkpoint=None, optimizer_scheduler_YN=Fals
                                                 num_epochs,
                                                 epoch_start,
                                                 state=state,
-                                                optimizer=optimizer
+                                                optimizer=optimizer,
+                                                resume_checkpoint=checkpoint
                                                 )
 
     end = time.time()
@@ -1005,6 +1082,14 @@ if __name__ == '__main__':
         if os.path.exists(_resume_path):
             use_old_model = True
             checkpoint = torch.load(_resume_path)
+            checkpoint_protocol = checkpoint.get('training_protocol_version', 1)
+            if (checkpoint_protocol != TRAINING_PROTOCOL_VERSION and
+                    not ALLOW_LEGACY_PROTOCOL_RESUME):
+                raise RuntimeError(
+                    f'断点训练协议 v{checkpoint_protocol} 与当前 v{TRAINING_PROTOCOL_VERSION} 不兼容：'
+                    '旧断点在 AMP 梯度裁剪前未 unscale。为避免混合协议，正式实验请先归档旧产物并从 epoch 0 重跑；'
+                    '仅为诊断而明确接受混合协议时，才在 experiment_config.json 设置 '
+                    'ALLOW_LEGACY_PROTOCOL_RESUME=true。')
             renew_class_to_index = checkpoint.get('renew_class_to_index', renew_class_to_index)
             state = checkpoint.get('state', state)
             epoch_start = checkpoint.get('epoch', -1) + 1
@@ -1063,6 +1148,14 @@ if __name__ == '__main__':
     # scheduler = StepLR(optimizer, step_size=5, gamma=0.8)
 
     scaler = GradScaler()
+    if use_old_model:
+        if 'scaler_state_dict' in checkpoint:
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
+            logging.info('已恢复 GradScaler 状态')
+        else:
+            logging.warning('旧断点不含 GradScaler 状态，将以新的缩放状态继续')
+        if checkpoint.get('training_protocol_version') != TRAINING_PROTOCOL_VERSION:
+            logging.warning('当前断点来自旧训练协议；修复 AMP 后继续会混合两种协议，正式实验应从 epoch 0 重跑')
     model = model.to(device)  # 将模型转移到 GPU
     for name, module in model.named_children():
         print(name, " ---> ", type(module))
@@ -1101,7 +1194,9 @@ if __name__ == '__main__':
     # 触发条件：非冒烟 且 非续跑；冒烟/续跑不归档
     if not SMOKE and not use_old_model:
         _ts = datetime.strftime(datetime.now(), '%Y%m%d_%H%M%S')
-        for _name in ['garbage_classification_model.pth', 'metrics.csv', 'metrics_record.csv', 'last_config.json']:
+        for _name in ['garbage_classification_model.pth', 'metrics.csv', 'metrics_record.csv', 'last_config.json',
+                      f'checkpoint_{RUN_TAG}_best.pth', f'checkpoint_{RUN_TAG}_last.pth',
+                      f'results_{RUN_TAG}.json']:
             _p = os.path.join(RUNS_DIR, _name)
             if os.path.exists(_p):
                 _stem, _ext = os.path.splitext(_name)

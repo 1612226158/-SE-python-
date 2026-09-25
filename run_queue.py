@@ -41,14 +41,14 @@ PYTHON = sys.executable  # 用启动本脚本的同一个 Python（保证 torch 
 #   -CAWR = CAWR 调度（T_0=5, T_mult=2, eta_min=1e-6）；无后缀 = RLRP 旧时代（已过时仅留档）
 #   V2- = 修正版 Transformer 头（ResNetTransformerV2：7×7=49 patch token + pos_embed + patch-emb dropout 0.1，
 #        替代 v1 头 avgpool 1×1 单 token + dropout 0.5 + 退化 seq_len=1 注意力的组合）
-#   SE 消融 = S-NoSE（全解冻无SE）；G-NoSE / G-NoSE-CAWR（渐进式系）已弃用，仅留档勿再排
-# 已完成基线（results JSON 权威，254 类/CAWR 口径）：
+#   SE 消融 = S-NoSE（无SE）/ S-StdSE（标准全局SE）/ S-NoProg（多区域SE）；三者仅 regions 不同
+# 已完成旧协议基线（results JSON 对旧协议内部比较有效；不可与修复后的新跑直接合并）：
 #   S-NoProg 82.63@74 / S-NoSE 82.53@73（SE 增益≈0.10pp）/ G-Full-CAWR 80.96@92（调度器修复后干净重跑）
 #   G-Full-CAWR-Long 83.565@132（160 轮预算）/ V2-Full 83.353@74（vs S-NoProG +0.72pp，n=1 初步）
 # ⚠️ 调度器 bug 史（2026-09-07）：CAWR 曾被误传 val_acc（原 step(val_accuracy[0])）→ state2/3 从不重启、
 #    lr 贴 1e-6 地板 → 旧 G-Full-CAWR 70.82 是脏数据（已存档 runs\DIRTY_scheduler_bug_20260907\）。
-# 🧪 V2-NoTF 提前到 seed2 复现之前（2026-09-09 用户重排）：它是 V2 归因的关键对照
-#    （V2-Full − V2-NoTF = 纯注意力栈增益；S-NoProg 停跑~10轮留断点，RESUME 补跑）。
+# 🧪 V2-NoTF 是 V2 归因的关键对照；2026-09-25 修复 AMP 后，旧断点不得与新协议混合续跑
+#    （V2-Full − V2-NoTF = 纯注意力栈增益；旧协议断点只保留作审计，正式实验须从头重跑）。
 #    早期观测：V2-NoTF 拟合速度 ≈ V2-Full >> v1 头(S-NoProg) → 初期提速主要来自 V2 侧头部修正
 #    （49-token 化 + patch-emb dropout 0.5→0.1），不是注意力栈本身；注意力净增益待 V2-NoTF 收官对比。
 # 🆕 G-V2（2026-09-09 立项）：渐进式解冻(30/60) + V2 修正头 = 2×2 网格第四格（头 v1/V2 × 解冻 全/渐进），
@@ -62,14 +62,16 @@ QUEUE = [
     ("G-Full-CAWR", 1),                       # ✅ 完成（修复后干净重跑 80.96@92；旧脏 70.82 已存档）
     ("G-Full-CAWR-Long", 1),                  # ✅ 完成（83.565@132，160 轮预算断点续跑）
     ("V2-Full", 1),                           # ✅ 完成（83.353@74，全解冻+V2 修正头；vs S-NoProg +0.72pp n=1）
-    # —— 待跑（按优先级排序；2026-09-09 起 V2-NoTF 优先于 seed2 复现）——
-    ("V2-NoTF", 1),                           # 🧪【跑中 09-09】V2 架构去掉 Transformer 栈（Identity 直通）：
+    # —— 待跑（按优先级排序；先补标准 SE，再处理须从头重跑的旧协议 V2-NoTF）——
+    ("S-StdSE", 1),                           # 🧪 标准全局 SE：与 S-NoSE / S-NoProg 构成 None / [1] / [1,2] 归因链
+    ("V2-NoTF", 1),                           # ⚠️ 旧 AMP 协议断点不可直接接修复后代码；正式结果须从 epoch 0 重跑
                                               #    V2-Full − V2-NoTF = 纯注意力增益；同 dropout/pos_embed 设置
     ("G-V2", 1),                              # 🧪【新 09-09 立项】渐进式解冻(30/60)+V2修正头 = 2×2网格第四格：
                                               #    对照 G-Full-CAWR(v1头渐进) / V2-Full(V2头全解冻)，100轮 n=1 验证趋势
-    ("S-NoProg", 2),                          # 📊 全解冻主结果 seed2 → n=2（09-09 曾跑 ~10 轮被停，RESUME 补跑）
+    ("S-NoProg", 2),                          # 📊 全解冻主结果 seed2；若存在旧协议断点，须归档后从 epoch 0 重跑
     ("G-Full-CAWR", 2),                       # 📊 渐进式对照 seed2 → n=2（长尾反转复现用）
     ("S-NoSE", 2),                            # 📊 SE 消融 seed2
+    ("S-StdSE", 2),                           # 📊 标准全局 SE seed2
     ("V2-Full", 2), ("V2-NoTF", 2),           # 🧪 V2 种子2（趋势验证通过后才值得跑）
     # 可选/暂缓：
 
@@ -151,7 +153,7 @@ def write_config(config_id, seed, resume):
     # Long 配置：跑到 SNAPSHOT_EPOCH 轮时，train.py 会自动把该轮 checkpoint/metrics 复制存档
     if config_id in LONG_CONFIGS:
         cfg["SNAPSHOT_EPOCH"] = SNAPSHOT_EPOCH
-        log(f"📌 {config_id} 为 Long 配置：MAX_EPOCHS={max_epochs}，跑到第 {SNAPSHOT_EPOCH} 轮自动存档 100 轮快照")
+        log(f"{config_id} 为 Long 配置：MAX_EPOCHS={max_epochs}，跑到第 {SNAPSHOT_EPOCH} 轮自动存档 100 轮快照")
     with open(CONFIG, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 
@@ -174,7 +176,7 @@ def ensure_long_resume(config_id, seed):
     src_pth = os.path.join(RUNS, f"checkpoint_{base}_seed{seed}_last.pth")
     if os.path.exists(src_pth):
         shutil.copy(src_pth, long_pth)
-        log(f"📌 {config_id} seed{seed} 从 {base} seed{seed} 的断点续跑（已复制 checkpoint）")
+        log(f" {config_id} seed{seed} 从 {base} seed{seed} 的断点续跑（已复制 checkpoint）")
 
 
 def process(config_id, seed):
@@ -182,20 +184,20 @@ def process(config_id, seed):
         log(f"跳过已完成 {config_id} seed{seed}")
         return "done"
     if in_progress(config_id, seed):
-        log(f"⏳ {config_id} seed{seed} 正在训练，等待 5 分钟")
+        log(f"{config_id} seed{seed} 正在训练，等待 5 分钟")
         return "running"
 
     ensure_long_resume(config_id, seed)  # Long 配置：从源配置断点续跑
     resume = os.path.exists(os.path.join(RUNS, f"checkpoint_{config_id}_seed{seed}_last.pth"))
     rc = run_once(config_id, seed, resume)
     if rc == 0 and done(config_id, seed):
-        log(f"✔ 完成 {config_id} seed{seed}")
+        log(f"完成 {config_id} seed{seed}")
         return "done"
 
     log(f"⚠ {config_id} seed{seed} 异常（退出码 {rc}），改用 RESUME=true 重试一次")
     rc2 = run_once(config_id, seed, True)
     if rc2 == 0 and done(config_id, seed):
-        log(f"✔ RESUME 完成 {config_id} seed{seed}")
+        log(f"RESUME 完成 {config_id} seed{seed}")
         return "done"
 
     log(f"✖ {config_id} seed{seed} 二次失败，停止队列，请人工检查后重启本脚本")
@@ -226,9 +228,11 @@ def main():
             time.sleep(300)  # 5 分钟后再查
         else:  # failed
             return 1
-    log("🎉 队列全部完成")
+    log("队列全部完成")
     return 0
 
 
 if __name__ == "__main__":
+    print("请用管理员cmd打开 disk_temp_sampler.py")
+    time.sleep(5)
     sys.exit(main())

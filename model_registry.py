@@ -19,7 +19,7 @@ model_registry.py —— 模型"配置/名字/元数据"唯一注册表（2026-0
   -CAWR = state2/3 或全程用 CAWR 调度（T_0=5, T_mult=2, eta_min=1e-6）；无后缀 = RLRP 旧时代（已过时仅留档）
   V2- = 修正版 Transformer 头（ResNetTransformerV2：7×7=49 patch token + pos_embed + patch-emb dropout 0.1，
         替代 v1 头 avgpool 1×1 单 token + dropout 0.5 + 退化 seq_len=1 注意力的组合）
-  SE 开关：regions=[1,2]=多区域SE / None=无SE；transformer_layers=3（有栈）/ 0（去栈，V2-NoTF）
+  SE 开关：regions=[1,2]=多区域SE / [1]=标准全局SE / None=无SE；transformer_layers=3（有栈）/ 0（去栈，V2-NoTF）
   ★ key 大小写规范：注册表与 runs/ 文件名一律用规范 key（如 'S-NoProg' 小写 g）；
     论文/叙述里的 "S-NoProG"（大写 G）只是显示写法，经 ALIASES 归一化到规范 key。
 
@@ -85,6 +85,13 @@ MODELS = {
         'target_epochs': 100,
         'note': 'SE 消融 82.53@73（SE 增益≈0.10pp）',
     },
+    'S-StdSE': {
+        'params': dict(regions=[1], transformer_layers=3, use_decouple=True, unfreeze='none'),
+        'short': '全程全解冻·标准SE',
+        'cn': '全程全解冻·标准全局SE·CAWR调度（多区域SE归因对照）',
+        'target_epochs': 100,
+        'note': '标准 SE 对照：与 S-NoSE / S-NoProg 仅 regions 不同，用于隔离多区域描述符的净增益',
+    },
     # —— V2 路线：修正版 49-token Transformer（v2 架构）——
     'V2-Full': {
         'params': dict(model='v2', regions=[1, 2], transformer_layers=3, use_decouple=True, unfreeze='none'),
@@ -117,7 +124,7 @@ MODELS = {
 }
 
 # 规范顺序（GUI 下拉无成绩项、文档展示按此序）
-ORDER = ['G-Full', 'G-NoSE', 'S-NoProg', 'S-NoSE', 'G-Full-CAWR',
+ORDER = ['G-Full', 'G-NoSE', 'S-NoProg', 'S-NoSE', 'S-StdSE', 'G-Full-CAWR',
          'G-Full-CAWR-Long', 'V2-Full', 'V2-NoTF', 'G-V2']
 
 # 显示写法 → 规范 key（论文/口头常用 S-NoProG，文件与注册表用 S-NoProg）
