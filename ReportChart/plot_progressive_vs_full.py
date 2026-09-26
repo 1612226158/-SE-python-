@@ -15,7 +15,7 @@ plot_progressive_vs_full.py —— 渐进式解冻 vs 全解冻 三图对比（l
 """
 import os
 import matplotlib.pyplot as plt
-from chart_data import load_model, fig_out, is_known, model_cn
+from chart_data import load_model, fig_out, is_known, model_cn, N_CLS  # noqa: E402
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -106,7 +106,7 @@ def main():
     ax2.set_ylim(10, 90)
     ax2.grid(True, alpha=0.4, linestyle='--')
     ax2.legend(frameon=True, loc='lower right')
-    ax2.set_title(f'验证集准确率对比（254类，CAWR调度，各100轮）', fontsize=13, pad=14)
+    ax2.set_title(f'验证集准确率对比（{N_CLS}类，CAWR调度，各100轮）', fontsize=13, pad=14)
     fig2.tight_layout()
     out2 = fig_out('val_acc', name_a, name_b)
     fig2.savefig(out2, bbox_inches='tight', dpi=300)

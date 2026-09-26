@@ -39,12 +39,21 @@ from calculate import (calculate_mean_and_std,
                        FocalLoss, add_record_metrics, add_record_metrics_v2,
                        get_classnames,
                        generate_mappings, get_class_proportion,
+                       get_output_class_sample_counts,
                        get_class_weight, hierarchical_collate_fn,
                        should_update_simple)
 from calculate_update import SafeImageFolder as NewSafeImageFolder
 from src_v2 import (device, DynamicMeanPad,
                     pth_file_name, save_model_after_epoch,
-                    extensions_suffix, merged_dict, ACC_STOP, ERROR_RATE, UPDATE_N)
+                    extensions_suffix, merged_dict, ACC_STOP, ERROR_RATE, UPDATE_N,
+                    TRAIN_NUM_WORKERS, VAL_NUM_WORKERS)
+from src_v2.taxonomy import (
+    EXPECTED_NUM_CLASSES,
+    LABEL_SCHEMA_DEFINITION_HASH,
+    LABEL_SCHEMA_ID,
+    LABEL_SCHEMA_VERSION,
+    mapping_fingerprint,
+)
 
 # from batch_size import adjust_batch_size
 
@@ -138,6 +147,51 @@ BEST_PTH = os.path.join(RUNS_DIR, f'checkpoint_{RUN_TAG}_best.pth')
 LAST_PTH = os.path.join(RUNS_DIR, f'checkpoint_{RUN_TAG}_last.pth')
 # 训练协议版本 2：AMP 梯度裁剪前显式 unscale，并在断点中保存全局 best / GradScaler 状态。
 TRAINING_PROTOCOL_VERSION = 2
+# 采样协议版本 1：每个绝对 epoch 使用可独立重建的 sampler seed，续跑不再重放随机流开头。
+SAMPLING_PROTOCOL_VERSION = 1
+SAMPLER_SEED_STRIDE = 1_000_000
+
+
+def _label_metadata(id_to_main_class, renew_class_to_index):
+    """生成写入 checkpoint/results/CSV 的当前标签协议元数据。"""
+    return {
+        'label_schema_id': LABEL_SCHEMA_ID,
+        'label_schema_version': LABEL_SCHEMA_VERSION,
+        'label_schema_definition_hash': LABEL_SCHEMA_DEFINITION_HASH,
+        'label_mapping_hash': mapping_fingerprint(id_to_main_class, renew_class_to_index),
+        'num_classes': len(renew_class_to_index),
+        'id_to_main_class': id_to_main_class,
+        'renew_class_to_index': renew_class_to_index,
+    }
+
+
+def _check_label_schema(checkpoint, id_to_main_class, renew_class_to_index):
+    """恢复前强校验标签体系；254 类旧权重不能接到当前 252 类输出头。"""
+    expected = _label_metadata(id_to_main_class, renew_class_to_index)
+    actual_version = checkpoint.get('label_schema_version')
+    actual_hash = checkpoint.get('label_mapping_hash')
+    actual_num_classes = checkpoint.get('num_classes')
+    if (actual_version != LABEL_SCHEMA_VERSION or
+            actual_hash != expected['label_mapping_hash'] or
+            actual_num_classes != expected['num_classes'] or
+            checkpoint.get('renew_class_to_index') != renew_class_to_index or
+            checkpoint.get('id_to_main_class') != id_to_main_class):
+        raise RuntimeError(
+            '断点标签体系与当前训练不兼容，拒绝续跑。'
+            f'断点: version={actual_version}, num_classes={actual_num_classes}, hash={actual_hash}; '
+            f'当前: version={LABEL_SCHEMA_VERSION}, num_classes={expected["num_classes"]}, '
+            f'hash={expected["label_mapping_hash"]}。'
+            '本次已把“蔬菜/菜根菜叶→菜叶、插头电线/充电线→插头充电线”纳入合并，'
+            '输出由254类变为252类，必须从 epoch 0 重新训练；ALLOW_LEGACY_PROTOCOL_RESUME 不绕过标签校验。')
+
+
+def _derive_sampler_seed(run_seed, epoch):
+    """由实验 seed 与绝对 epoch 唯一确定本轮 WeightedRandomSampler seed。"""
+    run_seed = int(run_seed)
+    epoch = int(epoch)
+    if run_seed < 0 or epoch < 0:
+        raise ValueError(f'run_seed 与 epoch 必须为非负整数，实际为 run_seed={run_seed}, epoch={epoch}')
+    return run_seed * SAMPLER_SEED_STRIDE + epoch
 
 
 def seed_all(seed):
@@ -290,7 +344,7 @@ class DynamicCachedDataset(Dataset):
         return len(self.dataset)
 
 
-def validate(model, val_loader, parent_criterion, alpha=0.5, beta=0.5):
+def validate(model, val_loader, parent_criterion, alpha=1.0, beta=0.0):
     """
     :param model: 模型
     :param val_loader: 验证集
@@ -427,6 +481,16 @@ def train_and_validate(model,
                 scheduler = _make_state_scheduler(optimizer)
                 state += 1
                 logging.info(f'state2 -> state3 于 epoch {epoch}（固定触发）')
+
+        # 每个绝对 epoch 独立播种采样器：无论中途重启多少次，同一 run_seed/epoch
+        # 都会得到相同的 WeightedRandomSampler 索引序列；persistent_workers 保持不变。
+        sampler_seed = _derive_sampler_seed(SEED, epoch)
+        sampler_generator = getattr(train_loader.sampler, 'generator', None)
+        if sampler_generator is None:
+            raise RuntimeError('训练采样器缺少独立 generator，无法应用逐 epoch sampler seed')
+        sampler_generator.manual_seed(sampler_seed)
+        logging.info(f'epoch {epoch} sampler_seed={sampler_seed}')
+
         TV__time_spend_start = time.time()
         epoch_start_time = time.time()
         model.train()  # 设置模型为训练模式
@@ -520,7 +584,9 @@ def train_and_validate(model,
         # 每个 epoch 后验证
         val_loss, val_accuracy, precision, recall, f1, f1_macro = validate(model,
                                                                            val_loader,
-                                                                           parent_criterion)
+                                                                           parent_criterion,
+                                                                           alpha=1.0,
+                                                                           beta=0.0)
         # 实时保存 best（只存 state_dict，刷新才覆盖；最后用 best.pth 测测试集）
         # 冒烟（SMOKE）不存任何 pth：避免留下断点让 run_queue 误判"中断需续跑"；metrics 记录已足够验证管线
         if val_accuracy[0] > best_val_acc and not SMOKE:
@@ -533,7 +599,10 @@ def train_and_validate(model,
                         'best_val_acc': best_val_acc,
                         'best_epoch': best_epoch,
                         'train_acc_at_best': train_acc_at_best,
-                        'training_protocol_version': TRAINING_PROTOCOL_VERSION},
+                        'training_protocol_version': TRAINING_PROTOCOL_VERSION,
+                        'sampling_protocol_version': SAMPLING_PROTOCOL_VERSION,
+                        'sampler_seed': sampler_seed,
+                        **_label_metadata(id_to_main_class, renew_class_to_index)},
                        BEST_PTH)
             logging.info(f'best 刷新: epoch {epoch}, val_acc {val_accuracy[0]:.4f}% -> {BEST_PTH}')
         # scheduler.step(val_loss)
@@ -565,6 +634,11 @@ def train_and_validate(model,
                                    state=state,
                                    config_id=CONFIG_ID,
                                    seed=SEED,
+                                   sampler_seed=sampler_seed,
+                                   sampling_protocol_version=SAMPLING_PROTOCOL_VERSION,
+                                   id_to_main_class=id_to_main_class,
+                                   training_protocol_version=TRAINING_PROTOCOL_VERSION,
+                                   scaler_state_dict=scaler.state_dict(),
                                    other_pth_file_name=os.path.join(RUNS_DIR, f'ACC_STOP-VAL-{ACC_STOP}.pth'))
         # if train_parent_acc > ACC_STOP or train_child_acc > ACC_STOP:
         #     save_model_after_epoch(epoch=epoch,
@@ -584,6 +658,11 @@ def train_and_validate(model,
                                    state=state,
                                    config_id=CONFIG_ID,
                                    seed=SEED,
+                                   sampler_seed=sampler_seed,
+                                   sampling_protocol_version=SAMPLING_PROTOCOL_VERSION,
+                                   id_to_main_class=id_to_main_class,
+                                   training_protocol_version=TRAINING_PROTOCOL_VERSION,
+                                   scaler_state_dict=scaler.state_dict(),
                                    other_pth_file_name=os.path.join(RUNS_DIR, f'ACC_STOP-OVERFIT-{ACC_STOP}.pth'))
 
         if save_model_after_epoch_flag:
@@ -594,7 +673,12 @@ def train_and_validate(model,
                                    optimizer=optimizer,
                                    scheduler=scheduler,
                                    config_id=CONFIG_ID,
-                                   seed=SEED)
+                                   seed=SEED,
+                                   sampler_seed=sampler_seed,
+                                   sampling_protocol_version=SAMPLING_PROTOCOL_VERSION,
+                                   id_to_main_class=id_to_main_class,
+                                   training_protocol_version=TRAINING_PROTOCOL_VERSION,
+                                   scaler_state_dict=scaler.state_dict())
 
         TV__time_spend_end = time.time()
 
@@ -631,6 +715,10 @@ def train_and_validate(model,
             add_record_metrics_v2(epoch=epoch,
                                   config_id=CONFIG_ID,
                                   seed=SEED,
+                                  sampler_seed=sampler_seed,
+                                  label_schema_version=LABEL_SCHEMA_VERSION,
+                                  label_mapping_hash=mapping_fingerprint(id_to_main_class, renew_class_to_index),
+                                  num_classes=len(renew_class_to_index),
                                   train_acc=train_parent_acc,
                                   train_loss=train_loss,
                                   val_acc=val_accuracy[0],
@@ -655,8 +743,10 @@ def train_and_validate(model,
                         'best_epoch': best_epoch,
                         'train_acc_at_best': train_acc_at_best,
                         'training_protocol_version': TRAINING_PROTOCOL_VERSION,
+                        'sampling_protocol_version': SAMPLING_PROTOCOL_VERSION,
+                        'sampler_seed': sampler_seed,
                         'state': state,
-                        'renew_class_to_index': renew_class_to_index},
+                        **_label_metadata(id_to_main_class, renew_class_to_index)},
                        LAST_PTH)
 
         # Long 配置：跑到 SNAPSHOT_EPOCH 轮时，把该轮的 checkpoint + metrics 单独复制存档（100 轮快照）
@@ -696,6 +786,13 @@ def train_and_validate(model,
         'best_val_acc': round(best_val_acc, 4),
         'train_acc_at_best': round(train_acc_at_best, 4),
         'training_protocol_version': TRAINING_PROTOCOL_VERSION,
+        'sampling_protocol_version': SAMPLING_PROTOCOL_VERSION,
+        'label_schema_id': LABEL_SCHEMA_ID,
+        'label_schema_version': LABEL_SCHEMA_VERSION,
+        'label_schema_definition_hash': LABEL_SCHEMA_DEFINITION_HASH,
+        'label_mapping_hash': mapping_fingerprint(id_to_main_class, renew_class_to_index),
+        'sampler_seed_scheme': f'run_seed*{SAMPLER_SEED_STRIDE}+epoch',
+        'last_sampler_seed': _derive_sampler_seed(SEED, num_epochs - 1),
         'amp_gradient_clipping': 'unscale_before_clip',
         'peak_gpu_mb': round(torch.cuda.max_memory_allocated() / 1024 ** 2, 1) if torch.cuda.is_available() else 0,
         'unfreeze_mode': unfreeze_mode,
@@ -878,13 +975,18 @@ def main(num_epochs, epoch_start=0, checkpoint=None, optimizer_scheduler_YN=Fals
     labels = [s[1] for s in train_dataset.samples]  # 永远与 samples 同步
     # labels = [train_dataset.targets[i] for i in range(len(train_dataset))]  # 获取所有样本的标签
     # print(f"train_dataset's labels {labels=}")
-    class_sample_counts = get_class_proportion(pq='q')  # 每个类别的样本数
+    # 逆频加权的口径 = **合并后的输出类**（当前 252 类），不是 265 个原始文件夹：
+    # 合并组内各成员文件夹取同一个权重（= 1 / 该输出类总样本数），否则"按类别平衡"
+    # 不成立（例：蔬菜与菜根菜叶并为「菜叶」后，两者仍按各自文件夹规模加权）。
+    # 详见 calculate.get_output_class_sample_counts 的说明。
+    class_sample_counts = get_output_class_sample_counts()
     weights = 1. / class_sample_counts.clone().detach().float()
     # print(weights)
     sample_weights = weights[labels]  # labels 是每个样本的类别标签
 
+    sampler_generator = torch.Generator()
     sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights),
-                                    replacement=True, generator=torch.Generator().manual_seed(SEED))
+                                    replacement=True, generator=sampler_generator)
     #
 
     # subset_indices = random.sample(range(len(train_dataset)), int(0.2 * len(train_dataset)))
@@ -896,7 +998,8 @@ def main(num_epochs, epoch_start=0, checkpoint=None, optimizer_scheduler_YN=Fals
         # cached_dataset,
         batch_size=batch_size,
         # shuffle=True,
-        num_workers=8,
+        # worker 数集中在 src_v2/__init__.py 的 TRAIN_NUM_WORKERS（2026-09-26：8→6 压提交内存峰值）
+        num_workers=TRAIN_NUM_WORKERS,
         pin_memory=True,
         persistent_workers=True,
         drop_last=True,
@@ -905,11 +1008,21 @@ def main(num_epochs, epoch_start=0, checkpoint=None, optimizer_scheduler_YN=Fals
         collate_fn=hierarchical_collate_fn,
         generator=torch.Generator().manual_seed(SEED)
     )
+    # ⚠️ persistent_workers=True 不可省（2026-09-26 修）：
+    #   若 val_loader 是"非持久"的，每轮验证都会在 8 个常驻训练 worker 存活的同时
+    #   新建 4 个 worker；Windows 下新建 worker 需要重新加载整套模块链（提交内存峰值出现在
+    #   这一刻），一旦第 4 个加载失败（WinError 1455），它会在向父进程注册前就死掉，
+    #   主进程随即永久阻塞在启动握手 —— 2026-09-26 01:43 的停摆正卡在
+    #   「Epoch 0 训练结束 → 首次 iter(val_loader)」这一步（日志停在 Train Accuracy Parent，
+    #   之后 Validation Accuracy Parent 再无输出）。
+    #   常驻后 worker 只在首次验证创建一次，后续每轮复用，既消除峰值也省掉重复的启动开销。
     val_loader = DataLoader(val_dataset,
                             batch_size=batch_size,
                             shuffle=False,
-                            num_workers=4,
+                            # worker 数集中在 src_v2/__init__.py 的 VAL_NUM_WORKERS（2026-09-26：4→2）
+                            num_workers=VAL_NUM_WORKERS,
                             pin_memory=True,
+                            persistent_workers=True,
                             collate_fn=hierarchical_collate_fn,
                             generator=torch.Generator().manual_seed(SEED)
                             )
@@ -984,7 +1097,9 @@ def main(num_epochs, epoch_start=0, checkpoint=None, optimizer_scheduler_YN=Fals
 
     if not SMOKE and not save_model_after_epoch_flag:
         # 这里是全部运行完, 如果没有设置每轮保存, 则在此保存, 若开启每轮保存, 则无需再进行保存
-        save_model_after_epoch(epoch=epoch,
+        # train_and_validate 返回的是目标总轮数；共享模型的 epoch 元数据应写最后一个零基 epoch。
+        final_epoch = num_epochs - 1
+        save_model_after_epoch(epoch=final_epoch,
                                model=model,
                                optimizer=optimizer,
                                scheduler=scheduler,
@@ -992,6 +1107,11 @@ def main(num_epochs, epoch_start=0, checkpoint=None, optimizer_scheduler_YN=Fals
                                state=state,
                                config_id=CONFIG_ID,
                                seed=SEED,
+                               sampler_seed=_derive_sampler_seed(SEED, final_epoch),
+                               sampling_protocol_version=SAMPLING_PROTOCOL_VERSION,
+                               id_to_main_class=id_to_main_class,
+                               training_protocol_version=TRAINING_PROTOCOL_VERSION,
+                               scaler_state_dict=scaler.state_dict(),
                                )
 
     # checkpoint = {
@@ -1065,6 +1185,12 @@ if __name__ == '__main__':
     # id_to_main_class, id_to_child_class, main_class_to_index, child_class_to_index = generate_mappings(
     #     merged_dict=merged_dict)
     id_to_main_class, renew_class_to_index = generate_mappings(merged_dict=merged_dict)
+    if len(renew_class_to_index) != EXPECTED_NUM_CLASSES:
+        raise RuntimeError(
+            f'当前标签映射应生成 {EXPECTED_NUM_CLASSES} 类，实际 {len(renew_class_to_index)} 类，拒绝训练')
+    logging.info(
+        f'[标签协议] {LABEL_SCHEMA_ID} v{LABEL_SCHEMA_VERSION}, '
+        f'{len(renew_class_to_index)} 类, hash={mapping_fingerprint(id_to_main_class, renew_class_to_index)}')
 
     # print(len(id_to_main_class), len(id_to_child_class), len(get_classnames()))
     # print(main_class_to_index, len(main_class_to_index))
@@ -1082,6 +1208,7 @@ if __name__ == '__main__':
         if os.path.exists(_resume_path):
             use_old_model = True
             checkpoint = torch.load(_resume_path)
+            _check_label_schema(checkpoint, id_to_main_class, renew_class_to_index)
             checkpoint_protocol = checkpoint.get('training_protocol_version', 1)
             if (checkpoint_protocol != TRAINING_PROTOCOL_VERSION and
                     not ALLOW_LEGACY_PROTOCOL_RESUME):
@@ -1090,7 +1217,23 @@ if __name__ == '__main__':
                     '旧断点在 AMP 梯度裁剪前未 unscale。为避免混合协议，正式实验请先归档旧产物并从 epoch 0 重跑；'
                     '仅为诊断而明确接受混合协议时，才在 experiment_config.json 设置 '
                     'ALLOW_LEGACY_PROTOCOL_RESUME=true。')
-            renew_class_to_index = checkpoint.get('renew_class_to_index', renew_class_to_index)
+            checkpoint_sampling_protocol = checkpoint.get('sampling_protocol_version', 0)
+            if (checkpoint_sampling_protocol != SAMPLING_PROTOCOL_VERSION and
+                    not ALLOW_LEGACY_PROTOCOL_RESUME):
+                raise RuntimeError(
+                    f'断点采样协议 v{checkpoint_sampling_protocol} 与当前 v{SAMPLING_PROTOCOL_VERSION} 不兼容：'
+                    '旧断点使用进程级连续随机流，当前实现使用逐 epoch sampler seed。'
+                    '为避免混合采样协议，正式实验请从 epoch 0 重跑；仅诊断时才允许 legacy resume。')
+            if checkpoint_sampling_protocol == SAMPLING_PROTOCOL_VERSION:
+                checkpoint_seed = int(checkpoint.get('seed', SEED))
+                if checkpoint_seed != int(SEED):
+                    raise RuntimeError(f'断点 seed={checkpoint_seed} 与当前实验 seed={SEED} 不一致，拒绝续跑')
+                checkpoint_epoch = int(checkpoint.get('epoch', -1))
+                expected_sampler_seed = _derive_sampler_seed(checkpoint_seed, checkpoint_epoch)
+                actual_sampler_seed = checkpoint.get('sampler_seed')
+                if actual_sampler_seed is None or int(actual_sampler_seed) != expected_sampler_seed:
+                    raise RuntimeError(
+                        f'断点 sampler_seed={actual_sampler_seed} 与预期 {expected_sampler_seed} 不一致，拒绝续跑')
             state = checkpoint.get('state', state)
             epoch_start = checkpoint.get('epoch', -1) + 1
             if 'model' in checkpoint:
@@ -1156,6 +1299,8 @@ if __name__ == '__main__':
             logging.warning('旧断点不含 GradScaler 状态，将以新的缩放状态继续')
         if checkpoint.get('training_protocol_version') != TRAINING_PROTOCOL_VERSION:
             logging.warning('当前断点来自旧训练协议；修复 AMP 后继续会混合两种协议，正式实验应从 epoch 0 重跑')
+        if checkpoint.get('sampling_protocol_version', 0) != SAMPLING_PROTOCOL_VERSION:
+            logging.warning('当前断点来自旧采样协议；续跑会混合进程级随机流与逐 epoch sampler seed')
     model = model.to(device)  # 将模型转移到 GPU
     for name, module in model.named_children():
         print(name, " ---> ", type(module))
@@ -1206,7 +1351,14 @@ if __name__ == '__main__':
         with open(os.path.join(RUNS_DIR, 'last_config.json'), 'w', encoding='utf-8') as f:
             json.dump({'CONFIG_ID': CONFIG_ID, 'SEED': SEED, 'SMOKE': SMOKE,
                        'MAX_EPOCHS': MAX_EPOCHS, 'RESUME': RESUME, 'AUTO': AUTO,
-                       'UNFREEZE1_EPOCH': UNFREEZE1_EPOCH, 'UNFREEZE2_EPOCH': UNFREEZE2_EPOCH},
+                       'UNFREEZE1_EPOCH': UNFREEZE1_EPOCH, 'UNFREEZE2_EPOCH': UNFREEZE2_EPOCH,
+                       'SAMPLING_PROTOCOL_VERSION': SAMPLING_PROTOCOL_VERSION,
+                       'SAMPLER_SEED_STRIDE': SAMPLER_SEED_STRIDE,
+                       'LABEL_SCHEMA_ID': LABEL_SCHEMA_ID,
+                       'LABEL_SCHEMA_VERSION': LABEL_SCHEMA_VERSION,
+                       'LABEL_SCHEMA_DEFINITION_HASH': LABEL_SCHEMA_DEFINITION_HASH,
+                       'LABEL_MAPPING_HASH': mapping_fingerprint(id_to_main_class, renew_class_to_index),
+                       'NUM_CLASSES': len(renew_class_to_index)},
                       f, ensure_ascii=False, indent=2)
         logging.info('已保存本次配置快照: runs/last_config.json')
 

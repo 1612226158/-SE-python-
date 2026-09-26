@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
-"""
-eval_confusion_matrix.py —— 混淆矩阵 + 逐类错误分析（254 合并类口径，2026-09-12 建）
+r"""
+eval_confusion_matrix.py —— 混淆矩阵 + 逐类错误分析（merged_dict 合并类口径，2026-09-12 建）
+
+【口径】类数 = 265 原始子类经 merged_dict 合并后的类数，取值见 chart_data.N_CLS
+  （2026-09-26 起为 252：9 组 22 子类；此前为 254：7 组 18 子类）。
 
 【用途】回答三个审稿人一定会问的问题：
-  1) 模型到底错在哪：254 类全量 val 推理 → 混淆矩阵（真值×预测）；
+  1) 模型到底错在哪：全部合并类 val 全量推理 → 混淆矩阵（真值×预测）；
   2) 哪些类最差：逐类 precision/recall/F1/support（per_class_metrics_<model>.csv）；
   3) 最典型的混淆对：top-N "真值 → 误判"对（top_confusions_<model>.csv + 图），
      并据此评估"易混淆类合并策略"到底救了多少（合并组内互混 vs 组间互混）。
@@ -326,7 +329,7 @@ def stage_plot(model_name, top_n=TOP_N_PAIRS):
     ax1.barh(range(len(vals)), vals, color='#c44e52', alpha=0.85)
     ax1.set_yticks(range(len(vals)))
     ax1.set_yticklabels(labels, fontsize=8)
-    ax1.set_xlabel('误判次数（254 类验证集）')
+    ax1.set_xlabel(f'误判次数（{cd.N_CLS} 类验证集）')
     ax1.set_title(f'(a) 最典型混淆对 top{top_n}（{model_name}，整体 {acc:.2f}%）', fontsize=12)
     for yi, v in enumerate(vals):
         ax1.text(v + max(vals) * 0.01, yi, str(v), va='center', fontsize=8)
@@ -402,7 +405,8 @@ def stage_plot(model_name, top_n=TOP_N_PAIRS):
 
 # ============ CLI ============
 def main():
-    ap = argparse.ArgumentParser(description='混淆矩阵 + 逐类错误分析（254 合并类口径）')
+    ap = argparse.ArgumentParser(
+        description=f'混淆矩阵 + 逐类错误分析（merged_dict 合并类口径，当前 {cd.N_CLS} 类）')
     ap.add_argument('stage', choices=['smoke', 'infer', 'report', 'plot', 'all'])
     ap.add_argument('--model', default='S-NoProG', help='注册表模型 key（如 S-NoProG / V2-Full / G-Full-CAWR）')
     ap.add_argument('--limit', type=int, default=None, help='只推理前 N 个 val 文件夹（冒烟用）')

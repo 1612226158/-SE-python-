@@ -2,7 +2,8 @@
 """
 eval_tail_class_acc.py —— 长尾小样本类对比：S-NoProG(全解冻) vs G-Full-CAWR(渐进式)
 研究问题：渐进式解冻是否在"训练样本最少的类"上更有优势？
-口径：254 个合并类（merged_dict 合并后），每类样本数 = 其成员文件夹(id)的图片数之和。
+口径：合并类（265 原始子类经 merged_dict 合并，当前 252 类，见 chart_data.N_CLS），
+      每类样本数 = 其成员文件夹(id)的图片数之和。
 切片：训练样本升序取最少 50 类 / 最少 100 类（最少50 ⊂ 最少100，嵌套）。
 
 用法（分阶段，避免推理长任务阻塞）：
@@ -14,7 +15,7 @@ eval_tail_class_acc.py —— 长尾小样本类对比：S-NoProG(全解冻) vs 
 【语义】
 - 聚合 acc（大数口径，更稳）= Σ正确 / Σ样本（该切片内全部 val 图）
 - 宏平均 acc = 切片内每类 acc 的简单平均（每类 val 仅~10张，噪声大，仅供对照）
-- 整体 254 类对照直接用 checkpoint 自带 val_acc：S-NoProG 82.63 / G-Full-CAWR 80.96
+- 整体类别对照直接用 checkpoint 自带 val_acc：S-NoProG 82.63 / G-Full-CAWR 80.96
 """
 import os
 import sys
@@ -56,14 +57,15 @@ _META = {
     'S-NoProg':    {'letter': 'S', 'label': 'S-NoProG（全解冻）',    'color': '#4c72b0'},
     'G-Full-CAWR': {'letter': 'G', 'label': 'G-Full-CAWR（渐进式）', 'color': '#dd8452'},
 }
-from chart_data import best_ckpt_path, results_best, model_best, is_known, model_cn  # noqa: E402
+from chart_data import (best_ckpt_path, results_best, model_best, is_known, model_cn,  # noqa: E402
+                        N_CLS)
 _unknown = [m for m in COMPARE_MODELS if not is_known(m)]
 if _unknown:
     raise SystemExit(f'[tail] 未在 model_registry.py 注册的模型: {_unknown}')
 _LETTER_OF = {cid: _META[cid]['letter'] for cid in COMPARE_MODELS}
 
 def _build_ckpt_and_overall():
-    """动态生成 {模型名: best checkpoint 路径} 与 {模型名: 整体254类 val_acc}。
+    """动态生成 {模型名: best checkpoint 路径} 与 {模型名: 整体各类 val_acc}。
     整体 acc 论文口径优先 results JSON（82.63/80.96），无 results 退回 metrics best。"""
     ckpt, overall = {}, {}
     for name in COMPARE_MODELS:
@@ -123,7 +125,11 @@ def build_class_table():
         row['train_n'] += train_cnt.get(fid, 0)
         row['val_n'] += val_cnt.get(fid, 0)
     n_classes = len(class_table)
-    assert n_classes == 254, f'合并类数应为 254，实际 {n_classes}'
+    # 交叉校验：本文件的 N_CLS（来自 chart_data）必须与 merged_dict 实际算出的类数一致。
+    # 两边任一处漂移（改了 merged_dict 忘改 N_CLS，或反之）都会在此当场报错。
+    assert n_classes == N_CLS, (
+        f'合并类数不一致：merged_dict 实际 {n_classes}，chart_data.N_CLS = {N_CLS}。'
+        f'请同步 src_v2/ReportChart/chart_data.py 的 N_CLS（口径 = 265 − Σ(|组|−1)）')
     return class_table, id_to_main_class, renew_class_to_index
 
 
@@ -133,7 +139,7 @@ def stage_count():
     print(f'合并类总数: {len(rows)}')
     print(f'{"名次":>4} {"类名":<32} {"train样本":>8} {"val样本":>7} {"成员ids":>12}')
     for rank, (cls, r) in enumerate(rows, 1):
-        if rank <= 30 or rank in (50, 100) or rank > 244:
+        if rank <= 30 or rank in (50, 100) or rank > N_CLS - 10:
             print(f'{rank:>4} {cls:<32} {r["train_n"]:>8} {r["val_n"]:>7} {str(r["ids"]):>12}')
     # 汇总切片
     def slice_stat(k):
@@ -354,7 +360,7 @@ def stage_plot():
                                    gridspec_kw={'width_ratios': [1.15, 1.4]})
 
     # ---- 左面板：三组聚合柱状 ----
-    labels = ['最少50类\n(聚合)', '最少100类\n(聚合)', '全部254类\n(整体参考)']
+    labels = ['最少50类\n(聚合)', '最少100类\n(聚合)', f'全部{N_CLS}类\n(整体参考)']
     full = OVERALL_ACC['S-NoProg']
     prog = OVERALL_ACC['G-Full-CAWR']
     s_vals = [a50, a100, full]
@@ -391,8 +397,8 @@ def stage_plot():
         xs.append(k)
         s_curve.append(sa)
         g_curve.append(ga)
-    # 全体 254 类的整体参考（checkpoint val_acc，非本次逐类推理）
-    xs_all = xs + [254]
+    # 全体合并类的整体参考（checkpoint val_acc，非本次逐类推理）
+    xs_all = xs + [N_CLS]
     s_all = s_curve + [full]
     g_all = g_curve + [prog]
 
@@ -407,13 +413,13 @@ def stage_plot():
     ax2.set_xlabel('参与统计的类数（按训练样本数从少到多取前 k 类）')
     ax2.set_ylabel('聚合 Top-1 准确率 (%)')
     ax2.set_xticks(xs_all)
-    ax2.set_xticklabels([str(k) for k in xs] + ['全体254'])
+    ax2.set_xticklabels([str(k) for k in xs] + [f'全体{N_CLS}'])
     ax2.set_ylim(0, 100)
     ax2.legend(loc='upper left', fontsize=9)
     ax2.set_title('(b) 前缀趋势：差距随类样本量变化', fontsize=12)
     ax2.grid(True, alpha=0.4)
 
-    fig.suptitle('长尾小样本类：渐进式解冻 vs 全解冻（254类口径，逐类推理）', fontsize=13)
+    fig.suptitle(f'长尾小样本类：渐进式解冻 vs 全解冻（{N_CLS}类口径，逐类推理）', fontsize=13)
     fig.tight_layout(rect=(0, 0, 1, 0.95))
     out = os.path.join(_HERE, 'tail_class_acc.pdf')
     fig.savefig(out, dpi=300)
@@ -425,7 +431,7 @@ def stage_plot():
     print('=' * 70)
     print(f'{"切片":<16}{"S-NoProG":>12}{"G-Full-CAWR":>14}{"差值(全解冻-渐进)":>18}')
     for nm, (sa, ga) in [('最少50类', (a50, b50)), ('最少100类', (a100, b100)),
-                         ('全部254类', (full, prog))]:
+                         (f'全部{N_CLS}类', (full, prog))]:
         print(f'{nm:<16}{sa:>11.2f}%{ga:>13.2f}%{sa - ga:>+17.2f}pp')
     print('-' * 70)
     print('每类宏平均（对照，单类 val 仅~10张噪声大）:')

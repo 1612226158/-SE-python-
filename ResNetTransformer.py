@@ -33,6 +33,7 @@ import torch.nn as nn
 from torchvision.models import resnext50_32x4d
 
 from src_v2 import merged_dict
+from src_v2.taxonomy import EXPECTED_NUM_CLASSES
 from src_v2.SE_Block import SEBlock as NewSEBlock
 
 
@@ -258,10 +259,10 @@ if __name__ == '__main__':
     # 用法：在项目根 E:\DataSet\垃圾分类图片-2 下执行
     #   python src_v2/ResNetTransformer.py
     d_model, nhead = 512, 8
-    fake_class_index = {i: i for i in range(254)}   # 254 类占位，自检只关心前向 shape
+    fake_class_index = {i: i for i in range(EXPECTED_NUM_CLASSES)}
     model = ResNetTransformerV2(transformer_layers=3, d_model=d_model, nhead=nhead,
                                 renew_class_to_index=fake_class_index)
     x = torch.randn(2, 3, 224, 224)
     out = model(x)
-    print('前向输出 shape:', tuple(out.shape), '(应为 (2, 254))')
+    print('前向输出 shape:', tuple(out.shape), f'(应为 (2, {EXPECTED_NUM_CLASSES}))')
     print('位置编码可学习参数数量:', model.pos_embed.numel())

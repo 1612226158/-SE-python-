@@ -23,7 +23,7 @@ model_registry.py —— 模型"配置/名字/元数据"唯一注册表（2026-0
   ★ key 大小写规范：注册表与 runs/ 文件名一律用规范 key（如 'S-NoProg' 小写 g）；
     论文/叙述里的 "S-NoProG"（大写 G）只是显示写法，经 ALIASES 归一化到规范 key。
 
-【当前状态基线（results JSON 权威，254 类/CAWR 口径）】
+【历史状态基线（results JSON 权威，254 类/CAWR 旧标签口径；新 252 类协议须重跑）】
   S-NoProg 82.63@74 / S-NoSE 82.53@73（SE≈0.10pp）/ G-Full-CAWR 80.96@92（调度器修复后干净重跑）
   G-Full-CAWR-Long 83.565@132（160轮）/ V2-Full 83.353@74（vs S-NoProG +0.72pp，n=1 初步）
   V2-NoTF 跑中（09-09）/ G-V2 立项排队（2×2 第四格）

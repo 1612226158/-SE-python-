@@ -29,7 +29,7 @@
 2. **classname.txt**：265 行纯文本，**第 N 行 = 文件夹 N 的类别名**（0-based 对齐，例：第 25 行 `厨余垃圾-果壳` 对应文件夹 24）；新增/改名类别时需同步改此文件与 train/、val/ 的文件夹（train/ 里也有一份残留 copy，代码不读它，可忽略）；
 3. **数据集存储**：`train/` 与 `val/` 各含 265 个数字子文件夹（0~264），每类一个文件夹、图片直接散放其中；加载扩展名 = `jpg/jpeg/png/bmp/tif/tiff/jfif`（**avif 不被加载**）；
 4. **缓存**：`src_v2` 启动时以 `src/` 的原缓存为种子，生成自己的 `src_v2/images_cache_*_v2.json`（增量自动更新，不入库）；
-5. **合并类**：`src_v2/__init__.py` 的 `merged_dict` 定义哪些类合并（当前 7 组 → 输出 254 类）；改它**无需重建缓存**（合并发生在标签生成层）。
+5. **合并类**：`src_v2/taxonomy.py` 是标签体系唯一真源（当前 9 组 → 输出 252 类），其中新增 `蔬菜/菜根菜叶 → 菜叶`、`插头电线/充电线 → 插头充电线`。后者避免与原有“充电头”等类别语义重叠。修改逻辑合并**无需重建图片缓存**，但会改变分类头维度或输出索引，旧 checkpoint 不得续跑。
 
 ## 一、怎么跑（PyCharm）
 
@@ -55,7 +55,7 @@
 | 文件 | 内容 |
 |---|---|
 | `metrics.csv` | 旧 18 列格式（与历史口径一致，便于和旧 CSV 对齐看） |
-| `metrics_record.csv` | 新格式：config_id/seed/train_acc/val_acc/val_macro_f1/val_weighted_f1/lr/gradient_norm 等纯数值列 |
+| `metrics_record.csv` | 新格式：config_id/seed/epoch/sampler_seed/train_acc/val_acc/val_macro_f1/val_weighted_f1/lr/gradient_norm 等纯数值列 |
 | `checkpoint_<配置>_seed<种子>_best.pth` | **实时 best（state_dict），论文数字以它为准** |
 | `checkpoint_<配置>_seed<种子>_last.pth` | **每轮断点（state_dict+optimizer+scheduler，约317MB）**：中途暂停后 `RESUME=true` 就从它续跑 |
 | `results_<配置>_seed<种子>.json` | **本运行结果汇总**（params/样本数/best 轮次与 acc/显存峰值/时长等，训练结束生成） |

@@ -15,7 +15,7 @@ chart_data.py —— ReportChart 统一实验数据读取模块（2026-09-08 会
   若模型在跑（metrics_record.csv 实时追加），load_model 也能拿到"截至当前"的数据。
 
 【口径说明】
-  - metrics_record.csv 每行含: config_id,seed,epoch,train_acc,train_loss,val_acc,val_loss,
+  - metrics_record.csv 每行含: config_id,seed,epoch,sampler_seed,train_acc,train_loss,val_acc,val_loss,
     val_macro_f1,val_weighted_f1,lr,gradient_norm,time_spend_s,state,save_time
   - Long 配置（G-Full-CAWR-Long=160 轮）续跑产生的 100~159 与源配置 0~99 分处不同 csv，
     本模块按 (config_id, seed) 合并后去重排序，天然支持。
@@ -29,6 +29,46 @@ import pandas as pd
 # ============ 路径（基于本文件定位，与 cwd 无关） ============
 _HERE = os.path.dirname(os.path.abspath(__file__))
 RUNS = os.path.join(os.path.dirname(_HERE), 'runs')
+
+# ============ 合并类口径常量（2026-09-26 加：消灭各绘图/评估脚本的硬编码 254） ============
+# **唯一真源 = src_v2/taxonomy.py**（merged_dict + RAW_CLASS_COUNT）。本模块**派生**而非复制：
+#   口径 = 原始子类文件夹数 − Σ(|组|−1)。
+#   2026-09-26 之前：7 组 18 子类 → 265 − 11 = 254
+#   2026-09-26 起  ：并入「蔬菜+菜根菜叶→菜叶」「插头电线+充电线→插头充电线」
+#                   （组名取「插头充电线」而非「充电器」，避免与既有类别「充电头」(id 68) 语义重叠）
+#                   共 9 组 22 子类 → 265 − 13 = 252
+# ⇒ 改标签体系请**只改 src_v2/taxonomy.py**，本模块的 N_CLS 会自动跟随。
+#   交叉校验：eval_tail_class_acc.build_class_table() 有 assert n_classes == N_CLS；
+#   merge_sim.py 自证 #2b 还会额外比对 chart_data.N_CLS ↔ merged_dict 实际类数 ↔ npz 类数。
+
+
+def _derive_n_cls():
+    """按**文件路径**加载 src_v2/taxonomy.py，返回 (原始子类数, 合并后类数)。
+
+    刻意不用 `import src_v2.taxonomy` —— 那会执行 src_v2/__init__.py 从而拉起 torch，
+    而本模块要求绘图脚本保持轻量（plot_*.py 不需要 torch）。taxonomy.py 本身只依赖
+    hashlib/json/os，按路径加载是安全的。
+    """
+    import importlib.util as _ilu
+    _taxonomy = os.path.join(os.path.dirname(_HERE), 'taxonomy.py')
+    _spec = _ilu.spec_from_file_location('_taxonomy_for_chart', _taxonomy)
+    if _spec is None or _spec.loader is None:
+        raise ImportError(f'无法定位 {_taxonomy}')
+    _mod = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    raw = int(_mod.RAW_CLASS_COUNT)
+    merged = raw - sum(len(g) - 1 for g in _mod.merged_dict.values())
+    return raw, merged
+
+
+try:
+    N_CLS_RAW, N_CLS = _derive_n_cls()
+except Exception as _e:      # taxonomy 缺失/改名时不静默：打印告警 + 回退字面常量
+    sys.stderr.write(
+        f'[chart_data] ⚠ 无法从 src_v2/taxonomy.py 派生合并类数（{_e.__class__.__name__}: {_e}），'
+        f'回退字面常量 265/252 —— 若标签体系已改，此处会画出错误口径，请立即核对。\n')
+    N_CLS_RAW = 265          # 数据集原始子类文件夹数（train/ 与 val/ 各 265 个数字文件夹）
+    N_CLS = 252              # 合并后模型输出类数 = N_CLS_RAW − Σ(|组|−1)（9 组 22 子类 → 减 13）
 
 # ============ 已知脏记录登记（2026-09-09 加，用户指出"只按文件新旧掩盖症状是严重bug"） ============
 # 背景：调度器 bug（CAWR 误传 val_acc → state2/3 从不重启、lr 贴 1e-6 地板）期间的

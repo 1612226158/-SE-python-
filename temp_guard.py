@@ -326,6 +326,8 @@ def _read_twice(read_fn, interval=3.0):
     for i in range(2):
         v = read_fn()
         if v is not None:
+            if i == 0:
+                time.sleep(3)  # 暂停3s
             vals.append(v)
         if i == 0:
             time.sleep(interval)  # 两次测量之间隔一下，避免读到同一瞬时的抖动

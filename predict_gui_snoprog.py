@@ -49,6 +49,7 @@ from ResNet import ResNetTransformer
 from ResNetTransformer import ResNetTransformerV2
 from calculate import calculate_mean_and_std, generate_mappings, get_classnames
 from src_v2 import merged_dict
+from src_v2.taxonomy import EXPECTED_NUM_CLASSES   # 合并类数唯一真源（当前 252，2026-09-26 起）
 
 # ==================== 模型配置（唯一真源 = src_v2\model_registry.py，2026-09-09 拆出） ====================
 # 本表 = (arch, regions, transformer_layers, use_decouple, 短说明)，全部由注册表派生；
@@ -227,7 +228,9 @@ def build_combo_items():
 
 
 class Predictor:
-    """加载指定配置的 best 模型 + 254 类映射，提供单图预测。
+    """加载指定配置的 best 模型 + 合并类映射（类数由 src_v2.taxonomy.EXPECTED_NUM_CLASSES 决定，
+    当前 252；2026-09-26 起由 254 并入「蔬菜+菜根菜叶→菜叶」「插头电线+充电线→插头充电线」而来），
+    提供单图预测。
     未跑出 best 的配置 → __init__ 抛 ModelNotReadyError（GUI 捕获后提示"暂无模型"）。"""
 
     def __init__(self, config_id=DEFAULT_CONFIG, verbose=True, device=None):
@@ -258,12 +261,19 @@ class Predictor:
         file = os.path.join(_PROJECT_ROOT, 'train')
         self.mean, self.std, _ = calculate_mean_and_std(file, retrieve_file=True)
 
-        # —— 254 类映射（与训练时同一 merged_dict / classname.txt / 排序逻辑）——
+        # —— 合并类映射（与训练时同一 merged_dict / classname.txt / 排序逻辑）——
         self.id_to_main_class, self.renew_class_to_index = generate_mappings(merged_dict=merged_dict)
         self.index_to_name = {int(v): k for k, v in self.renew_class_to_index.items()}
         num_classes = len(self.renew_class_to_index)
+        # 硬校验而非只打印：标签体系改了却没同步 taxonomy 时，输出头维度与类别名会错位，
+        # 预测会"看起来正常但全是错类"——这类静默错误必须当场拦下。
+        if num_classes != EXPECTED_NUM_CLASSES:
+            raise RuntimeError(
+                f'标签映射类数 {num_classes} != src_v2.taxonomy.EXPECTED_NUM_CLASSES '
+                f'{EXPECTED_NUM_CLASSES}：merged_dict 与 taxonomy 已不一致，'
+                f'拒绝以错误口径加载模型并预测。')
         if verbose:
-            print(f'[映射] 类别数 = {num_classes}（应为 254）')
+            print(f'[映射] 类别数 = {num_classes}（== EXPECTED_NUM_CLASSES）')
 
         # —— 重建模型（结构须与训练时完全一致；参数取自 MODEL_REGISTRY）——
         kwargs = dict(transformer_layers=tf_layers, d_model=D_MODEL,
@@ -598,7 +608,8 @@ QPushButton#tbBtnClose:pressed { background: #c50f1e; }
             root.setSpacing(0)
 
             # —— 自绘标题栏（浅色一体式，取代系统标题栏）——
-            self.title_bar = TitleBar(self, '垃圾分类智能识别', '多模型对照 · 单图预测 · 254 类')
+            self.title_bar = TitleBar(self, '垃圾分类智能识别',
+                                      f'多模型对照 · 单图预测 · {EXPECTED_NUM_CLASSES} 类')
             root.addWidget(self.title_bar)
 
             # —— 内容区（卡片带边距呼吸感）——

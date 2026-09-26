@@ -1,9 +1,9 @@
 {
-  "CONFIG_ID": "V2-NoTF",
+  "CONFIG_ID": "S-NoProg",
   "SEED": 1,
   "SMOKE": false,
   "MAX_EPOCHS": 100,
-  "RESUME": true,
+  "RESUME": false,
   "AUTO": true,
   "UNFREEZE1_EPOCH": 30,
   "UNFREEZE2_EPOCH": 60

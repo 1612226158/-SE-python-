@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """merge_sim.py —— 标签体系口径评估（离线合并模拟）
 
-【目的】不改一张图、不训练，只用已算好的 254×254 混淆矩阵做纯算术重算，量化"标签口径"对成绩的
+【目的】不改一张图、不训练，只用已算好的 N×N（N = 合并类数，见 chart_data.N_CLS）混淆矩阵做纯算术重算，量化"标签口径"对成绩的
 影响，并给候选合并排序。方案与全部限定条件见 `毕业设计\\离线合并模拟方案_v4.md` 与 `…_v5.md`。
 
 【口径定义（务必按此解读，勿混用）】
@@ -53,9 +53,16 @@ except Exception:
 HERE = os.path.dirname(os.path.abspath(__file__))          # src_v2/ReportChart
 SRCV2 = os.path.dirname(HERE)                              # src_v2
 ROOT = os.path.dirname(SRCV2)                              # 项目根
-for _p in (SRCV2, ROOT):
+for _p in (SRCV2, ROOT, HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
+
+# 合并类口径唯一真源 = chart_data.py 的 N_CLS / N_CLS_RAW（本文件不再重复硬编码）。
+# 缺失即报错而非静默退化——用错类数会让本文件所有"口径重算"结论失去意义。
+try:
+    from chart_data import N_CLS, N_CLS_RAW
+except ImportError as _e:
+    raise SystemExit(f'[merge_sim] 需同目录 chart_data.py 提供 N_CLS/N_CLS_RAW：{_e}')
 
 MODEL = 'S-NoProG'
 NPZ_DEFAULT = os.path.join(HERE, 'confusion_S-NoProG.npz')
@@ -64,15 +71,19 @@ VAL_ROOT = os.path.join(ROOT, 'val')
 RUNS_DIR = os.path.join(SRCV2, 'runs')
 VALID_EXTS = ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff', '.jfif')   # 与 SafeImageFolder._scan_disk 一致
 TIE_RULE = '(-w, class index asc)'
-# 期望值（来自论文表 tab:ambiguity-bound，用于自证 #9）
+# 期望值（来自论文表 tab:ambiguity-bound，用于自证 #9）——⚠️ 这些是"某一份 npz + 某个合并口径"
+# 的实测基线，与具体 confusion_*.npz 绑定：换模型 / 换合并口径 / 重训后必须重新 infer 并重新基线化，
+# 否则 #1/#9/#9b 会（正确地）报 FAIL。它们不是"应该改到通过"的目标值。
 EXPECT_TOL = {5: 84.6059, 10: 85.4208, 20: 86.4617, 50: 88.1874}
 EXPECT_PART = {5: 84.6059, 10: 85.5372, 20: 86.5713, 50: 88.9612}
 EXPECT_COMPONENTS = {5: 249, 10: 244, 20: 236, 50: 211}
 EXPECT_PARENT_ACC = 95.9734
 # spec A（6.5.6 盲标"重叠型" + 语义闸门）
+# ⚠️ 2026-09-26：原第 3 对「插头电线 ↔ 充电线」已并入同一合并类（可回收物-插头充电线），
+#    pair 内两名会指向同一个 npz 索引 ⇒ 在 stage_null 里 cm[i,i]+cm[i,i] 会把**正确预测**
+#    计入"组内误差"、虚高 Δacc。故必须从这里移除；spec json 同步改为 2 对。
 SPEC_A_PAIRS = [('私有类-可回收物-锅', '私有类-可回收物-电饭煲'),
-                ('公共类-可回收物-鞋', '私有类-可回收物-拖鞋'),
-                ('私有类-可回收物-插头电线', '私有类-可回收物-充电线')]
+                ('公共类-可回收物-鞋', '私有类-可回收物-拖鞋')]
 
 
 # ------------------------------------------------------------------ 基础工具
@@ -332,13 +343,16 @@ def stage_selfcheck(a):
     # #2 守恒与组数
     ck.check('#2 Σ CM 守恒', int(merge_cm(cm, [[i] for i in range(n)]).sum()) == N, f'{N}')
     if md:
-        n_merges = sum(len(g) - 1 for g in md.values())          # 7 组 / 18 成员 → 11 次归并
-        n_single = len(id2main) - n_merges                       # 265 − 11 = 254
-        ck.check('#2b 合并前 265 类 − Σ(|g|−1) == 254 个合并类',
-                 (n_single == n and len(id2main) == 265 and n_merges == 11),
-                 f'实测 265 − {n_merges} = {n_single}（组数 {len(md)}，成员 {sum(len(g) for g in md.values())}）')
+        n_merges = sum(len(g) - 1 for g in md.values())          # 当前 9 组 / 22 成员 → 13 次归并
+        n_single = len(id2main) - n_merges                       # 265 − 13 = 252
+        stale = '' if n_single == n else ' ⇐ 不相等：npz 属旧口径，需重新 infer 后再自证'
+        ck.check(f'#2b 合并前 {N_CLS_RAW} 类 − Σ(|g|−1) == {n_single} 个合并类'
+                 f'（且 == chart_data.N_CLS {N_CLS}、== npz 的 {n}）',
+                 (n_single == n and len(id2main) == N_CLS_RAW and n_single == N_CLS),
+                 f'实测 {N_CLS_RAW} − {n_merges} = {n_single}（组数 {len(md)}，'
+                 f'成员 {sum(len(g) for g in md.values())}）；npz 类数 {n}{stale}')
     else:
-        ck.check('#2b 合并前 265 类 − Σ(|g|−1) == 254 个合并类', False, 'SKIP')
+        ck.check(f'#2b 合并类数守恒（merged_dict ↔ chart_data.N_CLS {N_CLS} ↔ npz）', False, 'SKIP')
 
     # #3 闭式校验（spec A）
     idx = {nm: i for i, nm in enumerate(names)}
@@ -356,8 +370,8 @@ def stage_selfcheck(a):
     if mapping:
         want = sorted(set(id2main.values()))
         ck.check('#4 names == sorted(set(id2main.values()))', names == want, f'n={len(want)}')
-        ck.check('#4b 265 fid → 254 名满射（Σ|π⁻¹| = 265）',
-                 len(id2main) == 265 and len(set(id2main.values())) == n,
+        ck.check(f'#4b {N_CLS_RAW} fid → {n} 名满射（Σ|π⁻¹| = {N_CLS_RAW}）',
+                 len(id2main) == N_CLS_RAW and len(set(id2main.values())) == n,
                  f'fid 数 {len(id2main)}，去重类名 {len(set(id2main.values()))}，类数 {n}')
 
     # #5 每类 (support, tp) 比对盘上计数

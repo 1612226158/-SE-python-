@@ -22,6 +22,7 @@ import pillow_avif  # 导入 AVIF 支持插件
 from src_v2 import merged_dict, metrics_file, UPDATE_N
 
 from src_v2 import extensions_suffix
+from src_v2.taxonomy import generate_label_mappings
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True  # 忽略部分损坏的图片
 
@@ -121,7 +122,7 @@ class SafeImageFolder(datasets.ImageFolder):
     def _scan_disk(self):
         """列磁盘当前图片文件 -> {相对路径: (mtime, size)}。只列名+stat，不做内容验证。"""
         disk = {}
-        valid_exts = ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff', '.jfif')
+        valid_exts = ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff', '.jfif', '.avif')
         for folder in os.listdir(self.root):
             folder_path = os.path.join(self.root, folder)
             if not folder.isdigit() or not os.path.isdir(folder_path):
@@ -303,7 +304,7 @@ class SafeImageFolder(datasets.ImageFolder):
         """
         重写 is_valid_file，扩展支持的文件类型。
         """
-        valid_extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff', '.jfif')
+        valid_extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff', '.jfif', '.avif')
         return path.lower().endswith(valid_extensions)
 
 
@@ -598,6 +599,10 @@ def add_record_metrics(epoch=-1,
 def add_record_metrics_v2(epoch=-1,
                           config_id='',
                           seed=0,
+                          sampler_seed=None,
+                          label_schema_version=None,
+                          label_mapping_hash=None,
+                          num_classes=None,
                           train_acc=0.0,
                           train_loss=0.0,
                           val_acc=0.0,
@@ -608,7 +613,7 @@ def add_record_metrics_v2(epoch=-1,
                           gradient_norm=0.0,
                           time_spend=0,
                           state=1):
-    """新增实验记录 v2：纯数值列 + config_id/seed，写入 src_v2/runs/metrics_record.csv。
+    """新增实验记录 v2：纯数值列 + 采样/标签协议，写入 src_v2/runs/metrics_record.csv。
     原 metrics.csv（旧 18 列）仍由 add_record_metrics 照常写入，二者并存互不影响。"""
     runs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'runs')
     os.makedirs(runs_dir, exist_ok=True)
@@ -621,6 +626,10 @@ def add_record_metrics_v2(epoch=-1,
         "config_id": [config_id],
         "seed": [seed],
         "epoch": [epoch],
+        "sampler_seed": [sampler_seed],
+        "label_schema_version": [label_schema_version],
+        "label_mapping_hash": [label_mapping_hash],
+        "num_classes": [num_classes],
         "train_acc": [train_acc],
         "train_loss": [train_loss],
         "val_acc": [val_acc],
@@ -633,10 +642,20 @@ def add_record_metrics_v2(epoch=-1,
         "state": [state],
         "save_time": [datetime.strftime(datetime.now(), '%Y-%m-%d %H:%M:%S')],
     }
+    row_df = pd.DataFrame(row)
     if not os.path.isfile(record_file):
-        pd.DataFrame(row).to_csv(record_file, index=False)
+        row_df.to_csv(record_file, index=False)
     else:
-        pd.DataFrame(row).to_csv(record_file, mode='a', header=False, index=False)
+        # 兼容修改前已经创建的 CSV：旧行的 sampler_seed 无法可靠反推，保留为空；
+        # 先升级表头再追加，避免新列导致整行错位。
+        existing_columns = pd.read_csv(record_file, nrows=0).columns.tolist()
+        if list(row_df.columns) != existing_columns:
+            existing = pd.read_csv(record_file)
+            ordered_columns = existing_columns + [c for c in row_df.columns if c not in existing_columns]
+            existing = existing.reindex(columns=ordered_columns)
+            row_df = row_df.reindex(columns=ordered_columns)
+            existing.to_csv(record_file, index=False)
+        row_df.to_csv(record_file, mode='a', header=False, index=False)
     return epoch
 
 
@@ -683,72 +702,8 @@ def add_record_metrics_v2(epoch=-1,
 # 修改 generate_mappings 函数，确保与数据集排序一致
 def generate_mappings(merged_dict):
     class_labels = get_classnames()
-    id_to_main_class = {}  # id: 父类
-
-    # 遍历 merged_dict
-    for main_class in sorted(merged_dict.keys()):
-        items = merged_dict[main_class]
-        # main_class重新定义的公共父类
-        for item_id, child_name in items:
-            id_to_main_class[item_id] = f"公共类-{main_class}"
-            # id_to_child_class[item_id] = child_name
-
-    # print(f"temp_id_to_main_class, {id_to_main_class}", end="\n" + '*' * 100)
-
-    # 为未列出的类别设置默认值
-    # 按照数据集的顺序（字符串排序）处理类别
     dataset_classes = sorted([int(cls) for cls in os.listdir(os.path.join(_PROJECT_ROOT, 'train')) if cls.isdigit()])
-    # print(f"{dataset_classes=}")
-
-    for class_id in dataset_classes:
-        if str(class_id) not in id_to_main_class:
-            class_name = class_labels[class_id]
-            id_to_main_class[str(class_id)] = f"私有类-{class_name}"
-            # id_to_child_class[str(class_id)] = class_name
-
-    # print(f"all_id_to_main_class, {id_to_main_class}", end="\n" + '*' * 100)
-
-    # print(f"{id_to_child_class=}")
-
-    # 将父类索引重新标写, 从"0"开始
-    # 含公共类和私有类, 重新排序
-    renew_class_to_index = {}
-    sort_idx = sorted(set(id_to_main_class.values()))
-    for idx, main_class in enumerate(sort_idx):
-        renew_class_to_index[main_class] = str(idx)
-    # print(f"start's {sorted(set(id_to_main_class.values()))=}")
-    # print(f"{len(renew_class_to_index)=}")
-    # print(f"{id_to_main_class=}")
-    # print(f"{sorted(set(id_to_main_class.values()))=}")
-    # print(f"{set(id_to_main_class.values())=}")
-    # print(f"{len(set(id_to_main_class.values()))=}, {len(id_to_main_class.values())=}")
-    # print(f"{main_class_to_index=}")
-
-    # 创建子类到索引的映射（按主类分组）
-    # child_class_to_index = {}
-    # f = True
-    # idx_public = 0
-    # for main_class in main_class_to_index.keys():
-    #     # 获取该主类下的所有子类
-    #     children = [
-    #         child for class_id, child in id_to_child_class.items()
-    #         if id_to_main_class[class_id] == main_class
-    #     ]
-    #     # print(f"{children=}") if f else ...
-    #     f = False
-    #     # 为每个子类分配索引
-    #     for idx, child in enumerate(set(children)):
-    #         if main_class.split("-")[0] == '私有类':
-    #             child_key = main_class
-    #         else:
-    #             child_key = f"{main_class}___{child}"
-    #         child_class_to_index[child_key] = idx_public
-    #         idx_public += 1
-
-    # print(f"{child_class_to_index=}")
-    return id_to_main_class, renew_class_to_index
-
-    # return id_to_main_class, id_to_child_class, main_class_to_index, child_class_to_index
+    return generate_label_mappings(merged_dict, class_labels, dataset_classes)
 
 
 def get_class_proportion(pq='p'):
@@ -787,6 +742,64 @@ def get_class_proportion(pq='p'):
     # _ = [file_and_num[index].append(key[-1] / all_files_number) for index, key in enumerate(file_and_num)]
     class_weights = torch.tensor([value[-1] for value in file_and_num])
     return class_weights
+
+
+# 与 SafeImageFolder._scan_disk 一致的扩展名白名单——计数口径必须与加载器一致，
+# 否则"参与采样的样本数"与"盘上文件数"会对不上。
+_TRAIN_VALID_EXTS = ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff', '.jfif', '.avif')
+
+
+def get_output_class_sample_counts():
+    """按**合并后的输出类**（当前 252 类）统计样本数，返回按 ImageFolder class_idx 对齐的张量。
+
+    与 get_class_proportion(pq='q') 的区别
+    ------------------------------------
+    get_class_proportion 按 265 个**原始文件夹**各自计数。合并组里不同成员文件夹的图片数
+    不同 ⇒ 逆频权重也不同 ⇒ **同一输出类内部的采样强度不一致**。合并类越多越明显，例如
+    把「蔬菜」与「菜根菜叶」并为「菜叶」后，两类图片仍按各自文件夹的图片数加权，而不是
+    按"菜叶"这个输出类的总数加权 —— 这既不符合"按类别逆频平衡"的声明，也会让合并类的
+    成员分布被各自原始规模带偏。
+
+    本函数先把成员文件夹的样本数**加总到输出类**，再回填到每个成员文件夹对应的槽位，
+    于是 WeightedRandomSampler 的逆频加权口径 = 252 个输出类，合并类内部权重一致。
+
+    返回
+    ----
+    torch.long tensor，长度 = train/ 下数字文件夹个数（265）。
+    下标 i = ImageFolder 的 class_idx，值 = 下标 i 所属输出类的总样本数
+    （同一输出类的所有成员文件夹取到同一个值）。
+    """
+    train_root = os.path.join(_PROJECT_ROOT, 'train')
+    # 必须按"文件夹名的字符串升序"——ImageFolder 的 class_to_idx 正是这个顺序，
+    # 而 train.py 里 labels 取的是 ImageFolder 的 class_idx，两者下标必须严格对齐。
+    dir_names = sorted([d for d in os.listdir(train_root)
+                        if d.isdigit() and os.path.isdir(os.path.join(train_root, d))])
+
+    raw_counts = {}
+    for d in dir_names:
+        p = os.path.join(train_root, d)
+        try:
+            raw_counts[d] = sum(1 for n in os.listdir(p)
+                                if n.lower().endswith(_TRAIN_VALID_EXTS))
+        except OSError:
+            raw_counts[d] = 0
+
+    class_labels = get_classnames()
+    dataset_classes = sorted(int(d) for d in dir_names)
+    id_to_main_class, _ = generate_label_mappings(merged_dict, class_labels, dataset_classes)
+
+    cls_total = {}
+    for d in dir_names:
+        cls = id_to_main_class.get(d)
+        if cls is None:
+            continue
+        cls_total[cls] = cls_total.get(cls, 0) + raw_counts.get(d, 0)
+
+    out = []
+    for d in dir_names:
+        cls = id_to_main_class.get(d)
+        out.append(cls_total.get(cls, raw_counts.get(d, 0)))
+    return torch.tensor(out, dtype=torch.long)
 
 
 # def get_class_weight(main_class_to_index, id_to_child_class, merged_dict_user=None):

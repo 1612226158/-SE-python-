@@ -13,7 +13,7 @@
 ```python
 from chart_data import (load_model, model_best, model_final,
                         results_best, best_ckpt_path, list_models,
-                        pair_tag, fig_out)
+                        pair_tag, fig_out, N_CLS, N_CLS_RAW)
 
 load_model('S-NoProg')    # → DataFrame：该模型全部轮次曲线数据
                           #   自动扫 runs/ 当前 + 所有归档 csv，按 config_id 过滤合并
@@ -25,6 +25,15 @@ results_best('S-NoProg')  # → (82.6337, 74, 1) 论文口径 best（读 results
                           #   ⚠ 论文表格/正文引用数字请用这个（results 是训练结束的正式成绩）
 best_ckpt_path('S-NoProg')# → best checkpoint 绝对路径（推理/加载模型用）
 list_models()             # → 打印当前有哪些模型可用（跑过的就有）
+
+# —— 合并类口径常量（2026-09-26 加；**唯一定义处**，不要在脚本里再写数字）——
+N_CLS_RAW                 # → 265  数据集原始子类文件夹数（train/ 与 val/ 各 265）
+N_CLS                     # → 252  合并类数 = N_CLS_RAW − Σ(|组|−1)
+                          #   2026-09-26 前为 254（7 组 18 子类）；
+                          #   现为 252（9 组 22 子类：并入「蔬菜+菜根菜叶→菜叶」「插头电线+充电线→插头充电线」）
+                          #   ⚠ 改 src_v2/__init__.py 的 merged_dict 后必须同步这两个常量；
+                          #     漂移会由 eval_tail_class_acc.build_class_table() 的 assert 当场拦下。
+                          #   图内标题/轴标签/表格一律用 f'{N_CLS}' 插值，不再硬编码。
 
 # —— 输出文件名推导（不再手写 out1/out2/out3）——
 fig_out('val_acc', 'G-Full-CAWR', 'S-NoProg')
@@ -55,18 +64,19 @@ fig_out('val_acc', 'G-Full-CAWR', 'S-NoProg')
 - **论文对应**：fig:loss-curve-snoprog-vs-snose / fig:val-acc-snoprog-vs-snose / fig:time-acc-snoprog-vs-snose（SE 消融：证明强基线下 SE 增益≈0）
 
 ### 3. `eval_tail_class_acc.py` —— 长尾小样本类分析（渐进式 vs 全解冻在尾部类上）
-- **不是普通曲线图**：对 **254 个合并类按训练样本量升序切片**（最少 50 类 / 最少 100 类），逐类推理两模型（CPU），统计尾部类上的准确率对比
+- **不是普通曲线图**：对 **`N_CLS`（当前 252）个合并类按训练样本量升序切片**（最少 50 类 / 最少 100 类），逐类推理两模型（CPU），统计尾部类上的准确率对比
 - **四阶段运行**（用法见脚本 docstring）：
   - `count` —— 统计类分布 → 生成 `tail_classes.json`
   - `infer` —— CPU 逐类推理（S-NoProG + G-Full-CAWR，仅 tail100 覆盖的 val 图）→ `per_class_acc.csv`
   - `plot` —— 读 csv 出图
   - `smoke` —— 冒烟验证
 - **输出**：`tail_class_acc.pdf`（双面板：左=50/100/全体聚合柱状 + 右=前缀趋势）+ `per_class_acc.csv`
-- **论文对应**：fig:tail-class-acc（长尾反转：最少50类渐进式 +3.64pp、最少100类 +2.15pp、全体 254 全解冻仍 +1.67pp → 互补）
+- **论文对应**：fig:tail-class-acc（长尾反转：最少50类渐进式 +3.64pp、最少100类 +2.15pp、全体 252 全解冻仍 +1.67pp → 互补）
+  ⚠ 上述 +3.64/+2.15/+1.67pp 与图内 `全体252` 参考点均为**旧 254 类口径 + 旧脏协议**的读数，重跑后须重新生成。
 - ⚠ infer 阶段需要 GPU/CPU 推理较久（~1817 张 × 2 模型），平时只重跑 `plot` 即可（读已有 csv）。
 
 ### 4. `eval_confusion_matrix.py` —— 混淆矩阵与逐类错误分析（2026-09-12 建）
-- **回答的问题**：模型到底错在哪（254×254 混淆矩阵）／哪些类最差（逐类 P/R/F1/support）／最典型混淆对（"真值→误判" top-N）
+- **回答的问题**：模型到底错在哪（`N_CLS`×`N_CLS`，当前 252×252 混淆矩阵）／哪些类最差（逐类 P/R/F1/support）／最典型混淆对（"真值→误判" top-N）
 - **设备**：默认 **CPU**（不抢训练 GPU；val 14,603 张全量**实测约 20.1 分钟**，论文时限按保守 40 分钟预算；`--threads` 可调，与训练共存建议 2~4）
 - **五阶段用法**：
   - `smoke --model S-NoProG`（5 个文件夹自检，~0.5 分钟）
@@ -93,6 +103,8 @@ fig_out('val_acc', 'G-Full-CAWR', 'S-NoProg')
 3. 只读纪律：脚本只读 runs/ 与 train/val（统计用），产物只写本目录；不碰训练、不改数据集；
 4. 中文字体：SimHei（脚本已设），若缺字体图内中文会变方块。
 5. **脏数据隔离（2026-09-09 用户指出后补强）**：`chart_data.DIRTY_RECORDS` 按 `(归档文件名, 配置, seed)` 登记"已作废重跑"的 run，命中行**行级剔除**（不依赖文件新旧、不影响同文件里其他配置的合法记录）。今后作废 run 的 csv 归档到 `runs\DIRTY*` 子目录（本模块不扫），或在 DIRTY_RECORDS 里登记，二者等价。
+6. **合并类数只准从 `chart_data.N_CLS` 取（2026-09-26 加）**：唯一真源是 `src_v2/__init__.py` 的 `merged_dict`，`N_CLS = 265 − Σ(|组|−1)`。任何图标题、轴标签、表格、`assert` 都不许再写死数字；跨文件漂移由 `eval_tail_class_acc.build_class_table()` 的 assert 与 `merge_sim.py` 的自证 #2b 双双拦截。
+7. **`_` 前缀脚本与 spec 文件的口径绑定**：`merge_sim.py` 的 `SPEC_A_PAIRS` / `EXPECT_*`、`_verify_bootstrap.py` 的 `PAIRS`、`merge_specs/v2_candidate_A.json` 都绑定"某一份 npz + 某一个合并口径"。合并口径一变（类对落进同一合并类），**必须先剔除该对**——否则两名会指向同一索引，`cm[i,i]+cm[i,i]` 会把正确预测计入误差、虚高 Δacc（`merge_sim.stage_null` / `_verify_bootstrap` 的组内统计都吃这个坑）。重训后需在新 npz 上重新基线化这些期望值。
 
 ## 五、模型链接架构（2026-09-09 会话9 起）
 

@@ -1,0 +1,1291 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>垃圾分类模型 · 层叠架构图与消融参数差分台</title>
+<meta name="description" content="garbage265 垃圾分类模型逐层层叠架构图（方块堆叠 + 张量形状 + 参数分解）＋ 10 个配置的实时动画式差分。参数量由源码解析推导，已与项目记录交叉校验。">
+<style>
+/* =====================================================================
+   tokens —— 设计令牌
+   方向：工业仪表盘。方框堆叠采用「经典网络结构图」语汇（粗边框块 + 箭头 + 分组框）。
+   离线约束：不使用 Web Font，零外链；双击即开、可进论文归档。
+   ===================================================================== */
+:root{
+  --bg:#0b0d10;
+  --surface:#12151a; --surface-2:#171b21; --surface-3:#1d2229;
+  --border:rgba(148,163,184,.16); --border-2:rgba(148,163,184,.28);
+
+  --text:#e6e9ee; --text-2:#bcc3cd; --muted:#9aa4b2; --faint:#8b95a3;
+
+  /* 强调色：只表示「选中」，不表示任何数据状态 */
+  --accent:#f0a020; --accent-dim:rgba(240,160,32,.13);
+
+  /* 状态语义色（每个状态都同时有字形 + 文字标签，不单独依赖颜色）
+     注：--st-same 兼作「= 一致」文字色，必须满足正文 4.5:1，
+     原 #6b7686 在 #171c23 上只有 3.72:1（UI 审查实测），故提亮到 #8b95a3（≈5.6:1） */
+  --st-same:#8b95a3;
+  --st-changed:#ffd166;   /* 参数量改变（刻意避开强调色色相） */
+  --st-struct:#5cb8f0;    /* 结构改变、参数量不变 */
+  --st-absent:#c98b8b;    /* 直通 / 不存在 */
+  --st-new:#5fd39a;       /* 本配置新增 */
+  --st-frozen:#a4b0c8;    /* 被冻结 */
+
+  --mono:'Cascadia Mono','Consolas','SFMono-Regular','JetBrains Mono',ui-monospace,monospace;
+  --sans:'Segoe UI Variable Text','Microsoft YaHei UI','PingFang SC','Noto Sans SC','Hiragino Sans GB',sans-serif;
+
+  --fs-1:11px; --fs-2:12px; --fs-3:13px; --fs-4:15px; --fs-5:19px;
+  --sp-1:4px; --sp-2:8px; --sp-3:12px; --sp-4:16px; --sp-5:24px; --sp-6:36px;
+  --r-1:3px; --r-2:6px; --r-3:10px;
+
+  --ease:cubic-bezier(.16,1,.3,1);
+  --d-morph:460ms;        /* 状态换色的过渡时长 */
+}
+
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  background:var(--bg); color:var(--text); font-family:var(--sans); font-size:var(--fs-3);
+  line-height:1.55; -webkit-font-smoothing:antialiased;
+}
+button{background:none; border:0; font:inherit; color:inherit; cursor:pointer}
+:focus-visible{outline:2px solid var(--accent); outline-offset:2px}
+.visually-hidden{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;
+  clip:rect(0 0 0 0);white-space:nowrap;border:0}
+
+.wrap{max-width:1660px; margin:0 auto; padding:var(--sp-5) var(--sp-5) var(--sp-6)}
+
+/* ---------- 页头 ---------- */
+.top{display:flex; gap:var(--sp-5); align-items:flex-start; justify-content:space-between; flex-wrap:wrap}
+.brand{min-width:0; flex:1 1 520px}
+.eyebrow{font-family:var(--mono); font-size:var(--fs-1); letter-spacing:.18em; text-transform:uppercase; color:var(--faint)}
+h1{font-size:var(--fs-5); margin:var(--sp-2) 0 var(--sp-2); font-weight:650; letter-spacing:-.01em}
+h1 .thin{color:var(--muted); font-weight:400}
+.sub{margin:0; color:var(--text-2); max-width:74ch}
+.sub b{color:var(--text)}
+
+.baseline-pick{display:flex; flex-direction:column; gap:var(--sp-2); flex:none}
+.baseline-pick label{font-family:var(--mono); font-size:var(--fs-1); letter-spacing:.14em;
+  text-transform:uppercase; color:var(--faint)}
+select#baseline{
+  min-height:44px; padding:0 var(--sp-3); background:var(--surface-2); color:var(--text);
+  border:1px solid var(--border-2); border-radius:var(--r-2); font-family:var(--mono); font-size:var(--fs-2);
+}
+
+/* ---------- 三栏 ---------- */
+.work{display:grid; grid-template-columns:208px minmax(0,1fr) 430px; gap:var(--sp-4);
+      margin-top:var(--sp-4); align-items:start}
+.panel{border:1px solid var(--border); border-radius:var(--r-3); background:var(--surface); overflow:hidden}
+.panel-hd{display:flex; justify-content:space-between; align-items:center; gap:var(--sp-2);
+  padding:var(--sp-3) var(--sp-4); border-bottom:1px solid var(--border);
+  font-family:var(--mono); font-size:var(--fs-1); letter-spacing:.14em; text-transform:uppercase; color:var(--faint)}
+.panel-bd{padding:var(--sp-2)}
+
+/* ---------- 左栏：配置 ---------- */
+.rail{position:sticky; top:var(--sp-4)}
+.rail .grp{padding:var(--sp-3) var(--sp-3) var(--sp-1); font-family:var(--mono); font-size:var(--fs-1);
+  letter-spacing:.1em; color:var(--faint)}
+.mbtn{display:flex; align-items:center; gap:var(--sp-2); width:100%; min-height:44px;
+  padding:0 var(--sp-3); border-radius:var(--r-2); text-align:left;
+  transition:background 140ms linear, color 140ms linear}
+.mbtn:hover{background:var(--surface-3)}
+.mbtn:active{background:var(--surface-3)}
+.mbtn .dot{width:7px;height:7px;border-radius:50%;background:var(--st-same);flex:none}
+.mbtn .nm{font-family:var(--mono); font-size:var(--fs-2); color:var(--text-2); flex:1 1 auto;
+  min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.mbtn .tag{font-family:var(--mono); font-size:var(--fs-1); color:var(--faint); flex:none}
+.mbtn[aria-pressed="true"]{background:var(--accent-dim); box-shadow:inset 3px 0 0 var(--accent)}
+.mbtn[aria-pressed="true"] .nm{color:var(--accent); font-weight:600}
+.mbtn[aria-pressed="true"] .dot{background:var(--accent)}
+.mbtn[data-retired] .nm{text-decoration:line-through; color:var(--faint)}
+
+/* ---------- 中栏 ---------- */
+.stage-hd{display:flex; justify-content:space-between; align-items:baseline; gap:var(--sp-4); flex-wrap:wrap;
+  padding:var(--sp-3) var(--sp-4); border-bottom:1px solid var(--border)}
+.stage-hd h2{margin:0; font-size:var(--fs-4); font-weight:600}
+.stage-hd h2 code{font-family:var(--mono); color:var(--accent)}
+.totals{display:flex; gap:var(--sp-5); flex-wrap:wrap}
+.tot{display:flex; flex-direction:column; gap:1px}
+.tot .k{font-family:var(--mono); font-size:var(--fs-1); letter-spacing:.1em; color:var(--faint); text-transform:uppercase}
+.tot .v{font-family:var(--mono); font-size:var(--fs-3)}
+.tot .v .d{color:var(--muted); font-size:var(--fs-1)}
+.tot .v.up{color:var(--st-new)} .tot .v.down{color:var(--st-absent)}
+
+.deltabar{display:flex; flex-wrap:wrap; gap:var(--sp-2); align-items:center;
+  padding:var(--sp-3) var(--sp-4); border-bottom:1px solid var(--border); min-height:52px}
+.chip{display:inline-flex; align-items:center; gap:6px; padding:3px 9px; border-radius:999px;
+  border:1px solid var(--border-2); background:var(--surface-2); font-size:var(--fs-1); color:var(--text-2);
+  animation:chipIn 380ms var(--ease) both}
+.chip .g{font-family:var(--mono); font-weight:700}
+.chip.s-changed{border-color:var(--st-changed); color:var(--st-changed); background:rgba(255,209,102,.08)}
+.chip.s-struct{border-color:var(--st-struct); color:var(--st-struct); background:rgba(92,184,240,.08)}
+.chip.s-absent{border-color:var(--st-absent); color:var(--st-absent); background:rgba(201,139,139,.08)}
+.chip.s-new{border-color:var(--st-new); color:var(--st-new); background:rgba(95,211,154,.08)}
+.chip.s-frozen{border-color:var(--st-frozen); color:var(--st-frozen); background:rgba(164,176,200,.08)}
+@keyframes chipIn{from{opacity:0; transform:translateY(-4px)} to{opacity:1; transform:none}}
+
+.states{display:flex; align-items:center; gap:var(--sp-3); flex-wrap:wrap; padding:var(--sp-3) var(--sp-4);
+  border-bottom:1px solid var(--border)}
+.states[hidden]{display:none}
+.states .lb{font-family:var(--mono); font-size:var(--fs-1); letter-spacing:.14em; color:var(--faint); text-transform:uppercase}
+.seg{display:flex; border:1px solid var(--border-2); border-radius:var(--r-2); overflow:hidden}
+.seg button{min-height:44px; padding:0 var(--sp-4); font-family:var(--mono); font-size:var(--fs-2);
+  color:var(--text-2); border-right:1px solid var(--border)}
+.seg button:last-child{border-right:0}
+.seg button:hover,.seg button:active{background:var(--surface-3)}
+.seg button[aria-pressed="true"]{background:var(--accent-dim); color:var(--accent); box-shadow:inset 0 -3px 0 var(--accent)}
+/* ⚠ .seg 有 overflow:hidden —— 默认的 outline-offset:+2px 焦点环会被整条裁掉（UI 审查已实测 A/B 复现）。
+   这里用负偏移把环画进按钮内部。 */
+.seg button:focus-visible{outline-offset:-3px}
+.states .hint{color:var(--muted); font-size:var(--fs-2)}
+
+/* =====================================================================
+   ★ 层叠架构图
+   ---------------------------------------------------------------------
+   结构原则（为什么不可能再出现「文字重叠 / 超出边框」）：
+   1. 全部 13 个层框**位置固定**，不随配置增删移动 —— 没有重排，就没有错位；
+   2. 框内文字用 HTML 流式布局（flex + min-width:0 + ellipsis + overflow:hidden），
+      内容超出时被省略号截断而不是溢出；
+   3. 换配置只改 class 与文本 → CSS 过渡负责动画，不存在「整页重绘」。
+   ===================================================================== */
+.diagram{padding:var(--sp-4) var(--sp-4) var(--sp-2); border-bottom:1px solid var(--border);
+  background:radial-gradient(40rem 24rem at 50% 0%, rgba(92,184,240,.05), transparent 70%)}
+.diagram svg{display:block; width:100%; max-width:740px; margin:0 auto; height:auto}.diagram .cap{display:flex; flex-wrap:wrap; gap:var(--sp-2) var(--sp-4); align-items:center;
+  margin-top:var(--sp-3); padding-top:var(--sp-3); border-top:1px dashed var(--border)}
+.diagram .cap .it{display:inline-flex; align-items:center; gap:6px; font-size:var(--fs-1);
+  color:var(--muted); font-family:var(--mono)}
+.diagram .cap .it code{font-family:var(--mono); color:var(--text-2)}
+
+/* --- 方框本体（HTML，位于 foreignObject 内） --- */
+.cb{
+  position:relative; width:100%; height:100%;
+  padding:5px 14px 5px 18px;
+  border:2px solid var(--bdc, #3a434e);
+  border-radius:10px;
+  background-color:var(--bgc, #171c23);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.05), 0 2px 0 rgba(0,0,0,.38);
+  display:flex; flex-direction:column; justify-content:center; gap:2px;
+  line-height:1.2;                                   /* 框内一律紧凑行高，杜绝撑爆 */
+  overflow:hidden;                                   /* ← 结构性护栏：永不外溢 */
+  transition:background-color var(--d-morph) var(--ease),
+             border-color var(--d-morph) var(--ease),
+             box-shadow var(--d-morph) var(--ease);
+}
+.cb-bar{position:absolute; left:0; top:0; bottom:0; width:5px;
+  background:var(--sc, #8b95a3); border-radius:10px 0 0 10px;
+  transition:background-color var(--d-morph) var(--ease)}
+.cb-r1{display:flex; align-items:baseline; gap:8px; min-width:0; line-height:17px}
+.cb-ix{font-family:var(--mono); font-size:10.5px; color:var(--faint); flex:none}
+.cb-nm{font-size:14.5px; font-weight:650; color:var(--text); flex:1 1 auto; min-width:0;
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.cb-pp{font-family:var(--mono); font-size:12.5px; color:var(--text-2); flex:none; white-space:nowrap}
+.cb-r2{display:flex; align-items:baseline; gap:8px; min-width:0; line-height:14px}
+.cb-shp{font-family:var(--mono); font-size:11.5px; color:var(--text-2); flex:none; white-space:nowrap}
+.cb-cde{font-family:var(--mono); font-size:11.5px; color:var(--muted); flex:1 1 auto; min-width:0;
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.cb-st{font-family:var(--mono); font-size:11.5px; color:var(--sc, #8b95a3); flex:none; white-space:nowrap}
+.cb-st b{font-weight:700}
+.cb-extra{display:flex; flex-direction:column; gap:2px; margin-top:2px; min-height:0}
+.cb-sub{display:flex; align-items:center; gap:8px; min-width:0; height:16px;
+  padding:0 8px; border-radius:4px; background:rgba(148,163,184,.07);
+  border:1px solid var(--border); font-family:var(--mono); font-size:10px; line-height:14px}
+.cb-sub .l{color:var(--text-2); flex:1 1 auto; min-width:0; overflow:hidden;
+  text-overflow:ellipsis; white-space:nowrap}
+.cb-sub .r{color:var(--muted); flex:none; white-space:nowrap}
+.cb-note{font-size:10.5px; line-height:14px; color:var(--faint); overflow:hidden;
+  text-overflow:ellipsis; white-space:nowrap}
+.cb-note.fz{color:var(--st-frozen)}
+.cb-inner{display:flex; align-items:center; gap:8px; min-width:0; height:16px;
+  padding:0 8px; border-radius:4px; background:rgba(92,184,240,.08); border:1px solid var(--border);
+  font-family:var(--mono); font-size:10px; line-height:14px; color:var(--text-2)}
+.cb-inner .l{flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+
+/* --- 六种状态：背景 / 边框 / 状态色 --- */
+.blk[data-st="same"]    .cb{--bgc:#171c23; --bdc:#3a434e; --sc:#8b95a3}
+.blk[data-st="changed"] .cb{--bgc:#2e2412; --bdc:#ffd166; --sc:#ffd166}
+.blk[data-st="struct"]  .cb{--bgc:#132a35; --bdc:#5cb8f0; --sc:#5cb8f0}
+.blk[data-st="new"]     .cb{--bgc:#13291e; --bdc:#5fd39a; --sc:#5fd39a}
+.blk[data-st="absent"]  .cb{--bgc:rgba(201,139,139,.07); --bdc:#c98b8b; --sc:#c98b8b; border-style:dashed}
+.blk[data-st="frozen"]  .cb{--bgc:#181f2c; --bdc:#a4b0c8; --sc:#a4b0c8; border-style:dashed;
+  background-image:repeating-linear-gradient(45deg, rgba(164,176,200,.10) 0 6px, transparent 6px 12px)}
+.blk[data-st="absent"] .cb-nm{text-decoration:line-through; color:var(--muted)}
+.blk[data-st="absent"] .cb-pp{color:var(--faint)}
+
+/* --- 换配置时的动画（就地变形，不是切页） --- */
+.blk.tick .cb{animation:cbPop 620ms var(--ease) both}
+@keyframes cbPop{
+  0%  {opacity:.28; transform:translateY(-6px) scale(.985)}
+  55% {opacity:1}
+  100%{opacity:1; transform:none}
+}
+.swapped{animation:swapIn 420ms var(--ease) both}
+@keyframes swapIn{from{opacity:.2} to{opacity:1}}
+
+.conns{stroke:rgba(148,163,184,.5); fill:none; stroke-width:1.3}
+.conns.flow line{stroke-dasharray:5 6; animation:dashRun .85s linear 1}
+@keyframes dashRun{from{stroke-dashoffset:0} to{stroke-dashoffset:-22}}
+
+.grpbox{fill:rgba(148,163,184,.022); stroke:rgba(148,163,184,.24);
+  stroke-width:1.2; stroke-dasharray:7 6}
+.grpcap{font-family:var(--mono); font-size:10.5px; letter-spacing:.14em;
+  text-transform:uppercase; fill:var(--faint)}
+.brk{stroke:rgba(148,163,184,.5); fill:none; stroke-width:1.4}
+.brktx{font-family:var(--mono); font-size:12px; fill:var(--text-2)}
+
+.scan{opacity:0; pointer-events:none}
+.scan.run{animation:scanRun 1.25s cubic-bezier(.3,.7,.2,1) 1}
+@keyframes scanRun{
+  0%  {transform:translateY(-180px); opacity:0}
+  10% {opacity:.9}
+  80% {opacity:.45}
+  100%{transform:translateY(var(--scan-to,1254px)); opacity:0}
+}
+
+/* ---------- 文字明细表 ---------- */
+.detail{padding:var(--sp-4); overflow-x:auto}
+.detail h3{font-size:var(--fs-4); margin:0 0 var(--sp-3); display:flex; align-items:baseline; gap:var(--sp-3)}
+.detail h3 span{font-family:var(--mono); font-size:var(--fs-1); letter-spacing:.14em; color:var(--faint); font-weight:400}
+table.det{font-size:var(--fs-2); table-layout:fixed; min-width:860px; border-collapse:collapse; width:100%}
+table.det col.c1{width:24%} table.det col.c2{width:13%} table.det col.c3{width:12%}
+table.det col.c4{width:12%} table.det col.c5{width:11%} table.det col.c6{width:28%}
+table.det th,table.det td{padding:var(--sp-2) var(--sp-3); border-bottom:1px solid var(--border);
+  vertical-align:top; text-align:left; overflow-wrap:break-word}
+table.det thead th{font-family:var(--mono); font-size:var(--fs-1); letter-spacing:.1em;
+  color:var(--faint); font-weight:400; border-bottom:1px solid var(--border-2)}
+table.det td.n{font-family:var(--mono); text-align:right; white-space:nowrap}
+table.det tbody th{font-weight:400}
+table.det caption.visually-hidden{position:absolute;width:1px;height:1px;margin:-1px;padding:0;
+  overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
+table.det td.s{font-family:var(--mono); white-space:nowrap}
+table.det td.dsc{color:var(--text-2)}
+table.det tr.r-changed td.s{color:var(--st-changed)} table.det tr.r-changed{border-left:3px solid var(--st-changed)}
+table.det tr.r-struct td.s{color:var(--st-struct)}   table.det tr.r-struct{border-left:3px solid var(--st-struct)}
+table.det tr.r-absent td.s{color:var(--st-absent)}   table.det tr.r-absent{border-left:3px solid var(--st-absent)}
+table.det tr.r-new td.s{color:var(--st-new)}         table.det tr.r-new{border-left:3px solid var(--st-new)}
+table.det tr.r-frozen td.s{color:var(--st-frozen)}   table.det tr.r-frozen{border-left:3px solid var(--st-frozen)}
+table.det tr.r-same{border-left:3px solid transparent}
+
+.proto{padding:var(--sp-4); border-top:1px solid var(--border)}
+.proto h3{font-size:var(--fs-4); margin:0 0 var(--sp-3); display:flex; align-items:baseline; gap:var(--sp-3)}
+.proto h3 span{font-family:var(--mono); font-size:var(--fs-1); letter-spacing:.14em; color:var(--faint); font-weight:400}
+.pgrid{display:grid; grid-template-columns:repeat(auto-fit,minmax(238px,1fr)); gap:var(--sp-3)}
+.pcell{border:1px solid var(--border); border-radius:var(--r-2); padding:var(--sp-3); background:var(--surface-2);
+  transition:border-color var(--d-morph) var(--ease), background-color var(--d-morph) var(--ease)}
+.pcell .k{font-family:var(--mono); font-size:var(--fs-1); letter-spacing:.12em; color:var(--faint); text-transform:uppercase}
+.pcell .v{font-family:var(--mono); font-size:var(--fs-2); margin-top:var(--sp-1); color:var(--text); overflow-wrap:break-word}
+.pcell.diff{border-color:var(--st-changed); background:rgba(255,209,102,.06)}
+.pcell.diff .v{color:var(--st-changed)}
+
+/* ---------- 右栏 ---------- */
+.diff .panel-bd{padding:0; overflow-x:auto}
+.sum{padding:var(--sp-4); border-bottom:1px solid var(--border); display:flex; flex-direction:column; gap:var(--sp-2)}
+.sum .row{display:flex; justify-content:space-between; gap:var(--sp-3); font-size:var(--fs-2)}
+.sum .row .k{color:var(--muted); flex:1 1 auto; min-width:0}
+.sum .row .v{font-family:var(--mono); color:var(--text); text-align:right; flex:0 1 auto; min-width:0}
+table.dt{font-size:var(--fs-2); table-layout:fixed; min-width:412px; border-collapse:collapse; width:100%}
+table.dt col.k1{width:24%} table.dt col.k2{width:18%} table.dt col.k3{width:18%}
+table.dt col.k4{width:18%} table.dt col.k5{width:22%}
+table.dt caption{text-align:left; padding:var(--sp-4) var(--sp-4) var(--sp-2); color:var(--faint);
+  font-family:var(--mono); font-size:var(--fs-1); letter-spacing:.14em}
+table.dt th,table.dt td{padding:6px var(--sp-2); text-align:right; border-bottom:1px solid var(--border); overflow-wrap:break-word}
+table.dt th:first-child,table.dt td:first-child{text-align:left}
+table.dt thead th{font-family:var(--mono); font-size:var(--fs-1); letter-spacing:.1em;
+  color:var(--faint); font-weight:400; border-bottom:1px solid var(--border-2)}
+table.dt td.n,table.dt td.r{font-family:var(--mono); white-space:nowrap}
+table.dt tr.r-changed td.r{color:var(--st-changed)} table.dt tr.r-changed{border-left:3px solid var(--st-changed)}
+table.dt tr.r-struct td.r{color:var(--st-struct)}   table.dt tr.r-struct{border-left:3px solid var(--st-struct)}
+table.dt tr.r-absent td.r{color:var(--st-absent)}   table.dt tr.r-absent{border-left:3px solid var(--st-absent)}
+table.dt tr.r-new td.r{color:var(--st-new)}         table.dt tr.r-new{border-left:3px solid var(--st-new)}
+table.dt tr.r-frozen td.r{color:var(--st-frozen)}   table.dt tr.r-frozen{border-left:3px solid var(--st-frozen)}
+table.dt tfoot td{border-bottom:0; border-top:1px solid var(--border-2); font-family:var(--mono); color:var(--text)}
+.note{margin:var(--sp-4); padding:var(--sp-3); border-radius:var(--r-2); border:1px solid var(--border-2);
+  border-left:3px solid var(--st-struct); background:rgba(92,184,240,.07); color:var(--text-2); font-size:var(--fs-2)}
+.note b{color:var(--st-struct)}
+.note.warn{border-left-color:var(--st-changed); background:rgba(255,209,102,.06)}
+.note.warn b{color:var(--st-changed)}
+.note code{font-family:var(--mono); color:var(--text)}
+
+.legend{display:flex; flex-wrap:wrap; gap:var(--sp-2) var(--sp-4); align-items:center; margin-top:var(--sp-4);
+  padding:var(--sp-3) var(--sp-4); border:1px solid var(--border); border-radius:var(--r-3); background:var(--surface-2)}
+.legend .it{display:inline-flex; align-items:center; gap:var(--sp-2); font-size:var(--fs-2); color:var(--text-2)}
+.legend .sw{width:12px;height:12px;border-radius:2px;flex:none}
+.legend .gl{font-family:var(--mono); font-size:11px; padding:1px 5px; border-radius:999px;
+  border:1px solid var(--border-2); color:var(--text-2)}
+footer{margin-top:var(--sp-6); padding-top:var(--sp-4); border-top:1px solid var(--border);
+  color:var(--faint); font-size:var(--fs-2)}
+footer code{font-family:var(--mono); color:var(--text-2)}
+footer b{color:var(--text-2)}
+.kbd-hint{font-family:var(--mono); font-size:var(--fs-1); color:var(--faint); letter-spacing:.06em}
+
+@media (prefers-reduced-motion: no-preference){
+  .reveal{opacity:0; transform:translateY(14px); animation:rise 560ms var(--ease) forwards}
+  .reveal:nth-child(1){animation-delay:0ms}
+  .reveal:nth-child(2){animation-delay:70ms}
+  .reveal:nth-child(3){animation-delay:140ms}
+  @keyframes rise{to{opacity:1; transform:none}}
+}
+@media (prefers-reduced-motion: reduce){
+  *{animation:none!important; transition:none!important}
+}
+
+@media (max-width:1560px){ .work{grid-template-columns:200px minmax(0,1fr) 430px} }
+/* 断点定在 1400 而非 1320：实测 1321–1399 区间三栏会把图压到 ~580px
+   （框内字号有效值掉到 11.2px）。低于 1400 直接单栏，让图拿到满宽。 */
+@media (max-width:1400px){
+  .work{grid-template-columns:1fr}
+  .rail{position:static}
+  .rail .panel-bd{display:block}
+  .rail .panel-bd .mbtn{width:calc(50% - 3px); display:inline-flex; vertical-align:top}
+  .rail .panel-bd .grp{display:block}
+}
+@media (max-width:768px){
+  .wrap{padding:var(--sp-4) var(--sp-3) var(--sp-6)}
+  .top{flex-direction:column; align-items:stretch}
+  /* ⚠ 一旦 .top 变纵向，.brand 的 flex-basis:520px 会被当成**高度**解析，撑出大片空白
+     —— 必须在这里把 basis 归零 */
+  .brand{flex:0 0 auto}
+  .baseline-pick{flex:0 0 auto}
+  h1{font-size:var(--fs-4)}
+  .totals{gap:var(--sp-4)}
+  .rail .panel-bd{max-height:44vh; overflow-y:auto}
+  .rail .panel-bd .mbtn{width:100%}
+  .seg button{padding:0 var(--sp-3); font-size:var(--fs-1)}
+  /* 窄屏：若让 SVG 等比缩到 350px，框内 13.5px 字会缩成约 6.8px 完全不可读。
+     改为给图一个最小宽度、容器内横向滚动 —— 保住可读性优先于不出横向滚动条。 */
+  .diagram{overflow-x:auto; padding-left:var(--sp-2); padding-right:var(--sp-2)}
+  .diagram svg{min-width:600px; max-width:none}
+  .diagram .cap{min-width:0}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="top reveal">
+    <div class="brand">
+      <div class="eyebrow">garbage265 · protocol v2 · stacked architecture</div>
+      <h1>层叠架构图与消融参数差分台 <span class="thin" id="h1sub">／ 252 类单头</span></h1>
+      <p class="sub">
+        左侧点一个配置，中间那张<b>方块堆叠图会就地变形</b>——不是切换页面：每一层的方框按
+        「有 / 无 / 参数变了 / 只是结构变了 / 被冻结」<b>换色并逐层依次亮起</b>，同时有一道扫描光带自上而下走过。
+        每块方框里标出层名、输出张量与参数量；下方保留完整文字明细，最右侧是与基准的逐模块参数对照。
+      </p>
+    </div>
+    <div class="baseline-pick">
+      <label for="baseline">基准配置（差分对照）</label>
+      <select id="baseline" aria-describedby="baseline-help"></select>
+      <span id="baseline-help" class="visually-hidden">选择后，架构图与右侧差分表都会以该配置为参照。</span>
+    </div>
+  </header>
+
+  <div class="work">
+    <aside class="panel rail reveal" aria-label="配置选择">
+      <div class="panel-hd"><span>配置</span><span id="model-count"></span></div>
+      <div class="panel-bd" id="model-list" role="group" aria-label="队列中的模型配置"></div>
+    </aside>
+
+    <section class="panel stage reveal" aria-label="架构图与协议">
+      <div class="stage-hd">
+        <h2>当前：<code id="cur-name">—</code></h2>
+        <div class="totals" id="totals"></div>
+      </div>
+
+      <div class="deltabar" id="deltabar" role="status" aria-atomic="true"></div>
+
+      <div class="states" id="states" hidden>
+        <span class="lb">解冻状态</span>
+        <div class="seg" role="group" aria-label="渐进式解冻阶段">
+          <button type="button" data-state="1" aria-pressed="true">state 1 · 骨干冻结</button>
+          <button type="button" data-state="2" aria-pressed="false">state 2 · 解冻 layer4</button>
+          <button type="button" data-state="3" aria-pressed="false">state 3 · 全部解冻</button>
+        </div>
+        <span class="hint" id="state-hint">切换阶段可查看骨干冻结范围的变化</span>
+      </div>
+
+      <!-- ★ 层叠架构图（SVG + foreignObject，整体只构建一次，之后就地更新） -->
+      <div class="diagram">
+        <div id="svg-host"></div>
+        <div class="cap">
+          <span class="it">↓ 纵向 = 前向传播顺序</span>
+          <span class="it">框内 = 层名 / 张量 / 参数量 / 状态</span>
+          <span class="it">虚线分组框 = 结构分区</span>
+          <span class="it">虚线细框 = 该配置中被 <code>nn.Identity()</code> 替换</span>
+        </div>
+      </div>
+
+      <!-- 文字明细（完整保留） -->
+      <div class="detail">
+        <h3>逐层明细 <span>／ 文字说明全保留</span></h3>
+        <table class="det">
+          <caption class="visually-hidden">逐层明细：13 层的张量形状、参数量、相对基准的差异、状态与文字说明</caption>
+          <colgroup><col class="c1"><col class="c2"><col class="c3"><col class="c4"><col class="c5"><col class="c6"></colgroup>
+          <thead>
+            <tr>
+              <th scope="col">层 / 模块</th>
+              <th scope="col" class="shp">张量</th>
+              <th scope="col">参数</th>
+              <th scope="col">Δ vs 基准</th>
+              <th scope="col">状态</th>
+              <th scope="col">说明</th>
+            </tr>
+          </thead>
+          <tbody id="detbody"></tbody>
+        </table>
+      </div>
+
+      <div class="proto">
+        <h3>训练协议 <span>／ 非结构差异，随所选配置与解冻阶段变化</span></h3>
+        <div class="pgrid" id="pgrid"></div>
+      </div>
+    </section>
+
+    <aside class="panel diff reveal" aria-label="与基准的差分">
+      <div class="panel-hd"><span>差分</span><span id="diff-vs"></span></div>
+      <div class="panel-bd">
+        <div class="sum" id="sum"></div>
+        <table class="dt" id="dtable">
+          <colgroup><col class="k1"><col class="k2"><col class="k3"><col class="k4"><col class="k5"></colgroup>
+          <caption>模块级参数对照</caption>
+          <thead>
+            <tr>
+              <th scope="col">模块</th><th scope="col">基准</th><th scope="col">当前</th>
+              <th scope="col">Δ</th><th scope="col">状态</th>
+            </tr>
+          </thead>
+          <tbody id="dtbody"></tbody>
+          <tfoot id="dtfoot"></tfoot>
+        </table>
+        <div class="note warn" id="special" hidden></div>
+      </div>
+    </aside>
+  </div>
+
+  <div class="legend reveal" role="group" aria-label="状态图例">
+    <span class="it"><span class="gl">=</span><span class="sw" style="background:var(--st-same)"></span>与基准一致</span>
+    <span class="it"><span class="gl">Δ</span><span class="sw" style="background:var(--st-changed)"></span>参数量改变</span>
+    <span class="it"><span class="gl">≡</span><span class="sw" style="background:var(--st-struct)"></span>结构改变 · 参数量不变</span>
+    <span class="it"><span class="gl">∅</span><span class="sw" style="background:var(--st-absent)"></span>直通 / 该配置中不存在</span>
+    <span class="it"><span class="gl">＋</span><span class="sw" style="background:var(--st-new)"></span>本配置新增</span>
+    <span class="it"><span class="gl">❄</span><span class="sw" style="background:var(--st-frozen)"></span>被冻结（不可训练）</span>
+    <span class="it kbd-hint">数字键 1–8 切换 8 个队列配置（两个已退场项需点击）</span>
+  </div>
+
+  <footer>
+    <p>
+      架构源：<code>src_v2/ResNet.py</code>（v1 头 · <code>ResNetTransformer</code>）、
+      <code>src_v2/ResNetTransformer.py</code>（v2 头 · <code>ResNetTransformerV2</code>）、
+      <code>src_v2/SE_Block.py</code>（<code>SEBlock</code>）、
+      <code>src_v2/model_registry.py</code>（配置唯一真源）、<code>src_v2/train.py</code>（构建与协议）。
+    </p>
+    <p style="margin-top:var(--sp-2)">
+      参数量口径：骨干取 <code>children()[:-2]</code>（去掉 <code>avgpool</code> 与 <code>fc</code>），
+      骨干计 <b>22,979,904</b>；页头「总参数」= 骨干 ＋ 本项目头部，已扣除骨干原 <code>fc</code> 的 2,049,000。
+      推导值已与项目记录交叉校验：头部 18.76M ✓ · G-Full/S-NoProg 41.74M ✓ · G-NoSE/S-NoSE 33.88M ✓ · V2-Full 较 S-NoProg 多 25,088 ✓。
+    </p>
+    <p style="margin-top:var(--sp-2)">
+      ⚠ 底层陷阱（本图侥幸正确）：<code>SE_Block.SEBlock(regions=None)</code> 的<b>默认值是 <code>[1,2,4]</code></b>（三尺度空间金字塔），
+      <b>不是</b>无 SE。本项目的「无 SE」完全依赖调用方 <code>if regions else nn.Identity()</code> 这一守卫。
+      一旦该守卫被改动，<code>S-NoSE</code> 会<b>静默</b>变成三尺度 SE 并改变参数量。
+    </p>
+  </footer>
+</div>
+
+<script>
+/* =====================================================================
+   1. 常量：参数量公式（公式即注释，便于逐项复核）
+   ===================================================================== */
+/* ⚠️ N_CLS = 合并类数，口径 = 265 原始子类 − Σ(|组|−1)，唯一真源是
+   src_v2/__init__.py 的 merged_dict。改 merged_dict 后**必须同步本常量**：
+     2026-09-26 之前：7 组 18 子类 → 265 − 11 = 254
+     2026-09-26 起  ：并入「蔬菜+菜根菜叶→菜叶」「插头电线+充电线→插头充电线」
+     （组名取「插头充电线」而非「充电器」，避免与既有类别「充电头」(id 68) 语义重叠）
+                     共 9 组 22 子类 → 265 − 13 = 252
+   分类头参数量随之由 130,302 变为 129,276（−1,026）。 */
+const D = 512, C_IN = 2048, N_CLS = 252, N_PATCH = 49;
+
+const P = {
+  backbone : 22979904,                 /* resnext50_32x4d 全量 25,028,904 − fc(2048×1000+1000) */
+  projection: C_IN * D + D,            /* 1,049,088 */
+  posEmbed : N_PATCH * D,              /* 25,088，仅 v2 */
+  tfLayer  : 3152384,                  /* MHA 1,050,624 + FFN 2,099,712 + 2×LN 2,048 */
+  classifier: D * N_CLS + N_CLS,       /* 512×252+252 = 129,276（N_CLS=254 时为 130,302） */
+  disent   : (D * (D / 2) + D / 2) + (2 * (D / 2)) + ((D / 2) * D + D),  /* 263,424 */
+  se : { none: 0, std: C_IN * 128 + 128 * C_IN, multi: (C_IN * 5) * 640 + 640 * C_IN }
+};
+
+/* 骨干各阶段输出（ResNeXt-50 @224 输入；仅用于图上标注形状） */
+const BACKBONE_STAGES = [
+  ['conv1  7×7, s2, 64',      '[B, 64, 112, 112]'],
+  ['maxpool  3×3, s2',        '[B, 64, 56, 56]'],
+  ['layer1  ×3 bottleneck',   '[B, 256, 56, 56]'],
+  ['layer2  ×4 bottleneck',   '[B, 512, 28, 28]'],
+  ['layer3  ×6 bottleneck',   '[B, 1024, 14, 14]'],
+  ['layer4  ×3 bottleneck',   '[B, 2048, 7, 7]']
+];
+
+/* =====================================================================
+   2. 配置表（逐字段与 src_v2/model_registry.py + run_queue.py QUEUE 对齐）
+   ===================================================================== */
+const MODELS = {
+  'S-NoProg': {queue:true,  block:'块1 · SE 三点链', head:'v1', regions:[1,2], tf:3, dec:true, unfreeze:'none', epochs:100},
+  'S-NoSE':   {queue:true,  block:'块1 · SE 三点链', head:'v1', regions:null,  tf:3, dec:true, unfreeze:'none', epochs:100},
+  'S-StdSE':  {queue:true,  block:'块1 · SE 三点链', head:'v1', regions:[1],   tf:3, dec:true, unfreeze:'none', epochs:100},
+  'V2-Full':  {queue:true,  block:'块2 · V2 头归因', head:'v2', regions:[1,2], tf:3, dec:true, unfreeze:'none', epochs:100},
+  'V2-NoTF':  {queue:true,  block:'块2 · V2 头归因', head:'v2', regions:[1,2], tf:0, dec:true, unfreeze:'none', epochs:100},
+  'G-Full-CAWR':      {queue:true, block:'块3 · 解冻策略', head:'v1', regions:[1,2], tf:3, dec:true, unfreeze:'progressive', epochs:100},
+  'G-Full-CAWR-Long': {queue:true, block:'块4 · 训练预算', head:'v1', regions:[1,2], tf:3, dec:true, unfreeze:'progressive', epochs:160, inherit:'G-Full-CAWR'},
+  'G-V2':     {queue:true,  block:'块5 · 2×2 第四格', head:'v2', regions:[1,2], tf:3, dec:true, unfreeze:'progressive', epochs:100},
+  'G-Full':   {queue:false, block:'已退场（RLRP 时代）', head:'v1', regions:[1,2], tf:3, dec:true, unfreeze:'progressive', epochs:100, rlrp:true},
+  'G-NoSE':   {queue:false, block:'已退场（RLRP 时代）', head:'v1', regions:null,  tf:3, dec:true, unfreeze:'progressive', epochs:100, rlrp:true}
+};
+
+/* =====================================================================
+   3. 参数量计算
+   ===================================================================== */
+const seKey  = m => m.regions === null ? 'none' : (m.regions.length === 1 ? 'std' : 'multi');
+const seName = m => m.regions === null ? '无 SE（Identity 直通）'
+                  : (m.regions.length === 1 ? '标准全局 SE · regions=[1]' : '多区域 SE · regions=[1,2]');
+const tfParams  = m => m.tf > 0 ? m.tf * P.tfLayer : 0;
+const decParams = m => m.dec ? P.disent : 0;
+const posParams = m => m.head === 'v2' ? P.posEmbed : 0;
+const headTotal = m => P.projection + posParams(m) + tfParams(m) + decParams(m) + P.classifier + P.se[seKey(m)];
+const grandTotal = m => P.backbone + headTotal(m);
+
+/* =====================================================================
+   4. 层定义 —— 顺序即前向顺序；shape()/dt() 随配置变化
+   ===================================================================== */
+const LAYERS = [
+  {id:'input', name:'输入图像', code:'',
+   shape:()=> '[B, 3, 224, 224]', params:()=>0,
+   dt:()=> 'Resize((256, 256)) → RandomResizedCrop(224, scale=(0.5,1.0)) → AutoAugment(IMAGENET) → ToTensor → Normalize → RandomErasing(p=0.5)'},
+
+  {id:'backbone', name:'ResNeXt-50 32×4d 骨干', code:'pretrained, children()[:-2]',
+   shape:()=> '[B, 2048, 7, 7]', params:()=>P.backbone,
+   dt:()=> '取 children()[:-2]，去掉原 avgpool 与 fc。骨干是预训练权重、本项目未新建参数，但**已计入**页头「总参数」（计 22,979,904）；总参数口径为骨干 + 本项目头部，并已扣除骨干原 fc 的 2,049,000。'},
+
+  {id:'se', name:m => m.regions === null ? '无 SE（直通）' : (m.regions.length === 1 ? '标准全局 SE' : '多区域 SE'),
+   /* ⚠ name/code 必须同时随 regions 变：否则 S-NoSE 会出现「无 SE（直通）」的名字
+      却挂着 SEBlock(...) 的代码名，展示一个并不存在的模块（一致性审查已指出） */
+   code:m => m.regions ? 'SEBlock(2048, reduction=16)' : 'nn.Identity()',
+   shape:()=> '[B, 2048, 7, 7]', params:m=>P.se[seKey(m)],
+   dt:m=> 'SEBlock(in=2048, reduction=16, regions=' + JSON.stringify(m.regions) + ')　·　' +
+          (m.regions === null ? 'regions=None → nn.Identity()，张量原样通过'
+           : (m.regions.length === 1
+              ? 'num_regions=1；fc1(2048→128)+fc2(128→2048)，bias=False'
+              : 'num_regions=1+4=5；total_features=2048×5=10240；mid=max(10240//16,128)=640'))},
+
+  {id:'tokenize', name:'池化 / 分词', code:m => m.head === 'v1' ? 'AdaptiveAvgPool2d(1) → flatten' : 'flatten(2) → 49 tokens',
+   shape:m=> m.head === 'v1' ? '[B, 2048, 1, 1] → [B, 2048]' : '[B, 49, 2048]',
+   params:()=>0, headDep:true,
+   dt:m=> m.head === 'v1'
+     ? 'AdaptiveAvgPool2d((1,1)) → flatten(1)：把 7×7 压成单个 2048 维向量 —— 这是 v1 头 seq_len=1 的根源'
+     : 'flatten(2).transpose(1,2)：保留 7×7=49 个空间位置，每个位置 2048 维 ⇒ 49 个 patch token'},
+
+  {id:'proj', name:'投影', code:'Linear(2048 → 512)',
+   shape:m=> m.head === 'v1' ? '[B, 1, 512]' : '[B, 49, 512]',
+   params:()=>P.projection,
+   dt:()=> '把每个 token 投影到 d_model=512。v1 得到长度 1 的序列，v2 得到长度 49 的序列。'},
+
+  {id:'pos', name:m => m.head === 'v2' ? '可学习位置编码' : '位置编码（v1 无此层）',
+   /* ⚠ 源码对照：ResNet.py 的 v1 头**完全没有** pos_embed（构造器无此属性、forward 无相加）。
+      因此 name 与 code 都必须随 head 变，否则 v1 下会显示一个不存在的参数名 —— 这是实质对立。 */
+   code:m => m.head === 'v2' ? 'pos_embed (1, 49, 512)' : '—',
+   shape:m=> m.head === 'v2' ? '[B, 49, 512]' : '—',
+   params:m=>posParams(m),
+   dt:m=> m.head === 'v2'
+     ? 'nn.Parameter(randn(1,49,512)×0.02)，1D learned（ViT-B 做法）。这也是 V2-Full 相对 S-NoProg 唯一多出的参数来源（+25,088）。'
+     : 'v1 头没有位置编码：序列长度为 1，既不需要也无法定义。'},
+
+  {id:'drop1', name:'patch-embedding Dropout', code:'',
+   shape:()=> '—', params:()=>0, headDep:true,
+   dt:m=> m.head === 'v1' ? 'Dropout(0.5)：作用在长度为 1 的序列上' : 'Dropout(0.1)：ViT 标准值，作用在 49 个 token 上（v1 的 0.5 偏高）'},
+
+  {id:'tf', name:'Transformer 编码器', code:'',
+   shape:m=> m.tf > 0 ? (m.head === 'v1' ? '[1, B, 512] → [1, B, 512]' : '[49, B, 512] → [49, B, 512]') : '—',
+   params:m=>tfParams(m),
+   dt:m=>{
+     if (m.tf === 0) return 'transformer_layers=0 → nn.Identity()，完全直通。V2-NoTF 与 V2-Full 的全部差异就在这一行；注意位置编码与 49-token 分词仍然保留，并未退回 v1 的 avgpool 路径。';
+     const c = 'layers=' + m.tf + ' · d_model=512 · nhead=8 · dim_feedforward=4×512=2048 · dropout=0.3';
+     return m.head === 'v1'
+       ? 'nn.TransformerEncoder(' + c + ')：post-LN、ReLU FFN、无随机深度。序列长度 1 ⇒ 自注意力退化为恒等，等价于"MLP+残差+LN"堆栈。'
+       : 'TransformerEncoderStack(' + c + ')：pre-LN、GELU FFN、两支残差各带 DropPath(0.1)。49 个 token 之间是真自注意力。';
+   }},
+
+  {id:'readout', name:'读出', code:'mean-pool',
+   shape:()=> '[B, 512]', params:()=>0, headDep:true,
+   dt:m=> m.head === 'v1'
+     ? 'transformer_output.mean(dim=0)：序列长度为 1，等价于恒等取回'
+     : 'x.mean(dim=1)：对 49 个 patch token 做平均池化（use_cls_token=False，未启用 [CLS] token）'},
+
+  {id:'drop2', name:'Dropout', code:'0.5',
+   shape:()=> '—', params:()=>0,
+   dt:()=> '全局特征上的 Dropout(0.5)，v1 与 v2 取值相同，各配置一致。'},
+
+  {id:'disent', name:'简化解耦层', code:'512 → 256 → 512',
+   shape:()=> '[B, 512]', params:m=>decParams(m),
+   dt:m=> m.dec
+     ? 'Linear(512→256) → BatchNorm1d(256) → GELU → Dropout(0.5) → Linear(256→512)'
+     : 'use_decouple=False → nn.Identity() 直通（消融 G-PureBB 用；当前全部 10 个配置——8 队列 + 2 退场——均为 True，故此分支恒不触发）'},
+
+  {id:'cls', name:'父类分类头', code:'Linear(512 → ' + N_CLS + ')',
+   shape:()=> '[B, ' + N_CLS + ']', params:()=>P.classifier,
+   dt:()=> '单头 ' + N_CLS + ' 个合并类输出（265 原始子类经 merged_dict 合并，现为 9 组 22 子类 → 252）。子类头在代码中已整体注释，训练用 alpha=1.0 / beta=0.0，child_loss 恒为 0，不参与训练。（验证函数另有 alpha=0.5 / beta=0.5，仅用于上报 val_loss，不影响训练。）'},
+
+  {id:'out', name:'输出', code:'argmax → ' + N_CLS + ' 类',
+   shape:()=> String(N_CLS), params:()=>0,
+   dt:()=> '论文口径的父类（合并类）预测结果。'}
+];
+
+const ST = {
+  same:    {glyph:'=',  label:'一致',     color:'var(--st-same)'},
+  changed: {glyph:'Δ',  label:'参数变化', color:'var(--st-changed)'},
+  struct:  {glyph:'≡',  label:'结构变化', color:'var(--st-struct)'},
+  absent:  {glyph:'∅',  label:'直通',     color:'var(--st-absent)'},
+  new:     {glyph:'＋', label:'新增',     color:'var(--st-new)'},
+  frozen:  {glyph:'❄',  label:'冻结',     color:'var(--st-frozen)'}
+};
+
+/* =====================================================================
+   5. 布局 —— **常量**。全部层框位置固定 ⇒ 无重排、无错位、可动画。
+   ===================================================================== */
+const SVG_W  = 700;
+const COL_X  = 30,  COL_W = 560;              /* 方框：30 … 590 */
+const FBX    = 14,  FBW = 588;                /* 分组虚线框：14 … 602 */
+const CX     = COL_X + COL_W / 2;             /* 箭头所在中轴 = 310 */
+
+/* 每层固定高度 */
+const HGT = {
+  input:54, backbone:188, se:54, tokenize:54, proj:54, pos:54,
+  drop1:54, tf:106, readout:54, drop2:54, disent:54, cls:54, out:54
+};
+/* 每层与其下一层之间的固定间距（字段名 = 上一层的 id） */
+const GAP = {
+  input:36, backbone:22, se:46, tokenize:22, proj:22, pos:22,
+  drop1:22, tf:46, readout:22, drop2:22, disent:22, cls:30
+};
+/* 结构分区（虚线分组框），from/to 为层 id */
+const GROUPS = [
+  {label:'骨干区 Backbone',        from:'backbone', to:'se',    pad:22},
+  {label:'注意力头 Attention Head', from:'tokenize', to:'tf',    pad:22},
+  {label:'分类头 Classifier Head',  from:'readout',  to:'cls',   pad:22}
+];
+/* 右侧「重复次数」括号所依附的层（原先多带一个从未被读取的 mx 字段，已删） */
+const BRACKET_ID = 'tf';
+
+const LAY = (function(){
+  const pos = {}; let y = 16;
+  LAYERS.forEach((L, i) => {
+    if (i > 0) y += GAP[LAYERS[i-1].id];
+    pos[L.id] = {y, h:HGT[L.id]};
+    y += HGT[L.id];
+  });
+  const H = y + 18;
+  const groups = GROUPS.map(g => {
+    const top = pos[g.from].y - g.pad;
+    const bot = pos[g.to].y + pos[g.to].h + 12;
+    return {label:g.label, y:top, h:bot - top};
+  });
+  return {pos, H, groups};
+})();
+
+/* =====================================================================
+   6. 状态判定 —— 一律「相对基准」，两边同为缺失 → 一致
+   ===================================================================== */
+function statusOf(id, m, b){
+  if (id === 'backbone'){
+    if (m.unfreeze === 'progressive' && state.stage < 3) return 'frozen';
+    return m.unfreeze !== b.unfreeze ? 'struct' : 'same';
+  }
+  if (id === 'se'){
+    const a = seKey(m), c = seKey(b);
+    if (a === 'none' && c === 'none') return 'same';
+    if (a === 'none') return 'absent';
+    if (c === 'none') return 'new';
+    return a === c ? 'same' : 'changed';
+  }
+  if (id === 'pos'){
+    const a = posParams(m), c = posParams(b);
+    if (a === 0 && c === 0) return 'same';
+    if (a === 0) return 'absent';
+    if (c === 0) return 'new';
+    return 'same';
+  }
+  if (id === 'tf'){
+    const a = tfParams(m), c = tfParams(b);
+    if (a === 0 && c === 0) return 'same';
+    if (a === 0) return 'absent';
+    if (c === 0) return 'new';
+    if (a !== c) return 'changed';
+    return m.head === b.head ? 'same' : 'struct';
+  }
+  if (id === 'disent'){
+    const a = decParams(m), c = decParams(b);
+    if (a === 0 && c === 0) return 'same';
+    if (a === 0) return 'absent';
+    if (c === 0) return 'new';
+    return 'same';
+  }
+  const L = LAYERS.find(x => x.id === id);
+  if (L && L.headDep) return m.head === b.head ? 'same' : 'struct';
+  return 'same';
+}
+
+/* 该模块在**本配置里是否存在**（绝对判定，与基准无关） */
+function presentOf(id, m){
+  if (id === 'se')     return seKey(m) !== 'none';
+  if (id === 'pos')    return posParams(m) > 0;
+  if (id === 'tf')     return tfParams(m) > 0;
+  if (id === 'disent') return decParams(m) > 0;
+  return true;
+}
+
+/* ★ 外观状态 ≠ 差异状态，两者必须分开：
+   - statusOf() 是「相对基准」的差异 → 决定是否进"变化摘要"（两边同为缺失就不算差异）；
+   - visOf()   是「本配置里有没有」→ 决定方框长相与配色。
+   否则 v1 头下的「位置编码」（当前与基准都没有）会被画成实心「= 一致」块，
+   看起来像"存在且无变化"，与用户要求的「有/无该模块就改颜色」相悖。 */
+function visOf(id, m, b){
+  const st = statusOf(id, m, b);
+  if (st === 'same' && !presentOf(id, m)) return 'absent';
+  return st;
+}
+
+/* 「两边都没有」：当前与基准**都不存在**该模块。它不是差异，Δ 必须记 '—' 而不是 '±0'，
+   否则「∅ 直通」与「±0」并置会让读者以为"这里有个 0 参数的模块"。 */
+const bothAbsent = (id, m, b) => !presentOf(id, m) && !presentOf(id, b);
+
+/* 状态列文本：把"两边均无"与"真的直通（基准有、当前没有）"区分开 */
+function statusText(id, m, b){
+  const st = visOf(id, m, b);
+  if (bothAbsent(id, m, b)) return '∅ 两边均无';
+  return ST[st].glyph + ' ' + ST[st].label;
+}
+/* Δ 列文本：两边均无 → '—' */
+const deltaText = (id, m, b, d) => bothAbsent(id, m, b) ? '—' : (d === 0 ? '±0' : signed(d));
+
+/* =====================================================================
+   7. 工具
+   ===================================================================== */
+const fmt    = n => n.toLocaleString('en-US');
+const signed = n => (n > 0 ? '+' : n < 0 ? '−' : '±') + fmt(Math.abs(n));
+const esc    = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+const nm     = (L, m) => typeof L.name === 'function' ? L.name(m) : L.name;
+const cd     = (L, m) => !L.code ? '' : (typeof L.code === 'function' ? L.code(m) : L.code);
+
+const state = { current:'S-NoProg', baseline:'S-NoProg', stage:1 };
+const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+/* =====================================================================
+   8. ★ 架构图 —— 只构建一次，之后就地更新（动画的来源）
+   ===================================================================== */
+const blkRefs = {};          /* id → {g, cb, ix, nme, pp, cde, st, extra} */
+let svgRoot = null, scanWrap = null, connsGrp = null, svgH = LAY.H;
+
+function blockInnerHTML(L, i){
+  return '<i class="cb-bar"></i>' +
+    '<div class="cb-r1">' +
+      '<span class="cb-ix">' + String(i+1).padStart(2,'0') + '</span>' +
+      '<span class="cb-nm"></span><span class="cb-pp"></span>' +
+    '</div>' +
+    '<div class="cb-r2"><span class="cb-shp"></span><span class="cb-cde"></span>' +
+      '<span class="cb-st"></span></div>' +
+    '<div class="cb-extra"></div>';
+}
+
+function buildDiagramDOM(){
+  const P0 = LAY.pos;
+  /* 分组虚线框（画在最底层） */
+  let groups = LAY.groups.map(g =>
+    `<rect class="grpbox" x="${FBX}" y="${g.y}" width="${FBW}" height="${g.h}" rx="16"/>` +
+    `<text class="grpcap" x="${FBX + 16}" y="${g.y + 20}">${esc(g.label)}</text>`
+  ).join('');
+
+  /* 连接箭头（位置固定） */
+  const b = LAYERS[LAYERS.length - 1].id;
+  let conns = '';
+  for (let i = 1; i < LAYERS.length; i++){
+    const a = LAYERS[i-1].id, c = LAYERS[i].id;
+    const y1 = P0[a].y + P0[a].h + 3, y2 = P0[c].y - 2;
+    conns += `<line x1="${CX}" y1="${y1}" x2="${CX}" y2="${y2}"/>`;
+  }
+
+  /* 右侧「×N」括号 */
+  const bp = P0[BRACKET_ID], by1 = bp.y + 18, by2 = bp.y + bp.h - 18, bx = FBX + FBW + 10;
+  const brk = `<path class="brk" d="M ${bx} ${by1} h 10 v ${by2-by1} h -10"/>` +
+              `<text class="brktx" id="brktx" x="${bx + 18}" y="${(by1+by2)/2 + 4}"></text>`;
+
+  /* 13 个层框（foreignObject 内是 HTML，流式布局 ⇒ 不可能溢出） */
+  const blocks = LAYERS.map((L, i) => {
+    const p = P0[L.id];
+    return `<g class="blk" data-id="${L.id}" data-st="same">` +
+      `<foreignObject x="${COL_X}" y="${p.y}" width="${COL_W}" height="${p.h}">` +
+        `<div xmlns="http://www.w3.org/1999/xhtml" class="cb" data-fo="${COL_W}x${p.h}">` +
+          blockInnerHTML(L, i) +
+        `</div>` +
+      `</foreignObject></g>`;
+  }).join('');
+
+  const html =
+  `<svg id="arch-svg" viewBox="0 0 ${SVG_W} ${LAY.H}" role="img"
+     aria-label="层叠架构图：13 层张量流，按所选配置相对基准的差异换色">
+    <defs>
+      <marker id="ah" markerWidth="7" markerHeight="7" refX="5.6" refY="3.5" orient="auto">
+        <path d="M 0 0 L 7 3.5 L 0 7 z" fill="rgba(148,163,184,.62)"/>
+      </marker>
+      <linearGradient id="scanGrad" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%"   stop-color="rgba(240,160,32,0)"/>
+        <stop offset="45%"  stop-color="rgba(240,160,32,.16)"/>
+        <stop offset="55%"  stop-color="rgba(240,160,32,.16)"/>
+        <stop offset="100%" stop-color="rgba(240,160,32,0)"/>
+      </linearGradient>
+    </defs>
+    ${groups}
+    <g class="conns" id="conns">${conns}</g>
+    ${brk}
+    ${blocks}
+    <g class="scan" id="scan"><rect x="${FBX}" y="0" width="${FBW}" height="180" fill="url(#scanGrad)"/></g>
+  </svg>`;
+
+  const host = document.getElementById('svg-host');
+  host.innerHTML = html;
+
+  /* 箭头统一挂 marker */
+  svgRoot = document.getElementById('arch-svg');
+  connsGrp = document.getElementById('conns');
+  connsGrp.querySelectorAll('line').forEach(l => l.setAttribute('marker-end', 'url(#ah)'));
+  scanWrap = document.getElementById('scan');
+  scanWrap.style.setProperty('--scan-to', LAY.H + 'px');
+
+  /* 缓存元素引用 */
+  LAYERS.forEach(L => {
+    const g = svgRoot.querySelector('.blk[data-id="' + L.id + '"]');
+    blkRefs[L.id] = {
+      g, cb: g.querySelector('.cb'), ix: g.querySelector('.cb-ix'),
+      nme: g.querySelector('.cb-nm'), pp: g.querySelector('.cb-pp'),
+      shp: g.querySelector('.cb-shp'),
+      cde: g.querySelector('.cb-cde'), st: g.querySelector('.cb-st'),
+      extra: g.querySelector('.cb-extra')
+    };
+    /* 动画结束后清掉 .tick —— 否则残留类只增不减，无法用 .tick 判断「本次是否在动」。
+       只认 .cb 自身的 animationend，忽略 setTxt 触发的子元素 swapped 动画。 */
+    blkRefs[L.id].cb.addEventListener('animationend', ev => {
+      if (ev.target !== ev.currentTarget) return;
+      const gg = svgRoot.querySelector('.blk[data-id="' + L.id + '"]');
+      if (gg) gg.classList.remove('tick');
+    });
+  });
+  svgH = LAY.H;
+}
+
+/* 文本替换：内容真的变了才写，并给一个微动画 */
+function setTxt(el, s){
+  if (el.textContent === s) return;
+  el.textContent = s;
+  if (!reduceMotion){
+    el.classList.remove('swapped');
+    void el.offsetWidth;
+    el.classList.add('swapped');
+  }
+}
+
+/* 骨干子阶段 / Transformer 内部结构：内容变化时才重建 */
+function extraHTML(L, m, b){
+  const st = statusOf(L.id, m, b);
+  if (L.id === 'backbone'){
+    const fz = st === 'frozen'
+      ? (state.stage === 1 ? '　·　骨干全部冻结' : '　·　仅 layer4 已解冻')
+      : '';
+    return BACKBONE_STAGES.map(s =>
+        '<div class="cb-sub"><span class="l">' + esc(s[0]) + '</span>' +
+        '<span class="r">' + esc(s[1]) + '</span></div>').join('') +
+      '<div class="cb-note' + (st === 'frozen' ? ' fz' : '') + '">' +
+        esc('预训练权重 · 本项目未新建参数 · 仅标注各阶段输出形状' + fz) + '</div>';
+  }
+  if (L.id === 'tf'){
+    if (m.tf === 0)
+      return '<div class="cb-inner"><span class="l">' +
+        esc('× 0 层 · nn.Identity() 完全直通') + '</span></div>' +
+        '<div class="cb-note">' +
+        esc('位置编码与 49-token 分词仍保留，未退回 v1 的 avgpool 路径') + '</div>';
+    const lay = m.head === 'v1'
+      ? 'post-LN → 多头自注意力(8 heads) → ReLU FFN(2048)'
+      : 'pre-LN → 多头自注意力(8 heads) → GELU FFN(2048) · DropPath(0.1)';
+    return '<div class="cb-inner"><span class="l">' + esc('× ' + m.tf + ' 层 · ' + lay) + '</span></div>' +
+      '<div class="cb-note">' +
+        esc(m.head === 'v1'
+          ? '序列长度 = 1 ⇒ 自注意力恒等退化（V2 头要修正的正是这一点）'
+          : '49 个 token ⇒ 真自注意力，可建模空间小块之间的关系') + '</div>';
+  }
+  return '';
+}
+
+const prevSig = {};
+
+function updateDiagram(animate){
+  const m = MODELS[state.current], b = MODELS[state.baseline];
+  let changed = false;
+
+  LAYERS.forEach((L, i) => {
+    const r = blkRefs[L.id], st = visOf(L.id, m, b);
+    const name = nm(L, m), code = cd(L, m);
+    const pp = L.params(m), shp = L.shape(m);
+    /* sig 只在「该层自身呈现」变化时变。
+       ⚠ state.stage 只并入 backbone —— 否则在渐进式配置上切 stage 会让全部 13 块一起重放 pop
+       （输入图像、分类头等与冻结无关的块也动），属功能审查指出的噪声。 */
+    const sig = [st, name, code, pp, shp, L.id === 'backbone' ? state.stage : ''].join('|');
+
+    if (r.g.dataset.st !== st) r.g.dataset.st = st;
+
+    setTxt(r.nme, name);
+    setTxt(r.shp, shp);
+    setTxt(r.cde, code || '—');
+    setTxt(r.pp, pp === 0 ? '0 参数' : fmt(pp) + ' 参数');
+    setTxt(r.st, ST[st].glyph + ' ' + ST[st].label);
+    setTxt(r.ix, String(i + 1).padStart(2, '0'));
+
+    const ex = extraHTML(L, m, b);
+    if (r.extra.dataset.h !== ex){ r.extra.dataset.h = ex; r.extra.innerHTML = ex; }
+
+    if (prevSig[L.id] !== sig){
+      prevSig[L.id] = sig;
+      changed = true;
+      if (animate && !reduceMotion){
+        const cb = r.cb;
+        cb.style.animation = 'none';
+        void cb.offsetWidth;
+        cb.style.animation = '';
+        cb.style.animationDelay = (i * 30) + 'ms';
+        r.g.classList.remove('tick');
+        void r.g.getBoundingClientRect();
+        r.g.classList.add('tick');
+      }
+    }
+  });
+
+  /* 右侧 ×N 括号文字 */
+  const bt = document.getElementById('brktx');
+  if (bt) setTxt(bt, m.tf > 0 ? '× ' + m.tf : '0 层');
+
+  /* 动画：扫描光带 + 箭头流动 */
+  if (animate && !reduceMotion && changed){
+    scanWrap.classList.remove('run'); void scanWrap.getBoundingClientRect();
+    scanWrap.classList.add('run');
+    connsGrp.classList.remove('flow'); void connsGrp.getBoundingClientRect();
+    connsGrp.classList.add('flow');
+  }
+  /* role="img" 会屏蔽 foreignObject 内的文本，所以 aria-label 必须自带结论，
+     并把读者指向下方语义完整的表格（明细表已补 caption 与 th[scope=row]）。 */
+  svgRoot.setAttribute('aria-label',
+    '层叠架构图：13 层张量流，当前配置 ' + state.current + '，基准 ' + state.baseline +
+    '。总参数 ' + fmt(grandTotal(m)) + '，相对基准 ' + (grandTotal(m) - grandTotal(b) === 0
+      ? '无差异' : signed(grandTotal(m) - grandTotal(b))) +
+    '。逐层数值与说明见下方「逐层明细」表。');
+}
+
+/* =====================================================================
+   9. 各区块渲染
+   ===================================================================== */
+function renderModelList(){
+  const host = document.getElementById('model-list');
+  host.innerHTML = '';
+  const groups = [];
+  Object.entries(MODELS).forEach(([k, v]) => {
+    let g = groups.find(x => x.name === v.block);
+    if (!g){ g = {name:v.block, items:[]}; groups.push(g); }
+    g.items.push(k);
+  });
+  groups.forEach(g => {
+    const h = document.createElement('div');
+    h.className = 'grp';
+    h.textContent = g.name;
+    host.appendChild(h);
+    g.items.forEach(k => {
+      const mm = MODELS[k];
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'mbtn';
+      btn.dataset.model = k;
+      btn.setAttribute('aria-pressed', String(k === state.current));
+      if (!mm.queue) btn.dataset.retired = '1';
+      btn.innerHTML = '<span class="dot"></span><span class="nm">' + esc(k) + '</span>' +
+                      '<span class="tag">' + (grandTotal(mm) / 1e6).toFixed(3) + 'M</span>';
+      btn.addEventListener('click', () => selectModel(k));
+      host.appendChild(btn);
+    });
+  });
+  document.getElementById('model-count').textContent = Object.keys(MODELS).length + ' 个';
+}
+
+function renderBaselineOptions(){
+  const sel = document.getElementById('baseline');
+  sel.innerHTML = '';
+  Object.keys(MODELS).forEach(k => {
+    const o = document.createElement('option');
+    o.value = k;
+    o.textContent = k + '（' + (grandTotal(MODELS[k]) / 1e6).toFixed(2) + 'M）';
+    if (k === state.baseline) o.selected = true;
+    sel.appendChild(o);
+  });
+}
+
+function renderTotals(){
+  const m = MODELS[state.current], b = MODELS[state.baseline];
+  const g = grandTotal(m), gb = grandTotal(b), h = headTotal(m), d = g - gb;
+  document.getElementById('cur-name').textContent = state.current;
+  document.getElementById('totals').innerHTML =
+    '<div class="tot"><span class="k">总参数（已扣骨干原 fc）</span>' +
+      '<span class="v">' + fmt(g) + ' <span class="d">≈' + (g/1e6).toFixed(2) + 'M</span></span></div>' +
+    '<div class="tot"><span class="k">头部参数</span>' +
+      '<span class="v">' + fmt(h) + ' <span class="d">≈' + (h/1e6).toFixed(2) + 'M</span></span></div>' +
+    '<div class="tot"><span class="k">vs ' + esc(state.baseline) + '</span>' +
+      '<span class="v ' + (d === 0 ? '' : (d > 0 ? 'up' : 'down')) + '">' + (d === 0 ? '±0' : signed(d)) + '</span></div>';
+
+  const chips = [];
+  LAYERS.forEach(L => {
+    const st = statusOf(L.id, m, b);
+    if (st === 'same') return;
+    const dlt = L.params(m) - L.params(b);
+    chips.push('<span class="chip s-' + st + '"><span class="g">' + ST[st].glyph + '</span>' +
+      esc(nm(L, m)) + '：' + ST[st].label + (dlt !== 0 ? '（' + signed(dlt) + '）' : '') + '</span>');
+  });
+  if (m.unfreeze !== b.unfreeze)
+    chips.push('<span class="chip s-struct"><span class="g">≡</span>解冻策略：' +
+      (m.unfreeze === 'none' ? '全程全解冻' : '渐进式 30/60') + '</span>');
+  if (m.rlrp !== b.rlrp)
+    chips.push('<span class="chip s-struct"><span class="g">≡</span>调度器：' +
+      (m.rlrp ? 'CAWR(state1) → RLRP(state2/3)' : 'CosineAnnealingWarmRestarts 全程') + '</span>');
+
+  const isBaseline = state.current === state.baseline;
+  document.getElementById('deltabar').innerHTML = (isBaseline || !chips.length)
+    ? '<span class="chip s-same"><span class="g">=</span>与基准 ' + esc(state.baseline) + ' 完全一致（所有参数差异为 ±0）</span>'
+    : '<span style="color:var(--faint);font-family:var(--mono);font-size:11px;letter-spacing:.14em">变化摘要</span>' + chips.join('');
+}
+
+function renderDetail(){
+  const m = MODELS[state.current], b = MODELS[state.baseline];
+  document.getElementById('detbody').innerHTML = LAYERS.map((L, i) => {
+    const st = visOf(L.id, m, b);
+    const p = L.params(m), pb = L.params(b), d = p - pb;
+    return '<tr class="r-' + st + '">' +
+      '<th scope="row"><span class="num" style="color:var(--faint)">' + String(i+1).padStart(2,'0') + '</span> ' +
+        '<b>' + esc(nm(L, m)) + '</b>' + (cd(L, m) ? '<br><span class="num" style="color:var(--muted);font-size:11px">' + esc(cd(L, m)) + '</span>' : '') + '</th>' +
+      '<td class="n shp">' + esc(L.shape(m)) + '</td>' +
+      '<td class="n">' + fmt(p) + '</td>' +
+      '<td class="n">' + deltaText(L.id, m, b, d) + '</td>' +
+      '<td class="s">' + esc(statusText(L.id, m, b)) + '</td>' +
+      '<td class="dsc">' + esc(L.dt(m, b)) + '</td></tr>';
+  }).join('');
+}
+
+function renderProto(){
+  const m = MODELS[state.current], b = MODELS[state.baseline];
+  const prog = m.unfreeze === 'progressive';
+  let opt;
+  if (!prog) opt = 'AdamW 全体参数：lr=1e-4（weight_decay=1e-2）';
+  else if (state.stage === 1) opt = 'AdamW 全体可训练参数：lr=1e-4（weight_decay=5e-4）· 单一参数组';
+  else opt = 'AdamW 分组：backbone ' + (m.rlrp ? '5e-6' : '1e-4') + ' · head ' + (m.rlrp ? '5e-5' : '1e-4') + '（weight_decay=1e-2）';
+
+  const sch = m.rlrp
+    ? 'state1 CAWR → state2/3 ReduceLROnPlateau（已退场配置）'
+    : 'CosineAnnealingWarmRestarts(T_0=5, T_mult=2, eta_min=1e-6)';
+
+  /* 优化器是否"与基准不同"：比较「给定当前 stage 下」两侧的实际分支，
+     而不是恒为 true（原写法让本格在 当前==基准 时也高亮成差异） */
+  const optBranch = mm => mm.unfreeze !== 'progressive' ? 'none'
+                        : (state.stage === 1 ? 's1' : 's23-' + (mm.rlrp ? 'rlrp' : 'cawr'));
+
+  /* ⚠ 解冻跃迁副作用的文案必须区分 cawr / rlrp：
+     rlrp 退场配置在 state2 会把调度器换成 ReduceLROnPlateau、分组 lr=5e-6/5e-5，
+     所以"CAWR 的 T_0 重新起算""lr 抬回 1e-4 峰顶"对它们并不成立（一致性审查已指出）。 */
+  const jump = !prog
+    ? '不涉及（无解冻跃迁）'
+    : (m.rlrp
+        ? 'ep30 / ep60 每次跃迁都会重建 optimizer 与 scheduler；本配置 state2 起调度器改用 ReduceLROnPlateau、分组 lr=5e-6 / 5e-5，因此「CAWR 的 T_0 重新起算」不适用'
+        : 'ep30 / ep60 每次跃迁都会重建 optimizer 与 scheduler：① CAWR 的 T_0 计时在 ep30、ep60 重新起算（不是从 ep0 连续累计）；② 新 AdamW 的 lr=1e-4 会把学习率抬回余弦峰顶；③ 新 optimizer 未载入 state_dict ⇒ Adam 一阶/二阶矩归零。论文若讨论渐进式的优化轨迹，这三点必须交代');
+
+  const cells = [
+    {k:'解冻策略', v: prog ? 'progressive：ep30 → 解冻 layer4，ep60 → 全部解冻（固定 epoch，非自适应）' : 'none：ep0 起全程全解冻',
+     d: m.unfreeze !== b.unfreeze},
+    {k:'骨干冻结（当前阶段）', v: prog ? (state.stage === 1 ? '骨干全部冻结' : state.stage === 2 ? 'layer4 已解冻，其余冻结' : '无冻结（全解冻）') : '无冻结',
+     d: prog && state.stage < 3},
+    {k:'调度器', v: sch, d: !!m.rlrp !== !!b.rlrp},
+    {k:'优化器 / 学习率', v: opt, d: optBranch(m) !== optBranch(b)},
+    {k:'⚠ 解冻跃迁的副作用', v: jump, d: prog},
+    {k:'目标轮数', v: m.epochs + ' 轮', d: m.epochs !== b.epochs},
+    {k:'损失', v: 'CrossEntropyLoss(label_smoothing=0.1) · alpha=1.0 / beta=0.0 · 单头 ' + N_CLS + ' 类', d:false},
+    {k:'批次 / 采样', v: 'batch_size=64 · WeightedRandomSampler(类别逆频加权) · ' + N_CLS + ' 合并类', d:false}
+  ];
+  document.getElementById('pgrid').innerHTML = cells.map(c =>
+    '<div class="pcell' + (c.d ? ' diff' : '') + '"><div class="k">' + esc(c.k) + '</div>' +
+    '<div class="v">' + esc(c.v) + '</div></div>').join('');
+}
+
+function renderDiff(){
+  const m = MODELS[state.current], b = MODELS[state.baseline];
+  document.getElementById('diff-vs').textContent = state.current + ' − ' + state.baseline;
+  document.getElementById('dtbody').innerHTML = LAYERS.map((L, i) => {
+    const st = visOf(L.id, m, b);
+    const p = L.params(m), pb = L.params(b), d = p - pb;
+    return '<tr class="r-' + st + '"><th scope="row" style="text-align:left;font-weight:400">' +
+      (i+1) + '. ' + esc(nm(L, m)) + '</th>' +
+      '<td class="n">' + fmt(pb) + '</td><td class="n">' + fmt(p) + '</td>' +
+      '<td class="n">' + deltaText(L.id, m, b, d) + '</td>' +
+      '<td class="r">' + esc(statusText(L.id, m, b)) + '</td></tr>';
+  }).join('');
+
+  const gm = grandTotal(m), gb = grandTotal(b), dg = gm - gb;
+  document.getElementById('dtfoot').innerHTML =
+    '<tr><th scope="row" style="text-align:left">合计（含骨干）</th><td class="n">' + fmt(gb) + '</td>' +
+    '<td class="n">' + fmt(gm) + '</td><td class="n">' + (dg === 0 ? '±0' : signed(dg)) + '</td><td></td></tr>';
+
+  document.getElementById('sum').innerHTML = [
+    ['族 / 块', m.block],
+    ['头版本', m.head === 'v1' ? 'v1 · seq_len=1 退化注意力' : 'v2 · 49-token 真注意力'],
+    ['SE', seName(m)],
+    ['Transformer', m.tf > 0 ? m.tf + ' 层 · 单层 ' + fmt(P.tfLayer) : '0 层（nn.Identity 直通）'],
+    ['解耦层', m.dec ? '启用 · ' + fmt(P.disent) : '直通'],
+    ['位置编码', posParams(m) ? fmt(posParams(m)) + '（v2 新增参数）' : '无']
+  ].map(([k, v]) => '<div class="row"><span class="k">' + esc(k) + '</span><span class="v">' + esc(v) + '</span></div>').join('');
+
+  const box = document.getElementById('special');
+  let html = '';
+  if (m.inherit){
+    html += '<b>继承说明：</b>' + esc(state.current) + ' 与 ' + esc(m.inherit) +
+      ' 结构完全相同（逐模块、逐参数一致），差异只在目标轮数（' + m.epochs + ' vs ' + MODELS[m.inherit].epochs + '）。' +
+      '实际执行时由 <code>run_queue.ensure_long_resume()</code> 复制 ' + esc(m.inherit) +
+      ' 的 <code>_last.pth</code>（含 optimizer / scheduler / state）作为起点，' +
+      '因此前 100 轮的权重来自 ' + esc(m.inherit) + '，并非独立从头训练 —— 这就是它必须排在 ' +
+      esc(m.inherit) + ' 之后的原因。';
+  }
+  if (m.queue === false){
+    html += (html ? '<br><br>' : '') + '<b>已退场配置：</b>该配置不在当前协议 v2 队列中。' +
+      '保留它是为了让 RLRP 调度时代（state1 走 CAWR、state2/3 走 RLRP）的形态可见；' +
+      '它的分组学习率也应为 backbone 5e-6 / head 5e-5，与 CAWR 配置的 1e-4/1e-4 不同。';
+  }
+  /* 「两边均无」的说明必须**始终**出现（不只 current==baseline 时），
+     否则换到别的基准后，读者看到「∅ 两边均无」+「Δ = —」照样会困惑（验证审查第 12 条）。 */
+  const absBoth = LAYERS.filter(L => bothAbsent(L.id, m, b)).map(L => nm(L, m));
+  if (absBoth.length){
+    html += (html ? '<br><br>' : '') + '<b>「∅ 两边均无」说明：</b>' + esc(absBoth.join('、')) +
+      ' 在当前配置与基准中<b>都不存在</b>（被 <code>nn.Identity()</code> 替换），因此<b>不是差异</b>：' +
+      'Δ 列记 <code>—</code>，也不进上方「变化摘要」。图中该行仍画成虚线框，' +
+      '是为了让"这一层在本配置里没有参与前向"这件事本身可见。';
+  }
+  if (state.current === state.baseline){
+    html += (html ? '<br><br>' : '') + '<b>当前即为基准：</b>所有参数差异为 ±0。' +
+      '若图中出现 <b>❄ 冻结</b>，那是<b>解冻阶段</b>的状态，只影响可训练性、不改变参数量，同样不与「差异为 ±0」冲突。' +
+      '请在右上角换基准，或点左侧其它配置。';
+  }
+  box.innerHTML = html;
+  box.hidden = !html;
+}
+
+/* =====================================================================
+   10. 主渲染
+   ===================================================================== */
+function renderAll(animate){
+  updateDiagram(animate === true);
+  renderDetail();
+  renderTotals();
+  renderProto();
+  renderDiff();
+}
+
+/* =====================================================================
+   11. 交互
+   ===================================================================== */
+function selectModel(key){
+  state.current = key;
+  document.querySelectorAll('.mbtn').forEach(btn =>
+    btn.setAttribute('aria-pressed', String(btn.dataset.model === key)));
+  const prog = MODELS[key].unfreeze === 'progressive';
+  document.getElementById('states').hidden = !prog;
+  if (!prog) state.stage = 1;
+  syncStage();
+  renderAll(true);
+}
+
+function syncStage(){
+  document.querySelectorAll('.seg button').forEach(b =>
+    b.setAttribute('aria-pressed', String(Number(b.dataset.state) === state.stage)));
+}
+
+document.getElementById('baseline').addEventListener('change', e => {
+  state.baseline = e.target.value;
+  renderAll(true);
+});
+
+document.querySelectorAll('.seg button').forEach(b => {
+  b.addEventListener('click', () => {
+    state.stage = Number(b.dataset.state);
+    syncStage();
+    renderAll(true);
+  });
+});
+
+/* 数字键 1–8：仅在非表单控件聚焦、且无修饰键时生效；焦点跟随到新按钮。
+   守卫**不含 button** —— 否则焦点跟随把焦点放到 .mbtn 后，下一次按键会被自己挡住。 */
+document.addEventListener('keydown', e => {
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  if (e.target.closest && e.target.closest('input,select,textarea,[contenteditable]')) return;
+  /* ① 焦点在「阶段按钮」上时，1–3 用于**切阶段**（兑现键盘可达性），不切模型。
+     注意：不能简单 return —— 那样阶段键就变成纯 no-op，注释与实现不符（验证审查已指出）。 */
+  const segBtn = e.target.closest && e.target.closest('.seg button');
+  if (segBtn && MODELS[state.current].unfreeze === 'progressive' && /^[1-3]$/.test(e.key)){
+    state.stage = Number(e.key);
+    syncStage();
+    renderAll(true);
+    return;
+  }
+  /* ② 焦点在其它非 .mbtn 按钮上 → 一律不响应（避免劫持该按钮自身的键） */
+  if (e.target.closest && e.target.closest('button:not(.mbtn)')) return;
+  const idx = parseInt(e.key, 10);
+  const keys = Object.keys(MODELS).slice(0, 8);
+  if (!(idx >= 1 && idx <= keys.length)) return;
+  selectModel(keys[idx - 1]);
+  const btn = document.querySelector('.mbtn[data-model="' + keys[idx - 1] + '"]');
+  if (btn) btn.focus();
+});
+
+/* =====================================================================
+   12. 自检：溢出 / 叠字检测（供无头浏览器断言，也可在控制台手跑）
+   ===================================================================== */
+window.__qa = function(){
+  const of = [], ell = [];
+  document.querySelectorAll('.cb').forEach(cb => {
+    const id = cb.closest('.blk').dataset.id;
+    const fo = cb.dataset.fo ? cb.dataset.fo.split('x').map(Number) : null;
+    /* 1) 内容是否超出可绘制区（scroll > client，排除边框 4px 的口径差） */
+    if (cb.scrollWidth  > cb.clientWidth  + 1) of.push('w:' + id + ' ' + cb.scrollWidth + '>' + cb.clientWidth);
+    if (cb.scrollHeight > cb.clientHeight + 1) of.push('h:' + id + ' ' + cb.scrollHeight + '>' + cb.clientHeight);
+    /* 2) 方框实际外框是否与 foreignObject 声明尺寸一致（offset 含边框，故应与声明相等） */
+    if (fo && (cb.offsetWidth !== fo[0] || cb.offsetHeight !== fo[1]))
+      of.push('fo:' + id + ' ' + cb.offsetWidth + 'x' + cb.offsetHeight + ' != ' + fo.join('x'));
+    /* 3) 纵向余量（越小越危险） */
+    cb.querySelectorAll('.cb-nm,.cb-shp,.cb-cde,.cb-pp,.cb-st,.cb-sub .l,.cb-sub .r,.cb-inner .l,.cb-note')
+      .forEach(el => { if (el.scrollWidth > el.clientWidth + 1) ell.push(id + ':' + el.className + '=' + el.textContent.trim().slice(0,22)); });
+  });
+  const svg = document.getElementById('arch-svg');
+  return JSON.stringify({
+    overflow: of, ellipsis: ell, H: svgH,
+    svgW: svg ? svg.getBoundingClientRect().width : -1,
+    /* 合并类口径自检：ncls 必须与 src_v2/__init__.py 的 merged_dict 一致，
+       clsParams 应等于 512×N_CLS+N_CLS（252 → 129,276） */
+    ncls: N_CLS, clsParams: P.classifier
+  });
+};
+window.__probe = function(){ return String(document.querySelectorAll('.blk.tick').length); };
+
+/* =====================================================================
+   13. 启动
+   ===================================================================== */
+buildDiagramDOM();
+renderModelList();
+renderBaselineOptions();
+renderAll(false);
+/* 标题里的合并类数接到 N_CLS（单一真源）：改 N_CLS 后标题自动跟随，
+   避免出现「图上 252 类、标题写 254 类」这类不一致。 */
+(function(){ const s = document.getElementById('h1sub'); if (s) s.textContent = '／ ' + N_CLS + ' 类单头'; })();
+</script>
+</body>
+</html>
