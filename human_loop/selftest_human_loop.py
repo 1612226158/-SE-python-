@@ -22,6 +22,7 @@ selftest_human_loop.py —— human_loop 工具链自检（2026-09-12 建）
 import os
 import sys
 import csv
+import json
 import shutil
 import argparse
 import tempfile
@@ -31,7 +32,16 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 from hl_common import (cohens_kappa, kappa_level, short_name, resolve_class, parse_pairs,
-                       merged_class_index, VAL_ROOT, EXPORT_ROOT)  # noqa: E402
+                       merged_class_index, VAL_ROOT, EXPORT_ROOT,
+                       EXPECTED_NUM_CLASSES, MERGED_MEMBER_HINTS,
+                       current_protocol_identity, validate_public_pack,
+                       sha256_file, configure_utf8_console,
+                       public_class_member_hint)  # noqa: E402
+from annotate_gui import (_protocol_ok, first_unanswered_index,
+                          next_unanswered_index, is_answered)  # noqa: E402
+from kappa_report import validate_checkpoint_identity  # noqa: E402
+
+configure_utf8_console()
 
 PASS, FAIL = [], []
 
@@ -128,6 +138,69 @@ def test_names_and_pairs():
     except SystemExit:
         check('类对格式错误 → 报错', True)
 
+    _fid2, current, renew = merged_class_index()
+    check('当前盲标映射固定为252类', len(renew) == EXPECTED_NUM_CLASSES, str(len(renew)))
+    defaults = parse_pairs(None, current)
+    short_pairs = [(short_name(a), short_name(b)) for _pid, a, b in defaults]
+    check('P03/P04 已替换为252类下的独立类对',
+          short_pairs[2:4] == [('衣服', '裤子'), ('饼干', '蛋糕')], str(short_pairs[2:4]))
+    expected_merged_hints = {
+        '菜根菜叶': '厨余垃圾-菜叶',
+        '蔬菜': '厨余垃圾-菜叶',
+        '插头电线': '可回收物-插头充电线',
+        '充电线': '可回收物-插头充电线',
+    }
+    check('两组新增合并类的输出语义精确一致',
+          MERGED_MEMBER_HINTS == expected_merged_hints, str(MERGED_MEMBER_HINTS))
+    rejected = []
+    for member in expected_merged_hints:
+        try:
+            resolve_class(member, current)
+        except SystemExit:
+            rejected.append(member)
+    check('四个已合并原始成员均被拒绝作为独立候选',
+          rejected == list(expected_merged_hints), str(rejected))
+    check('公共玻璃制品类提示来自merged_dict且包含四个原始子类',
+          public_class_member_hint('玻璃制品类') == '玻璃器皿、玻璃瓶、玻璃壶、玻璃制品')
+    check('私有类不显示公共合并提示', public_class_member_hint('水杯') == '')
+
+    resume_fixture = [
+        {'choice': '1'}, {'choice': '2'}, {'choice': ''},
+        {'choice': 'unexpected'}, {'choice': '0'},
+    ]
+    check('恢复会话定位第一道空白题', first_unanswered_index(resume_fixture) == 2)
+    check('异常choice不计入进度并作为下一道未答题',
+          not is_answered(resume_fixture[3]) and next_unanswered_index(resume_fixture, 2) == 3)
+
+
+def test_checkpoint_identity():
+    section('[4] checkpoint标签映射负向校验（不加载模型）')
+    _fid2, _cls2fids, renew = merged_class_index()
+    identity = current_protocol_identity()
+    good = {**identity, 'renew_class_to_index': dict(renew)}
+    check('当前252类checkpoint身份 → 接受',
+          validate_checkpoint_identity(good, identity, renew) is True)
+
+    bad_hash = dict(good)
+    bad_hash['label_mapping_hash'] = '0' * 64
+    try:
+        validate_checkpoint_identity(bad_hash, identity, renew)
+        rejected_hash = False
+    except ValueError:
+        rejected_hash = True
+    check('旧/伪造mapping hash → 拒绝', rejected_hash)
+
+    bad_renew = dict(good)
+    bad_renew['renew_class_to_index'] = dict(renew)
+    first_class = next(iter(bad_renew['renew_class_to_index']))
+    bad_renew['renew_class_to_index'][first_class] = 999
+    try:
+        validate_checkpoint_identity(bad_renew, identity, renew)
+        rejected_renew = False
+    except ValueError:
+        rejected_renew = True
+    check('错位renew_class_to_index → 拒绝', rejected_renew)
+
 
 # ---------------------------------------------------------------- 集成测试
 def run(cmd):
@@ -136,7 +209,7 @@ def run(cmd):
 
 
 def test_pack_and_report(tmp, with_model=None):
-    section('[4] make_kappa_pack 生成抽样包（真实 val 只读）')
+    section('[5] make_kappa_pack 生成抽样包（真实 val 只读）')
     if not os.path.isdir(VAL_ROOT):
         print('  [SKIP] 未找到 val 目录，跳过集成测试')
         return
@@ -147,7 +220,8 @@ def test_pack_and_report(tmp, with_model=None):
     check('生成命令退出码 0', rc == 0, out[-400:])
     if rc != 0:
         return
-    need = ['images', 'sheetA.csv', 'sheetB.csv', '_key.csv', 'pairs.csv', 'README_ANNOTATOR.txt']
+    need = ['images', 'sheetA.csv', 'sheetB.csv', '_key.csv', 'pairs.csv',
+            'protocol.json', 'public_manifest.json', 'README_ANNOTATOR.txt']
     check('产物齐全', all(os.path.exists(os.path.join(pack, n)) for n in need),
           str([n for n in need if not os.path.exists(os.path.join(pack, n))]))
 
@@ -156,6 +230,8 @@ def test_pack_and_report(tmp, with_model=None):
             return list(csv.DictReader(f))
 
     A, B, K = rows(os.path.join(pack, 'sheetA.csv')), rows(os.path.join(pack, 'sheetB.csv')), rows(os.path.join(pack, '_key.csv'))
+    with open(os.path.join(pack, 'protocol.json'), encoding='utf-8') as f:
+        protocol = json.load(f)
     check('sheetA/B 行数一致且等于答案键', len(A) == len(B) == len(K) == 4, f'{len(A)}/{len(B)}/{len(K)}')
     check('图片文件数 = 行数', len(os.listdir(os.path.join(pack, 'images', 'P01'))) == len(K))
     check('图片与答案键一一对应', {r['image'] for r in K} == {r['image'] for r in A})
@@ -169,6 +245,26 @@ def test_pack_and_report(tmp, with_model=None):
           sorted([r['true_short'] for r in K]) == ['电饭煲'] * 2 + ['锅'] * 2,
           str([r['true_short'] for r in K]))
     check('答案键记录了来源路径（便于复核）', all(r.get('source_path') for r in K))
+    check('答案键的源图/复制图SHA256真实且一致', all(
+        r.get('source_sha256') == sha256_file(r['source_path']) ==
+        r.get('image_sha256') == sha256_file(os.path.join(pack, 'images', r['image']))
+        for r in K))
+    identity = current_protocol_identity()
+    check('protocol 同时绑定研究设计、标签定义与完整映射哈希',
+          all(protocol.get(k) == v for k, v in identity.items()), str(protocol))
+    check('整包源图路径全局唯一',
+          len({os.path.normcase(os.path.abspath(r['source_path'])) for r in K}) == len(K))
+    try:
+        validate_public_pack(pack)
+        public_ok = True
+    except Exception:
+        public_ok = False
+    check('GUI可用的公开包校验通过（不读取答案键）', public_ok and _protocol_ok(pack))
+
+    rc_overwrite, _out_overwrite = run([exe, os.path.join(HERE, 'make_kappa_pack.py'),
+                                        '--pairs', '锅:电饭煲', '--n-per-class', '2',
+                                        '--seed', '123', '--out', pack])
+    check('非空输出目录拒绝覆盖', rc_overwrite != 0)
 
     # 同种子可复现
     pack2 = os.path.join(tmp, 'pack_same_seed')
@@ -178,9 +274,35 @@ def test_pack_and_report(tmp, with_model=None):
     check('同种子 → 抽到同一批图片（可复现）',
           sorted(r['source_path'] for r in K) == sorted(r['source_path'] for r in K2))
 
-    section('[5] kappa_report 报告生成（测试夹具：程序生成的标注，仅用于自检）')
+    default_pack = os.path.join(tmp, 'pack_default_pairs')
+    rc_default, out_default = run([exe, os.path.join(HERE, 'make_kappa_pack.py'),
+                                   '--n-per-class', '1', '--seed', '123', '--out', default_pack])
+    if rc_default == 0:
+        with open(os.path.join(default_pack, 'protocol.json'), encoding='utf-8') as f:
+            default_protocol = json.load(f)
+        default_balance_ok = default_protocol.get('pair_order_balance') == {'A_left': 4, 'B_left': 4}
+    else:
+        default_balance_ok = False
+    check('默认8类对候选方向严格4/4平衡且写入协议', default_balance_ok, out_default[-400:])
+
+    excluded_pack = os.path.join(tmp, 'pack_excluding_first')
+    rc_excluded, out_excluded = run([exe, os.path.join(HERE, 'make_kappa_pack.py'),
+                                     '--pairs', '锅:电饭煲', '--n-per-class', '2',
+                                     '--seed', '456', '--exclude-pack', pack,
+                                     '--out', excluded_pack])
+    if rc_excluded == 0:
+        with open(os.path.join(pack, 'public_manifest.json'), encoding='utf-8') as f:
+            first_hashes = {item['sha256'] for item in json.load(f)['images']}
+        with open(os.path.join(excluded_pack, 'public_manifest.json'), encoding='utf-8') as f:
+            excluded_hashes = {item['sha256'] for item in json.load(f)['images']}
+        exclusion_ok = first_hashes.isdisjoint(excluded_hashes)
+    else:
+        exclusion_ok = False
+    check('按公开清单排除旧包图片后内容哈希零重合', exclusion_ok, out_excluded[-400:])
+
+    section('[6] kappa_report 报告生成（测试夹具：程序生成的标注，仅用于自检）')
     key = {r['image']: r for r in K}
-    # 夹具1：完美标注者（两人都选真值）
+    # 夹具1：同一标注者两轮都选真值
     fixA = os.path.join(pack, '_fix_perfect_A.csv')
     fixB = os.path.join(pack, '_fix_perfect_B.csv')
     for path in (fixA, fixB):
@@ -202,7 +324,7 @@ def test_pack_and_report(tmp, with_model=None):
     check('完美标注 → 人类准确率 100%', float(allrow['acc_A']) == 1.0 and float(allrow['acc_B']) == 1.0)
     check('未给 --with-model 时模型列为空', allrow['acc_model'] == '', f"acc_model={allrow['acc_model']!r}")
 
-    # 夹具2：一人完美、一人全部反向 → 两人一致率 0 → κ 为负
+    # 夹具2：轮次A完美、轮次B全部反向 → 两轮一致率 0 → κ 为负
     fixC = os.path.join(pack, '_fix_flip_B.csv')
     with open(fixC, 'w', encoding='utf-8-sig', newline='') as f:
         w = csv.DictWriter(f, fieldnames=['pair_id', 'image', 'option_1', 'option_2', 'choice', 'notes'])
@@ -215,7 +337,7 @@ def test_pack_and_report(tmp, with_model=None):
     rep2 = sorted(f for f in os.listdir(pack) if f.startswith('kappa_report_') and f.endswith('.csv'))[-1]
     rr2 = rows(os.path.join(pack, rep2))
     all2 = [r for r in rr2 if r['pair_id'] == 'ALL'][0]
-    check('完全相反的两人 → κ<0', float(all2['kappa']) < 0, str(all2))
+    check('完全相反的两轮 → κ<0', float(all2['kappa']) < 0, str(all2))
 
     # 夹具3：弃权处理（一半填 0）→ 有效标注数减半，但流程不崩
     fixD = os.path.join(pack, '_fix_abstain_A.csv')
@@ -232,6 +354,53 @@ def test_pack_and_report(tmp, with_model=None):
     rr3 = rows(os.path.join(pack, rep3))
     all3 = [r for r in rr3 if r['pair_id'] == 'ALL'][0]
     check('弃权(choice=0) → 有效共同标注数下降', int(all3['n_both']) == 2, f"n_both={all3['n_both']}")
+
+    # 负向保护：协议嫁接/非法 choice 均必须硬失败。
+    bad_pack = os.path.join(tmp, 'pack_bad_protocol')
+    shutil.copytree(pack, bad_pack)
+    bad_protocol_path = os.path.join(bad_pack, 'protocol.json')
+    with open(bad_protocol_path, encoding='utf-8') as f:
+        bad_protocol = json.load(f)
+    bad_protocol['pairs'][0]['class_A'] = '私有类-厨余垃圾-蔬菜'
+    with open(bad_protocol_path, 'w', encoding='utf-8') as f:
+        json.dump(bad_protocol, f, ensure_ascii=False, indent=2)
+    rc, _out = run([exe, os.path.join(HERE, 'kappa_report.py'), '--pack', bad_pack,
+                    '--sheetA', '_fix_perfect_A.csv', '--sheetB', '_fix_perfect_B.csv'])
+    check('嫁接/篡改 protocol 类对 → 拒绝出报告', rc != 0)
+    check('GUI 在标注前拒绝嫁接/篡改 protocol 的包', not _protocol_ok(bad_pack))
+
+    bad_image_pack = os.path.join(tmp, 'pack_bad_image')
+    shutil.copytree(pack, bad_image_pack)
+    victim = os.path.join(bad_image_pack, 'images', K[0]['image'])
+    with open(victim, 'wb') as f:
+        f.write(b'content-replaced-after-pack-generation')
+    rc, _out = run([exe, os.path.join(HERE, 'kappa_report.py'), '--pack', bad_image_pack,
+                    '--sheetA', '_fix_perfect_A.csv', '--sheetB', '_fix_perfect_B.csv'])
+    check('复制图片内容被替换 → 报告拒绝', rc != 0)
+    check('复制图片内容被替换 → GUI 在标注前拒绝', not _protocol_ok(bad_image_pack))
+
+    bad_flow_pack = os.path.join(tmp, 'pack_bad_flow')
+    shutil.copytree(pack, bad_flow_pack)
+    bad_flow_path = os.path.join(bad_flow_pack, 'protocol.json')
+    with open(bad_flow_path, encoding='utf-8') as f:
+        bad_flow = json.load(f)
+    bad_flow['minimum_round_interval_hours'] = 0
+    with open(bad_flow_path, 'w', encoding='utf-8') as f:
+        json.dump(bad_flow, f, ensure_ascii=False, indent=2)
+    rc, _out = run([exe, os.path.join(HERE, 'kappa_report.py'), '--pack', bad_flow_pack,
+                    '--sheetA', '_fix_perfect_A.csv', '--sheetB', '_fix_perfect_B.csv'])
+    check('关键流程字段被篡改 → 报告拒绝', rc != 0)
+    check('关键流程字段被篡改 → GUI 在标注前拒绝', not _protocol_ok(bad_flow_pack))
+
+    bad_choice = os.path.join(pack, '_fix_bad_choice.csv')
+    with open(bad_choice, 'w', encoding='utf-8-sig', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=['pair_id', 'image', 'option_1', 'option_2', 'choice', 'notes'])
+        w.writeheader()
+        for i, r in enumerate(A):
+            w.writerow(dict(r, choice=('9' if i == 0 else '0')))
+    rc, _out = run([exe, os.path.join(HERE, 'kappa_report.py'), '--pack', pack,
+                    '--sheetA', '_fix_bad_choice.csv', '--sheetB', '_fix_perfect_B.csv'])
+    check('非法 choice 不得静默当弃权', rc != 0)
 
     if with_model:
         section(f'[6] --with-model 分支（{with_model}）')
@@ -259,6 +428,7 @@ def main():
         test_kappa()
         test_kappa_level()
         test_names_and_pairs()
+        test_checkpoint_identity()
         test_pack_and_report(tmp, with_model=a.with_model)
     finally:
         if a.keep:

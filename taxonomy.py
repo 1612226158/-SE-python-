@@ -94,7 +94,14 @@ def load_current_label_schema(project_root):
     with open(os.path.join(project_root, 'classname.txt'), encoding='utf-8') as file:
         class_labels = file.read().splitlines()
     train_root = os.path.join(project_root, 'train')
-    dataset_class_ids = [name for name in os.listdir(train_root) if name.isdigit()]
+    dataset_class_ids = {name for name in os.listdir(train_root) if name.isdigit()}
+    expected_class_ids = {str(index) for index in range(RAW_CLASS_COUNT)}
+    if dataset_class_ids != expected_class_ids:
+        missing = sorted(expected_class_ids - dataset_class_ids, key=int)
+        extra = sorted(dataset_class_ids - expected_class_ids, key=int)
+        raise ValueError(
+            f'train/ 原始类别目录必须严格覆盖 0..{RAW_CLASS_COUNT - 1}；'
+            f'缺失={missing[:20]}，多余={extra[:20]}')
     mappings = generate_label_mappings(merged_dict, class_labels, dataset_class_ids)
     id_to_main_class, renew_class_to_index = mappings
     if len(class_labels) != RAW_CLASS_COUNT:

@@ -19,7 +19,7 @@ from tqdm import tqdm
 from PIL import Image, ImageFile
 import pillow_avif  # 导入 AVIF 支持插件
 
-from src_v2 import merged_dict, metrics_file, UPDATE_N
+from src_v2 import merged_dict, metrics_file
 
 from src_v2 import extensions_suffix
 from src_v2.taxonomy import generate_label_mappings
@@ -1039,64 +1039,6 @@ def count_by_category(class_data):
         })
 
     return category_stats
-
-
-def should_update_simple(csv_file="metrics.csv",
-                         n=UPDATE_N,
-                         acc_col='Validation_Accuracy_Parent',
-                         incr_update=0.15):
-    df = pd.read_csv(csv_file)
-    if len(df) < 3*n+2:
-        return True
-    # 2. 比较最后一行与倒数第31行（k-30）的 'state'
-    last_state = df['state'].iloc[-1]
-    comparison_state = df['state'].iloc[-(5*n+1)]
-    if last_state != comparison_state:
-        # 如果状态不一致，说明在过去30轮内发生过状态切换。
-        # print(f"DEBUG: 最近30轮内状态已改变 (从 {comparison_state} -> {last_state})，处于宽限期，不进行解冻判断。")
-        return True  # 返回 True 表示“不解冻”，给新状态适应时间
-
-    last_n = df.tail(n)[acc_col].values
-    last_3n = df.tail(3 * n)[acc_col].values
-
-    # 条件1：连续递增量检查
-    # incrs = [(last_n[i + 1] - last_n[i]) / last_n[i] for i in range(len(last_n) - 1)]
-    # if incrs and sum(incr < incr_update for incr in incrs) >= len(incrs) // 2:
-    #     return False
-
-    deltas = [(last_n[i + 1] - last_n[i]) for i in range(len(last_n) - 1)]
-
-    # 你的逻辑：如果一半以上的增量 < incr_update → 无提升 → 返回 False
-    if deltas and sum(delta < incr_update for delta in deltas) >= len(deltas) // 2:
-        return False
-
-    # 条件2：最佳准确率对比
-    best_acc = np.max(last_3n) * 0.99
-    avg_acc = np.mean(last_n)
-    if avg_acc < best_acc:
-        return False
-
-    # 条件3：平均提升检查
-    # if len(last_n) > 2:
-    #     trimmed = np.sort(last_n)[1:-1]
-    #     mean_imp = np.mean([trimmed[i + 1] - trimmed[i] for i in range(len(trimmed) - 1)])
-    #     if mean_imp <= 0:
-    #         return False
-    values = last_n.copy()
-    max_idx = np.argmax(values)
-    min_idx = np.argmin(values)
-    mask = np.ones_like(values, dtype=bool)
-    mask[max_idx] = False
-    mask[min_idx] = False
-    trimmed = values[mask]
-
-    if len(trimmed) > 1:
-        diffs = [trimmed[i + 1] - trimmed[i] for i in range(len(trimmed) - 1)]
-        mean_imp = np.mean(diffs)
-        if mean_imp <= 0:
-            return False
-
-    return True
 
 
 if __name__ == '__main__':

@@ -14,6 +14,14 @@ chart_data.py —— ReportChart 统一实验数据读取模块（2026-09-08 会
 【通用性】任何新实验跑完（runs/results_*.json + metrics 归档后）无需改本模块；
   若模型在跑（metrics_record.csv 实时追加），load_model 也能拿到"截至当前"的数据。
 
+【命令行】本文件同时是只读结果查询入口，不生成或修改训练产物：
+    python chart_data.py list
+    python chart_data.py summary S-NoProg:1 S-NoSE:1
+    python chart_data.py compare S-NoProg:1 S-NoSE:1
+    python chart_data.py data S-NoProg:1
+    python chart_data.py data S-NoProg:1 --json
+    python chart_data.py compare S-NoProg:1 S-NoSE:1 --json
+
 【口径说明】
   - metrics_record.csv 每行含: config_id,seed,epoch,sampler_seed,train_acc,train_loss,val_acc,val_loss,
     val_macro_f1,val_weighted_f1,lr,gradient_norm,time_spend_s,state,save_time
@@ -21,9 +29,12 @@ chart_data.py —— ReportChart 统一实验数据读取模块（2026-09-08 会
     本模块按 (config_id, seed) 合并后去重排序，天然支持。
   - G-Full 历史 seed0/1 并存：load_model 默认取"行数最完整"的 seed（可显式传 seed 覆盖）。
 """
+import argparse
+import glob
+import json
+import math
 import os
 import sys
-import glob
 import pandas as pd
 
 # ============ 路径（基于本文件定位，与 cwd 无关） ============
@@ -269,6 +280,324 @@ def model_final(config_id, seed=None, verbose=False):
     return (float(last['val_acc']), int(last['epoch']))
 
 
+# ---------- 统一状态汇总 / 命令行 ----------
+
+def _number(row, key):
+    """从 pandas 行中安全读取有限浮点数；缺列、空值或无穷值返回 None。"""
+    if key not in row:
+        return None
+    try:
+        value = float(row[key])
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _metric_point(df, column, mode='max'):
+    """返回某指标的极值点 {'value', 'epoch'}；整列无有效值时返回空值。"""
+    if column not in df.columns:
+        return {'value': None, 'epoch': None}
+    values = pd.to_numeric(df[column], errors='coerce')
+    valid = values.dropna()
+    if valid.empty:
+        return {'value': None, 'epoch': None}
+    idx = valid.idxmin() if mode == 'min' else valid.idxmax()
+    return {'value': float(values.loc[idx]), 'epoch': int(df.loc[idx, 'epoch'])}
+
+
+def _result_for_run(config_id, seed):
+    """读取指定 config/seed 的正式 results JSON；未收官或不可读时返回 None。"""
+    path = os.path.join(RUNS, f'results_{_cid(config_id)}_seed{int(seed)}.json')
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding='utf-8') as f:
+            result = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if result.get('config_id') != _cid(config_id) or int(result.get('seed', -1)) != int(seed):
+        return None
+    return result
+
+
+def summarize_run(config_id, seed=None):
+    """汇总一个实验的状态与关键指标，供命令行和其他脚本统一调用。
+
+    数据仍由 load_model() 负责扫描、合并、去重和排除脏记录。本函数不直接打开
+    metrics CSV，只在其规范化结果上计算完整性、best/final、F1、loss、泛化差距和耗时。
+    正式 best 优先采用指定 seed 的 results JSON；未收官时退回当前 metrics 峰值。
+    """
+    df = load_model(config_id, seed=seed, verbose=False)
+    config_id = _cid(config_id)
+    selected_seed = int(df['seed'].iloc[0])
+    result = _result_for_run(config_id, selected_seed)
+    registered_model = bool(_mr is not None and _mr.is_known(config_id))
+    target_epochs = int(_mr.target_of(config_id)) if registered_model else None
+
+    epochs = sorted({int(e) for e in df['epoch'].dropna().tolist()})
+    min_epoch = epochs[0]
+    max_epoch = epochs[-1]
+    missing_epochs = sorted(set(range(0, max_epoch + 1)) - set(epochs))
+
+    metrics_best = _metric_point(df, 'val_acc', 'max')
+    best_epoch = metrics_best['epoch']
+    best_row = df[df['epoch'].astype(int) == best_epoch].iloc[-1]
+    final_row = df.iloc[-1]
+
+    official_best = {
+        'value': float(result['best_val_acc']) if result and result.get('best_val_acc') is not None
+                 else metrics_best['value'],
+        'epoch': int(result['best_val_epoch']) if result and result.get('best_val_epoch') is not None
+                 else metrics_best['epoch'],
+        'source': 'results_json' if result else 'metrics',
+    }
+    final_train = _number(final_row, 'train_acc')
+    final_val = _number(final_row, 'val_acc')
+    best_train = _number(best_row, 'train_acc')
+    best_val = _number(best_row, 'val_acc')
+    time_values = pd.to_numeric(df.get('time_spend_s'), errors='coerce') if 'time_spend_s' in df else None
+
+    def protocol_value(key, cast=None):
+        value = result.get(key) if result else None
+        if value is None and key in final_row:
+            value = final_row[key]
+        try:
+            if pd.isna(value):
+                return None
+        except (TypeError, ValueError):
+            pass
+        if value is None or cast is None:
+            return value
+        try:
+            return cast(value)
+        except (TypeError, ValueError):
+            return None
+
+    return {
+        'config_id': config_id,
+        'seed': selected_seed,
+        'registered_model': registered_model,
+        'status': 'finished' if result else 'incomplete',
+        'results_json': bool(result),
+        'epochs': {
+            'rows': int(len(df)),
+            'first': min_epoch,
+            'last': max_epoch,
+            'target': target_epochs,
+            'progress_percent': (100.0 * len(epochs) / target_epochs) if target_epochs else None,
+            'remaining': max(target_epochs - len(epochs), 0) if target_epochs else None,
+            'missing': missing_epochs,
+            'continuous_from_zero': not missing_epochs and min_epoch == 0,
+        },
+        'official_best_val_acc': official_best,
+        'metrics_best_val_acc': metrics_best,
+        'final': {
+            'epoch': int(final_row['epoch']),
+            'train_acc': final_train,
+            'val_acc': final_val,
+            'val_loss': _number(final_row, 'val_loss'),
+            'val_macro_f1': _number(final_row, 'val_macro_f1'),
+            'val_weighted_f1': _number(final_row, 'val_weighted_f1'),
+            'generalization_gap_pp': (final_train - final_val)
+                                     if final_train is not None and final_val is not None else None,
+        },
+        'at_metrics_best_val': {
+            'epoch': best_epoch,
+            'train_acc': best_train,
+            'val_acc': best_val,
+            'val_loss': _number(best_row, 'val_loss'),
+            'val_macro_f1': _number(best_row, 'val_macro_f1'),
+            'val_weighted_f1': _number(best_row, 'val_weighted_f1'),
+            'generalization_gap_pp': (best_train - best_val)
+                                     if best_train is not None and best_val is not None else None,
+        },
+        'best_macro_f1': _metric_point(df, 'val_macro_f1', 'max'),
+        'best_weighted_f1': _metric_point(df, 'val_weighted_f1', 'max'),
+        'minimum_val_loss': _metric_point(df, 'val_loss', 'min'),
+        'cumulative_train_hours': float(time_values.sum() / 3600.0)
+                                  if time_values is not None else None,
+        'protocol': {
+            'training_protocol_version': protocol_value('training_protocol_version', int),
+            'sampling_protocol_version': protocol_value('sampling_protocol_version', int),
+            'label_schema_id': protocol_value('label_schema_id', str),
+            'label_schema_version': protocol_value('label_schema_version', int),
+            'label_mapping_hash': protocol_value('label_mapping_hash', str),
+            'num_classes': protocol_value('num_classes', int),
+        },
+    }
+
+
+def compare_runs(left_config, left_seed, right_config, right_seed):
+    """比较两个实验；差值统一定义为 right - left，避免口径歧义。"""
+    left = summarize_run(left_config, left_seed)
+    right = summarize_run(right_config, right_seed)
+
+    def delta(path):
+        lv, rv = left, right
+        for key in path:
+            lv = lv.get(key) if isinstance(lv, dict) else None
+            rv = rv.get(key) if isinstance(rv, dict) else None
+        if lv is None or rv is None:
+            return None
+        return float(rv) - float(lv)
+
+    protocol_keys = ('training_protocol_version', 'sampling_protocol_version',
+                     'label_schema_version', 'label_mapping_hash', 'num_classes')
+    comparable_protocol = all(
+        left['protocol'].get(key) is not None and
+        left['protocol'].get(key) == right['protocol'].get(key)
+        for key in protocol_keys
+    )
+    return {
+        'left': left,
+        'right': right,
+        'delta_definition': 'right_minus_left',
+        'protocol_match': comparable_protocol,
+        'delta': {
+            'official_best_val_acc_pp': delta(('official_best_val_acc', 'value')),
+            'final_val_acc_pp': delta(('final', 'val_acc')),
+            'best_macro_f1': delta(('best_macro_f1', 'value')),
+            'best_weighted_f1': delta(('best_weighted_f1', 'value')),
+            'minimum_val_loss': delta(('minimum_val_loss', 'value')),
+            'final_generalization_gap_pp': delta(('final', 'generalization_gap_pp')),
+            'cumulative_train_hours': delta(('cumulative_train_hours',)),
+        },
+    }
+
+
+def _parse_run_spec(spec):
+    """解析 MODEL[:SEED] 或 MODEL@SEED；省略 seed 时由 load_model 自动选最完整者。"""
+    for separator in (':', '@'):
+        if separator in spec:
+            model, seed_text = spec.rsplit(separator, 1)
+            if not model or not seed_text.isdigit():
+                raise argparse.ArgumentTypeError(f'invalid run spec {spec!r}; expected MODEL:SEED')
+            return model, int(seed_text)
+    return spec, None
+
+
+def _fmt(value, digits=4, suffix=''):
+    if value is None:
+        return 'n/a'
+    return f'{float(value):.{digits}f}{suffix}'
+
+
+def _print_run_summary(summary):
+    e = summary['epochs']
+    ob = summary['official_best_val_acc']
+    final = summary['final']
+    target = f"/{e['target']} ({e['progress_percent']:.1f}%)" if e['target'] else ''
+    print(f"{summary['config_id']} seed{summary['seed']}  [{summary['status']}]  "
+          f"epochs={e['rows']}{target} (ep{e['first']}..{e['last']}, missing={len(e['missing'])})")
+    print(f"  best val      : {_fmt(ob['value'], 4, '%')}@ep{ob['epoch']} ({ob['source']})")
+    print(f"  final         : val={_fmt(final['val_acc'], 4, '%')}  "
+          f"train={_fmt(final['train_acc'], 4, '%')}  "
+          f"gap={_fmt(final['generalization_gap_pp'], 4, 'pp')}  "
+          f"loss={_fmt(final['val_loss'], 6)}")
+    print(f"  best macro-F1 : {_fmt(summary['best_macro_f1']['value'], 6)}"
+          f"@ep{summary['best_macro_f1']['epoch']}")
+    print(f"  min val loss  : {_fmt(summary['minimum_val_loss']['value'], 6)}"
+          f"@ep{summary['minimum_val_loss']['epoch']}")
+    print(f"  train time    : {_fmt(summary['cumulative_train_hours'], 2, ' h')}")
+    if e['missing']:
+        preview = ','.join(str(x) for x in e['missing'][:12])
+        tail = '...' if len(e['missing']) > 12 else ''
+        print(f'  missing epochs: {preview}{tail}')
+
+
+def _json_ready(value):
+    """把 NaN/Inf 清为 null，保证 --json 输出是严格 JSON。"""
+    if isinstance(value, dict):
+        return {key: _json_ready(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_ready(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
+def cli(argv=None):
+    """chart_data 命令行入口；成功返回0，数据或参数错误返回2。"""
+    parser = argparse.ArgumentParser(description='Read-only summary of src_v2/runs experiments')
+    sub = parser.add_subparsers(dest='command')
+
+    p_list = sub.add_parser('list', help='list available config/seed runs and epoch ranges')
+    p_list.add_argument('--json', action='store_true', help='emit machine-readable JSON')
+
+    p_summary = sub.add_parser('summary', help='summarize one or more MODEL[:SEED] runs')
+    p_summary.add_argument('runs', nargs='+', help='for example: S-NoProg:1 S-NoSE:1')
+    p_summary.add_argument('--json', action='store_true', help='emit machine-readable JSON')
+
+    p_compare = sub.add_parser('compare', help='compare two MODEL[:SEED] runs; delta=right-left')
+    p_compare.add_argument('left', help='left run, for example S-NoProg:1')
+    p_compare.add_argument('right', help='right run, for example S-NoSE:1')
+    p_compare.add_argument('--json', action='store_true', help='emit machine-readable JSON')
+
+    p_data = sub.add_parser('data', help='print every merged epoch row and every source column')
+    p_data.add_argument('run', help='run to read, for example S-NoProg:1')
+    p_data.add_argument('--json', action='store_true', help='emit a JSON array instead of CSV')
+
+    args = parser.parse_args(argv)
+    command = args.command or 'list'
+    try:
+        if command == 'list':
+            data = available_models()
+            if getattr(args, 'json', False):
+                print(json.dumps(_json_ready(data), ensure_ascii=False, indent=2, allow_nan=False))
+            else:
+                print(f'[chart_data] models={len(data)}')
+                for cid in sorted(data):
+                    for seed in sorted(data[cid]):
+                        info = data[cid][seed]
+                        print(f'  {cid:22s} seed{seed}  rows={info["rows"]:>4}  '
+                              f'max_epoch={info["max_epoch"]}')
+            return 0
+
+        if command == 'summary':
+            data = [summarize_run(*_parse_run_spec(spec)) for spec in args.runs]
+            if args.json:
+                print(json.dumps(_json_ready(data), ensure_ascii=False, indent=2, allow_nan=False))
+            else:
+                for index, summary in enumerate(data):
+                    if index:
+                        print()
+                    _print_run_summary(summary)
+            return 0
+
+        if command == 'data':
+            model, seed = _parse_run_spec(args.run)
+            df = load_model(model, seed=seed, verbose=False)
+            if args.json:
+                # pandas负责把NaN转换为null，并把numpy标量转换为标准JSON数值。
+                print(df.to_json(orient='records', force_ascii=False, indent=2))
+            else:
+                # 默认CSV便于终端查看、管道处理或由调用方自行重定向保存。
+                sys.stdout.write(df.to_csv(index=False, lineterminator='\n'))
+            return 0
+
+        left = _parse_run_spec(args.left)
+        right = _parse_run_spec(args.right)
+        data = compare_runs(left[0], left[1], right[0], right[1])
+        if args.json:
+            print(json.dumps(_json_ready(data), ensure_ascii=False, indent=2, allow_nan=False))
+        else:
+            _print_run_summary(data['left'])
+            print()
+            _print_run_summary(data['right'])
+            d = data['delta']
+            print(f"\nDelta ({data['right']['config_id']} - {data['left']['config_id']})")
+            print(f"  official best val : {_fmt(d['official_best_val_acc_pp'], 4, 'pp')}")
+            print(f"  final val         : {_fmt(d['final_val_acc_pp'], 4, 'pp')}")
+            print(f"  best macro-F1     : {_fmt(d['best_macro_f1'], 6)}")
+            print(f"  final gap         : {_fmt(d['final_generalization_gap_pp'], 4, 'pp')}")
+            print(f"  train time        : {_fmt(d['cumulative_train_hours'], 2, ' h')}")
+            print(f"  protocol match    : {data['protocol_match']}")
+        return 0
+    except (FileNotFoundError, ValueError, TypeError) as error:
+        parser.error(str(error))
+        return 2
+
+
 # ---------- 论文口径（results JSON / best checkpoint，与 metrics 略有出入） ----------
 
 def results_best(config_id):
@@ -323,14 +652,4 @@ def best_ckpt_path(config_id, verbose=False):
 
 
 if __name__ == '__main__':
-    # 自检：打印可用模型 + 各模型 best（仅读 csv，无 matplotlib/torch 依赖）
-    import sys
-    print('[chart_data 自检] 可用模型清单：')
-    avail = available_models()
-    if not avail:
-        print('  (runs/ 下暂无 metrics 记录)')
-        sys.exit(1)
-    for cid in sorted(avail):
-        bv, be = model_best(cid, verbose=False)
-        fv, fe = model_final(cid, verbose=False)
-        print(f'  {cid:24s} best {bv:7.3f}%@ep{be:<4d} final {fv:7.3f}%@ep{fe}')
+    sys.exit(cli())

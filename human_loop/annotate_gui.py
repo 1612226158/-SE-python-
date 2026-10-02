@@ -12,7 +12,7 @@ annotate_gui.py —— 标注一致性检验的图形标注界面（2026-09-12 �
 
 用法：
   D:\\Python\\Python3.10.7\\python.exe src_v2\\human_loop\\annotate_gui.py
-  ... annotate_gui.py --pack exports/20260912_220250_kappa_pack --annotator B
+  ... annotate_gui.py --pack 20260929_002757_kappa_pack --annotator A
   ... annotate_gui.py --ui-selftest          # 自动构建界面并模拟作答（强制 UITEST 标注者，不碰真实表）
 
 快捷键：1 / 2 选择左/右候选；0 无法判断；← → 上一张/下一张；Delete 清除本题（4 秒内 Ctrl+Z 可撤销）；
@@ -35,7 +35,30 @@ from datetime import datetime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from hl_common import EXPORT_ROOT  # noqa: E402
+from hl_common import (EXPORT_ROOT, validate_public_pack, public_class_member_hint,
+                       configure_utf8_console)  # noqa: E402
+
+configure_utf8_console()
+
+VALID_CHOICES = frozenset({'0', '1', '2'})
+
+
+def is_answered(row):
+    """只有协议允许的0/1/2才算已答；空白或异常字符串都应继续提示补填。"""
+    return (row.get('choice') or '').strip() in VALID_CHOICES
+
+
+def first_unanswered_index(rows):
+    """返回第一道未合法作答题目的索引；全部完成时返回None。"""
+    return next((index for index, row in enumerate(rows) if not is_answered(row)), None)
+
+
+def next_unanswered_index(rows, current_index):
+    """从当前题之后寻找下一道未答题，必要时回绕；全部完成时返回None。"""
+    if not rows:
+        return None
+    order = list(range(current_index + 1, len(rows))) + list(range(0, current_index))
+    return next((index for index in order if not is_answered(rows[index])), None)
 
 
 # ---------------- DPI 感知（必须在 Tk() 之前调用） ----------------
@@ -129,14 +152,23 @@ def _resolve_family(root):
             return
 
 
+def _protocol_ok(pack):
+    """只接受当前252类且公开文件/图片哈希完整的抽样包；绝不读取答案键。"""
+    try:
+        validate_public_pack(pack)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
 def packs_available():
-    """exports 下所有 *_kappa_pack 目录，按名称（时间戳）倒序。"""
+    """exports 下当前252类协议的 *_kappa_pack 目录，按名称倒序。"""
     if not os.path.isdir(EXPORT_ROOT):
         return []
     out = []
     for name in sorted(os.listdir(EXPORT_ROOT), reverse=True):
         p = os.path.join(EXPORT_ROOT, name)
-        if os.path.isdir(p) and name.endswith('_kappa_pack'):
+        if os.path.isdir(p) and name.endswith('_kappa_pack') and _protocol_ok(p):
             out.append(p)
     return out
 
@@ -151,6 +183,7 @@ class AnnotatorApp:
         self._init_fonts()
 
         self.pack = pack
+        self.pack_lookup = {}
         self.annotator = annotator
         self.rows = []
         self.idx = 0
@@ -242,14 +275,32 @@ class AnnotatorApp:
         tk.Label(card, text='抽样包', font=self.F_H2, bg=CARD, fg=TEXT)\
             .pack(anchor='w', padx=sp(40), pady=(sp(24), sp(6)))
         packs = packs_available()
-        self.pack_var = tk.StringVar(value=os.path.basename(self.pack) if self.pack else
-                                     (os.path.basename(packs[0]) if packs else ''))
+        if self.pack and os.path.isdir(self.pack) and _protocol_ok(self.pack):
+            resolved = os.path.abspath(self.pack)
+            if resolved not in [os.path.abspath(p) for p in packs]:
+                packs.insert(0, resolved)
+        packs = [os.path.abspath(p) for p in packs]
+        basename_counts = {}
+        for path in packs:
+            basename_counts[os.path.basename(path)] = basename_counts.get(os.path.basename(path), 0) + 1
+        self.pack_lookup = {}
+        selected = ''
+        explicit = os.path.abspath(self.pack) if self.pack else None
+        for path in packs:
+            base = os.path.basename(path)
+            display = base if basename_counts[base] == 1 else f'{base}  —  {path}'
+            self.pack_lookup[display] = path
+            if explicit and os.path.normcase(path) == os.path.normcase(explicit):
+                selected = display
+        if not selected and self.pack_lookup:
+            selected = next(iter(self.pack_lookup))
+        self.pack_var = tk.StringVar(value=selected)
         try:
             ttk.Style().configure('TCombobox', padding=sp(6))
         except Exception:
             pass
         combo = ttk.Combobox(card, textvariable=self.pack_var, state='readonly',
-                             values=[os.path.basename(p) for p in packs],
+                             values=list(self.pack_lookup),
                              font=(FAMILY, px(12)))
         combo.pack(fill='x', padx=sp(40))
         tk.Label(card, textvariable=self.pack_path_var, font=self.F_SMALL, fg=SUBTLE,
@@ -257,17 +308,17 @@ class AnnotatorApp:
         self._sync_pack_path()
         combo.bind('<<ComboboxSelected>>', lambda e: self._sync_pack_path())
 
-        tk.Label(card, text='标注者', font=self.F_H2, bg=CARD, fg=TEXT)\
+        tk.Label(card, text='标注轮次', font=self.F_H2, bg=CARD, fg=TEXT)\
             .pack(anchor='w', padx=sp(40), pady=(sp(16), sp(6)))
         row = tk.Frame(card, bg=CARD)
         row.pack(anchor='w', padx=sp(40))
         self.ann_var = tk.StringVar(value=self.annotator)
-        for who, desc in (('A', '标注者 A'), ('B', '标注者 B')):
+        for who, desc in (('A', '第一轮 A'), ('B', '第二轮 B')):
             tk.Radiobutton(row, text=desc, variable=self.ann_var, value=who, font=self.F_BODY,
                            bg=CARD, fg=TEXT, activebackground=CARD, selectcolor=CARD,
                            takefocus=0, highlightthickness=0).pack(side='left', padx=(0, sp(20)))
 
-        tk.Label(card, text='提示：两人请各自独立标注，不要讨论；不要打开 _key.csv（答案键）。',
+        tk.Label(card, text='提示：同一标注者先做 A，至少间隔 12 小时再做 B；第二轮前不要查看 A 或答案键。',
                  font=self.F_SMALL, bg=CARD, fg=SUBTLE, wraplength=sp(540), justify='left')\
             .pack(anchor='w', padx=sp(40), pady=(sp(18), 0))
 
@@ -283,7 +334,7 @@ class AnnotatorApp:
     def _sync_pack_path(self):
         name = self.pack_var.get()
         if name:
-            p = os.path.join(EXPORT_ROOT, name)
+            p = self.pack_lookup.get(name, os.path.join(EXPORT_ROOT, name))
             self.pack_path_var.set(f'路径：{p}')
 
     # ------------------------------------------------------------------ 会话
@@ -292,8 +343,13 @@ class AnnotatorApp:
         if not name:
             messagebox.showwarning('提示', '请先选择抽样包（可先运行 make_kappa_pack.py 生成）')
             return
-        self.pack = os.path.join(EXPORT_ROOT, name)
+        self.pack = self.pack_lookup.get(name, os.path.join(EXPORT_ROOT, name))
         self.annotator = self.ann_var.get()
+        if not _protocol_ok(self.pack):
+            messagebox.showerror('标签协议不匹配',
+                                 '该抽样包不是当前252类标签协议，或公开清单/图片内容校验失败。\n'
+                                 '旧254类第一轮盲标包已失效，请重新生成。')
+            return
         sheet = os.path.join(self.pack, f'sheet{self.annotator}.csv')
         if not os.path.exists(sheet):
             messagebox.showerror('错误', f'找不到标注表：\n{sheet}')
@@ -308,9 +364,15 @@ class AnnotatorApp:
         if os.path.isdir(img_dir):
             from concurrent.futures import ThreadPoolExecutor
             self._pool = ThreadPoolExecutor(max_workers=2)
-        self.idx = next((i for i, r in enumerate(self.rows) if not (r.get('choice') or '').strip()), 0)
+        resume_index = first_unanswered_index(self.rows)
+        self.idx = 0 if resume_index is None else resume_index
         self._build_main()
         self.render()
+        if resume_index is None:
+            self._toast('本轮240题均已作答；如需修改可用左右键定位原题')
+        else:
+            remaining = sum(1 for row in self.rows if not is_answered(row))
+            self._toast(f'已跳到第一道未答题：第 {resume_index + 1} 张（剩余 {remaining} 题）', kind='warn')
 
     def _build_main(self):
         self._clear()
@@ -318,8 +380,11 @@ class AnnotatorApp:
         top.pack(fill='x')
         tk.Label(top, text='人工标注 · 类对二选一', font=self.F_TITLE, bg=CARD, fg=TEXT)\
             .pack(side='left', padx=(sp(18), sp(10)), pady=sp(12))
-        tk.Label(top, text=f'{os.path.basename(self.pack)}　|　标注者 {self.annotator}',
+        tk.Label(top, text=f'{os.path.basename(self.pack)}　|　标注轮次 {self.annotator}',
                  font=self.F_SMALL, bg=CARD, fg=SUBTLE).pack(side='left', pady=sp(18))
+        tk.Label(top, text='协议v3 · 公共类子类参考：显示',
+                 font=self.F_SMALL, bg=CARD, fg=OK_TEXT)\
+            .pack(side='left', padx=(sp(10), 0), pady=sp(18))
         self.save_hint = tk.Label(top, text='自动保存已开启', font=self.F_SMALL, bg=CARD, fg=OK_TEXT)
         self.save_hint.pack(side='right', padx=sp(18))
         self.top_prog = tk.Label(top, text='', font=self.F_H2, bg=CARD, fg=TEXT)
@@ -446,7 +511,7 @@ class AnnotatorApp:
     # ------------------------------------------------------------------ 渲染
     def _done_ratio(self):
         n = len(self.rows) or 1
-        done = sum(1 for x in self.rows if (x.get('choice') or '').strip())
+        done = sum(1 for x in self.rows if is_answered(x))
         return done / n
 
     def _draw_bar(self):
@@ -464,15 +529,18 @@ class AnnotatorApp:
             c.create_rectangle(x0 + r, y, x1 - r, y + h, fill=col, outline='')
 
     def _opt_text(self, k, name, answered):
-        return f'{"✓" if answered else " "} {k}　{name}'
+        hint = public_class_member_hint(name)
+        suffix = f'\n公共合并类包含：{hint}' if hint else ''
+        return f'{"✓" if answered else " "} {k}　{name}{suffix}'
 
     def render(self):
         r = self.rows[self.idx]
-        done = sum(1 for x in self.rows if (x.get('choice') or '').strip())
+        done = sum(1 for x in self.rows if is_answered(x))
+        remaining = len(self.rows) - done
         abst = sum(1 for x in self.rows if (x.get('choice') or '').strip() == '0')
         self.pair_var.set(f'第 {self.idx + 1} / {len(self.rows)} 张　·　类对 {r["pair_id"]}　·　'
                           f'（图片已随机命名）')
-        self.top_prog.configure(text=f'已答 {done} / {len(self.rows)}')
+        self.top_prog.configure(text=f'已答 {done} / {len(self.rows)} · 未答 {remaining}')
         self.prog_var.set(f'{done} / {len(self.rows)}')
         self.prog_pct.set(f'{int(done * 100 / max(1, len(self.rows)))}%　（无法判断 {abst}）')
         self._draw_bar()
@@ -644,20 +712,28 @@ class AnnotatorApp:
             return
         r = self.rows[self.idx]
         prev = (r.get('choice') or '').strip()
+        prev_notes = r.get('notes') or ''
         r['choice'] = str(choice)
         if self.notes_var.get() != (r.get('notes') or ''):
             r['notes'] = self.notes_var.get()
-        self.save(silent=True)
+        if not self.save(silent=True):
+            r['choice'], r['notes'] = prev, prev_notes
+            self.render()
+            return
         name = {1: r['option_1'], 2: r['option_2'], 0: '无法判断'}.get(choice, '')
         if prev and prev != str(choice):
             self._toast(f'↻ 已改答：{"选项 " + str(choice) if choice else ""} {name}（原：选项 {prev}）')
         else:
             self._toast(f'✓ 已记录：{("选项 " + str(choice) + " · ") if choice else ""}{name}')
-        # 前进一题；若已在最后一题则原地重绘（否则刚答的题不显示 ✓/已选配色/答案回显；
-        # 也不走 move()，免得"已经是最后一张了"提示盖掉"已记录"确认）——2026-09-12 修
-        if self.idx < len(self.rows) - 1:
-            self.move(1)
+        # 优先跳到下一道未答题；补漏时不再落回已经答过的顺序页。
+        # 全部完成或只是修改既有答案时留在当前题，明确刷新进度与选中状态。
+        nxt = next_unanswered_index(self.rows, self.idx)
+        if nxt is None:
+            self.render()
+            if all(is_answered(row) for row in self.rows):
+                self._toast('✓ 本轮全部题目已完成')
         else:
+            self.idx = nxt
             self.render()
 
     def clear_current(self):
@@ -802,7 +878,7 @@ def option_style_invariants(app):
 def main():
     ap = argparse.ArgumentParser(description='人工标注 GUI（类对二选一，盲标）')
     ap.add_argument('--pack', default=None, help='抽样包目录（缺省用 exports 下最新的）')
-    ap.add_argument('--annotator', default='A', help='标注者标识（A / B，决定写 sheet<A|B>.csv）')
+    ap.add_argument('--annotator', default='A', help='标注轮次（A / B，决定写 sheet<A|B>.csv）')
     ap.add_argument('--ui-selftest', action='store_true',
                     help='自检：构建界面 + 模拟作答（强制 UITEST 标注者，不碰真实标注表）')
     a = ap.parse_args()
@@ -829,75 +905,119 @@ def main():
     if selftest:
         sheet = os.path.join(pack, f'sheet{annotator}.csv') if pack else None
         created = False
-        if sheet and not os.path.exists(sheet):
-            src = os.path.join(pack, 'sheetA.csv')
-            if os.path.exists(src):
-                import shutil
-                shutil.copy2(src, sheet)
-                created = True
-        app.ann_var.set(annotator)
-        app.start_session()
-        if not app.rows:
-            print('[gui-selftest] 失败：未能加载标注表')
-            root.destroy()
-            return 1
-        # 会话从"第一道未答题"续标，故测试须针对 app.idx 指向的那一行
-        # （早期版本写死 rows[0]，当抽样表已有作答时会误判为 FAIL）
-        k = getattr(app, 'idx', 0)
-        before = app.rows[k].get('choice', '')
-        app.answer(1)
-        written = app.rows[k].get('choice') == '1'
-        # 复核磁盘内容
-        with open(sheet, encoding='utf-8-sig', newline='') as f:
-            disk = list(csv.DictReader(f))
-        on_disk = disk[k].get('choice') == '1'
-        print(f'[gui-selftest] 加载 {len(app.rows)} 行；写入行=#{k + 1}；'
-              f'内存写入={"OK" if written else "FAIL"}；'
-              f'磁盘复核={"OK" if on_disk else "FAIL"}；原值={before!r}；标注者={annotator}（真实表未改动）')
-        # 选项按钮配色不变量（已选/未选/悬停/焦点，防止"返回上一题配色倒挂"回归）
-        checks = option_style_invariants(app)
-        bad = [c for c in checks if not c[1]]
-        print(f'[gui-selftest] 配色不变量：通过 {len(checks) - len(bad)} / {len(checks)} 项')
-        for name, ok, detail in bad:
-            print(f'    FAIL {name}　{detail}')
-        # 最后一题答完应原地重绘并给出"已记录"（不能被"已经是最后一张了"盖掉）
-        if len(app.rows) > 0:
-            app.idx = len(app.rows) - 1
-            app.render()
-            app.answer(2)
-            last_ok = (app.rows[-1].get('choice') == '2' and app.idx == len(app.rows) - 1
-                       and '②' in app.answer_var.get() and '已记录' in app.status_var.get())
-            print(f'[gui-selftest] 最后一题原地重绘与回显={"OK" if last_ok else "FAIL"}'
-                  f'（回显={app.answer_var.get()!r}；提示={app.status_var.get()!r}）')
-        else:
-            last_ok = True
-        # 「图外/异常」标记：开→notes 写入标记词且落盘；再点→移除（净效果为零）
-        flag_ok = True
+        gap_indexes = None
         try:
-            k2 = getattr(app, 'idx', 0)
-            app.toggle_outlier()
-            on_mem = OUTLIER_TOKEN in (app.rows[k2].get('notes') or '')
+            if sheet and not os.path.exists(sheet):
+                src = os.path.join(pack, 'sheetA.csv')
+                if os.path.exists(src):
+                    import shutil
+                    shutil.copy2(src, sheet)
+                    created = True
+            if created:
+                # 构造两个分散空白题，覆盖“重新打开→首个未答→答后跳到下一未答→进度更新”。
+                with open(sheet, encoding='utf-8-sig', newline='') as f:
+                    fixture_rows = list(csv.DictReader(f))
+                for fixture_row in fixture_rows:
+                    fixture_row['choice'] = '1'
+                    fixture_row['notes'] = ''
+                gap_indexes = [3, 8] if len(fixture_rows) > 8 else [0, 1]
+                for gap_index in gap_indexes:
+                    fixture_rows[gap_index]['choice'] = ''
+                with open(sheet, 'w', encoding='utf-8-sig', newline='') as f:
+                    writer = csv.DictWriter(
+                        f, fieldnames=['pair_id', 'image', 'option_1', 'option_2', 'choice', 'notes'])
+                    writer.writeheader()
+                    writer.writerows(fixture_rows)
+            app.ann_var.set(annotator)
+            app.start_session()
+            if not app.rows:
+                print('[gui-selftest] 失败：未能加载标注表')
+                return 1
+            # 会话从"第一道未答题"续标，故测试须针对 app.idx 指向的那一行
+            # （早期版本写死 rows[0]，当抽样表已有作答时会误判为 FAIL）
+            k = getattr(app, 'idx', 0)
+            resume_ok = (k == gap_indexes[0]) if gap_indexes else True
+            before = app.rows[k].get('choice', '')
+            app.answer(1)
+            written = app.rows[k].get('choice') == '1'
+            jump_ok = (app.idx == gap_indexes[1]) if gap_indexes else True
+            progress_ok = ((f'已答 {len(app.rows) - 1} / {len(app.rows)} · 未答 1'
+                            == app.top_prog.cget('text')) if gap_indexes else True)
+            # 复核磁盘内容
             with open(sheet, encoding='utf-8-sig', newline='') as f:
-                disk3 = list(csv.DictReader(f))
-            on_disk3 = OUTLIER_TOKEN in (disk3[k2].get('notes') or '')
-            app.toggle_outlier()
-            off_mem = OUTLIER_TOKEN not in (app.rows[k2].get('notes') or '')
-            flag_ok = on_mem and on_disk3 and off_mem
-            print(f'[gui-selftest] 「图外」标记：写入={"OK" if on_mem else "FAIL"}／'
-                  f'落盘={"OK" if on_disk3 else "FAIL"}／取消={"OK" if off_mem else "FAIL"}')
-        except Exception as e:
-            flag_ok = False
-            print(f'[gui-selftest] 「图外」标记测试异常：{e}')
-        # 自检产物清理放在最后：上面的最后一题测试会再次落盘（"已选"确认）
-        if created:
+                disk = list(csv.DictReader(f))
+            on_disk = disk[k].get('choice') == '1'
+            print(f'[gui-selftest] 加载 {len(app.rows)} 行；写入行=#{k + 1}；'
+                  f'内存写入={"OK" if written else "FAIL"}；'
+                  f'磁盘复核={"OK" if on_disk else "FAIL"}；原值={before!r}；标注者={annotator}（真实表未改动）')
+            print(f'[gui-selftest] 断点续标：首个未答定位={"OK" if resume_ok else "FAIL"}／'
+                  f'下一未答跳转={"OK" if jump_ok else "FAIL"}／'
+                  f'进度即时更新={"OK" if progress_ok else "FAIL"}')
+            # 补完第二个空白，使后续“最后一题原地回显”测试处于全题已答状态。
+            if gap_indexes:
+                app.answer(2)
+            # 选项按钮配色不变量（已选/未选/悬停/焦点，防止"返回上一题配色倒挂"回归）
+            checks = option_style_invariants(app)
+            bad = [c for c in checks if not c[1]]
+            print(f'[gui-selftest] 配色不变量：通过 {len(checks) - len(bad)} / {len(checks)} 项')
+            for name, ok, detail in bad:
+                print(f'    FAIL {name}　{detail}')
+            glass_index = next((i for i, row in enumerate(app.rows)
+                                if '玻璃制品类' in (row.get('option_1'), row.get('option_2'))), None)
+            if glass_index is not None:
+                app.idx = glass_index
+                app.render()
+                hint_visible = ('公共合并类包含：玻璃器皿、玻璃瓶、玻璃壶、玻璃制品' in app.btn1.cget('text')
+                                or '公共合并类包含：玻璃器皿、玻璃瓶、玻璃壶、玻璃制品' in app.btn2.cget('text'))
+                hint_ok = hint_visible
+            else:
+                hint_ok = False
+            print(f'[gui-selftest] 公共类子类参考（协议v3显示模式）={"OK" if hint_ok else "FAIL"}')
+            # 最后一题答完应原地重绘并给出"已记录"（不能被"已经是最后一张了"盖掉）
+            if len(app.rows) > 0:
+                app.idx = len(app.rows) - 1
+                app.render()
+                app.answer(2)
+                last_ok = (app.rows[-1].get('choice') == '2' and app.idx == len(app.rows) - 1
+                           and '②' in app.answer_var.get()
+                           and ('已记录' in app.status_var.get()
+                                or '全部题目已完成' in app.status_var.get()))
+                print(f'[gui-selftest] 最后一题原地重绘与回显={"OK" if last_ok else "FAIL"}'
+                      f'（回显={app.answer_var.get()!r}；提示={app.status_var.get()!r}）')
+            else:
+                last_ok = True
+            # 「图外/异常」标记：开→notes 写入标记词且落盘；再点→移除（净效果为零）
+            flag_ok = True
             try:
-                os.remove(sheet)
-            except OSError:
+                k2 = getattr(app, 'idx', 0)
+                app.toggle_outlier()
+                on_mem = OUTLIER_TOKEN in (app.rows[k2].get('notes') or '')
+                with open(sheet, encoding='utf-8-sig', newline='') as f:
+                    disk3 = list(csv.DictReader(f))
+                on_disk3 = OUTLIER_TOKEN in (disk3[k2].get('notes') or '')
+                app.toggle_outlier()
+                off_mem = OUTLIER_TOKEN not in (app.rows[k2].get('notes') or '')
+                flag_ok = on_mem and on_disk3 and off_mem
+                print(f'[gui-selftest] 「图外」标记：写入={"OK" if on_mem else "FAIL"}／'
+                      f'落盘={"OK" if on_disk3 else "FAIL"}／取消={"OK" if off_mem else "FAIL"}')
+            except Exception as e:
+                flag_ok = False
+                print(f'[gui-selftest] 「图外」标记测试异常：{e}')
+            return 0 if (resume_ok and jump_ok and progress_ok and written and on_disk
+                         and hint_ok and last_ok and flag_ok and not bad) else 1
+        finally:
+            # 即使输出编码、图片解码或界面断言中途异常，也不能留下测试标注表。
+            if created:
+                try:
+                    os.remove(sheet)
+                except OSError:
+                    pass
+            elif sheet and os.path.exists(sheet):
+                print(f'[gui-selftest] 注意：{os.path.basename(sheet)} 并非本次创建，已保留（非真实标注表）')
+            try:
+                root.destroy()
+            except tk.TclError:
                 pass
-        elif sheet and os.path.exists(sheet):
-            print(f'[gui-selftest] 注意：{os.path.basename(sheet)} 并非本次创建，已保留（非真实标注表）')
-        root.destroy()
-        return 0 if (written and on_disk and last_ok and flag_ok and not bad) else 1
 
     root.mainloop()
     return 0

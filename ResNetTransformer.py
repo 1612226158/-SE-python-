@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-ResNetTransformer.py —— 修正版 Transformer 分类模型（独立路线，当前【暂不使用】）
+ResNetTransformer.py —— 修正版 Transformer 分类模型（V2-Full / V2-NoTF 正式路线）
 
 【这个文件是什么】
     把 ResNet.py 里的 ResNetTransformer 复制过来，改正了其中"Transformer 退化"的问题：
@@ -11,17 +11,10 @@ ResNetTransformer.py —— 修正版 Transformer 分类模型（独立路线，
       → +可学习位置编码 → Transformer（真正的多 token 自注意力）→ 平均池化 → 解耦层 → 分类头。
       Transformer 现在能建模 49 个空间小块之间的细腻关系，契合"垃圾分类要关注小块细节"的动机。
 
-【当前状态：先放着不用，别改、别删】
-    - 正在跑的 12 个 G 系列 + 之后 2 个 Long 实验，用的都是 ResNet.py 里的旧模型（seq_len=1 那版），
-      本文件【不参与】当前任何实验，train.py 也【不导入】本文件。
-    - 不要删 ResNet.py，也不要动 src_v2 里任何正在跑的代码。
-
-【之后的规划（等 12 个 G 系列 + 2 个 Long 全跑完再做，见 task_plan 的"🔬 Long 验证实验"块与决策记录）】
-    1. 作为"Transformer-v2 独立路线"立项：把 train.py 里 `from ResNet import ResNetTransformer`
-       改为 `from ResNetTransformer import ResNetTransformerV2`（并相应处理 PRESETS / 配置切换）。
-    2. 重新做 Transformer 消融（加/不加 Transformer 的对照，此时对照才有意义），
-       以及必要的 2 种子 + 可能的长轮数验证。
-    3. 论文里 Transformer 的相关表述（现已决定"弱化/退场"）届时再根据新结果决定是否升级为卖点。
+【当前状态】
+    - train.py 已按 model_registry.py 的 `model='v2'`选择本模型。
+    - V2-Full 使用 49 token + 3 层 Transformer；V2-NoTF 保持同一 V2 数据流并令层数为 0。
+    - 两项必须在同一训练协议下成对比较，不能用历史254类结果替代当前252类重跑。
 
 【参数说明】
     - transformer_layers / d_model / nhead：与原版一致（默认 3 / 512 / 8）。
@@ -82,7 +75,8 @@ class _TransformerBlock(nn.Module):
     def forward(self, x):
         # x: [seq, batch, d_model]
         x_norm = self.norm1(x)
-        x = x + self.drop_path1(self.attn(x_norm, x_norm, x_norm)[0])
+        # 分类路径不消费注意力权重；显式关闭返回可避免无用的 [B,N,N] 张量。
+        x = x + self.drop_path1(self.attn(x_norm, x_norm, x_norm, need_weights=False)[0])
         x = x + self.drop_path2(self.ffn(self.norm2(x)))
         return x
 
@@ -130,10 +124,35 @@ class ResNetTransformerV2(nn.Module):
                  ):
         super().__init__()
 
+        if renew_class_to_index is None:
+            raise ValueError('renew_class_to_index 不能为空；V2分类头必须显式绑定当前标签映射')
+        if not isinstance(transformer_layers, int) or transformer_layers < 0:
+            raise ValueError(f'transformer_layers 必须为非负整数，收到 {transformer_layers!r}')
+        if not isinstance(d_model, int) or d_model <= 0:
+            raise ValueError(f'd_model 必须为正整数，收到 {d_model!r}')
+        if not isinstance(nhead, int) or nhead <= 0 or d_model % nhead != 0:
+            raise ValueError(f'nhead 必须为正整数且整除 d_model，收到 d_model={d_model}, nhead={nhead}')
+        if not isinstance(num_patches, int) or num_patches <= 0:
+            raise ValueError(f'num_patches 必须为正整数，收到 {num_patches!r}')
+
         self.renew_class_to_index = renew_class_to_index
         self.id_to_main_class = id_to_main_class
         self.merged_dict = merged_dict or {}
         num_parent_classes = len(renew_class_to_index)
+        self.backbone_name = 'resnext50_32x4d'
+        self.transformer_layers = transformer_layers
+        self.d_model = d_model
+        self.nhead = nhead
+        self.num_patches = num_patches
+        self.regions = list(regions) if regions is not None else None
+        self.use_decouple = bool(use_decouple)
+        self.model_impl_version = 2
+        self.feature_dim = 2048
+        self.ffn_dim = 4 * d_model
+        self.transformer_dropout = 0.3
+        self.patch_dropout = 0.1
+        self.head_dropout = 0.5
+        self.drop_path_rate = float(drop_path_rate)
 
         # 加载预训练 ResNeXt50 并去掉分类头（去掉 fc + avgpool，保留 7×7 特征图）
         backbone = resnext50_32x4d(pretrained=True)
@@ -153,11 +172,12 @@ class ResNetTransformerV2(nn.Module):
         # 位置编码（次级消融 V2-1Dpos vs V2-2Dpos）
         assert pos_embed_type in ('1d', '2d'), f'pos_embed_type 只支持 1d/2d，收到 {pos_embed_type}'
         self.pos_embed_type = pos_embed_type
+        grid = int(round(num_patches ** 0.5))
+        self.expected_grid = (grid, grid) if grid * grid == num_patches else None
         if pos_embed_type == '1d':
             self.pos_embed = nn.Parameter(torch.randn(1, num_patches, d_model) * 0.02)  # 1D learned（ViT-B 做法）
             self.row_emb = self.col_emb = None
         else:  # '2d' 行列解耦：位置(r,c) = row[r] + col[c]
-            grid = int(round(num_patches ** 0.5))
             assert grid * grid == num_patches, f'2D 编码需要 num_patches 为平方数，收到 {num_patches}'
             self.row_emb = nn.Parameter(torch.randn(1, grid, d_model) * 0.02)
             self.col_emb = nn.Parameter(torch.randn(1, grid, d_model) * 0.02)
@@ -167,8 +187,8 @@ class ResNetTransformerV2(nn.Module):
         self.use_cls_token = use_cls_token
         self.cls_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02) if use_cls_token else None
 
-        self.dropout1 = nn.Dropout(0.1)     # patch-embedding dropout（ViT 标准 0.1；原 0.5 偏高）
-        self.dropout2 = nn.Dropout(0.5)
+        self.dropout1 = nn.Dropout(self.patch_dropout)     # patch-embedding dropout（原 0.5 偏高）
+        self.dropout2 = nn.Dropout(self.head_dropout)
 
         # Transformer 开关：layers=0 时直通（消融 G-NoTF / 无 Transformer 基线）
         # 改进（相对 nn.TransformerEncoder）：pre-LN + GELU FFN + 随机深度 DropPath
@@ -176,9 +196,9 @@ class ResNetTransformerV2(nn.Module):
             num_layers=transformer_layers,
             d_model=d_model,
             nhead=nhead,
-            dim_feedforward=4 * d_model,
-            dropout=0.3,
-            drop_path_rate=drop_path_rate,
+            dim_feedforward=self.ffn_dim,
+            dropout=self.transformer_dropout,
+            drop_path_rate=self.drop_path_rate,
         ) if transformer_layers > 0 else nn.Identity()
 
         # 父类分类器
@@ -199,6 +219,15 @@ class ResNetTransformerV2(nn.Module):
         x = self.resnet_backbone(x)                      # [B, C, H, W]
         x = self.se_block(x)                             # [B, C, H, W]（多区域 SE，regions=None 则直通）
         B, C, H, W = x.shape
+        actual_patches = H * W
+        if actual_patches != self.num_patches:
+            raise RuntimeError(
+                f'V2 token数量不匹配：配置要求 {self.num_patches}，backbone实际输出 '
+                f'{H}x{W}={actual_patches}。请同步检查输入尺寸、backbone和num_patches。')
+        if self.expected_grid is not None and (H, W) != self.expected_grid:
+            raise RuntimeError(
+                f'V2空间网格不匹配：配置要求 {self.expected_grid[0]}x{self.expected_grid[1]}，'
+                f'实际为 {H}x{W}。禁止仅凭token总数相同静默改变二维布局。')
         x = x.flatten(2).transpose(1, 2)                 # [B, H*W, C] = N 个 patch token
         x = self.projection(x)                           # [B, N, d_model]
 
@@ -227,6 +256,31 @@ class ResNetTransformerV2(nn.Module):
         disentangled_feature = self.disentangle_layer(global_feature)
         parent_output = self.parent_classifier(disentangled_feature)
         return parent_output
+
+    def architecture_metadata(self):
+        """返回可写入checkpoint/results的稳定结构元数据，不含运行态对象。"""
+        return {
+            'architecture': type(self).__name__,
+            'model_impl_version': self.model_impl_version,
+            'backbone': self.backbone_name,
+            'feature_dim': self.feature_dim,
+            'num_classes': self.parent_classifier.out_features,
+            'regions': self.regions,
+            'transformer_layers': self.transformer_layers,
+            'd_model': self.d_model,
+            'nhead': self.nhead,
+            'ffn_dim': self.ffn_dim,
+            'num_patches': self.num_patches,
+            'pos_embed_type': self.pos_embed_type,
+            'readout': 'cls' if self.use_cls_token else 'mean',
+            'use_decouple': self.use_decouple,
+            'transformer_norm': 'pre_ln_without_final_norm',
+            'ffn_activation': 'gelu',
+            'transformer_dropout': self.transformer_dropout,
+            'patch_dropout': self.patch_dropout,
+            'head_dropout': self.head_dropout,
+            'drop_path_rate': self.drop_path_rate,
+        }
 
     # ---- 渐进式解冻（与原版一致，供 train.py 复用） ----
     def freeze_backbone(self):
@@ -262,7 +316,13 @@ if __name__ == '__main__':
     fake_class_index = {i: i for i in range(EXPECTED_NUM_CLASSES)}
     model = ResNetTransformerV2(transformer_layers=3, d_model=d_model, nhead=nhead,
                                 renew_class_to_index=fake_class_index)
-    x = torch.randn(2, 3, 224, 224)
-    out = model(x)
-    print('前向输出 shape:', tuple(out.shape), f'(应为 (2, {EXPECTED_NUM_CLASSES}))')
-    print('位置编码可学习参数数量:', model.pos_embed.numel())
+    model.eval()
+    with torch.no_grad():
+        out = model(torch.zeros(1, 3, 224, 224))
+    assert tuple(out.shape) == (1, EXPECTED_NUM_CLASSES)
+    assert tuple(model.pos_embed.shape) == (1, 49, d_model)
+    print('V2_SELFTEST_OK', {
+        'output_shape': tuple(out.shape),
+        'pos_embed_shape': tuple(model.pos_embed.shape),
+        'metadata': model.architecture_metadata(),
+    })

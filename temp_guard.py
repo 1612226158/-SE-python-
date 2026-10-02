@@ -344,7 +344,7 @@ def _read_twice(read_fn, interval=3.0):
     return hi
 
 
-def _check_temps_only(tag="", log_info=logging.info, log_warn=logging.warning):
+def _check_temps_only(tag="", log_info=logging.info, log_warn=logging.warning, count=0):
     """`DISK_MONITOR_ENABLED=False` 时的路径：与"加磁盘监测之前"的**原逻辑逐字一致**
     —— 只读 GPU/CPU、日志行只有温度段、唯一休息条件是温度。"""
     gpu = _read_twice(get_gpu_temp_c)
@@ -358,8 +358,14 @@ def _check_temps_only(tag="", log_info=logging.info, log_warn=logging.warning):
         over.append(f"CPU {cpu:.1f}°C > {CPU_MAX_C}°C")
 
     if over:
-        log_warn(f"[温度守护] ⚠️ {'、'.join(over)}，休息 {REST_SECONDS // 60} 分钟…")
-        time.sleep(REST_SECONDS)
+        if count >= 2:
+            log_warn(f"[温度守护][多次温度异常, 延长时间] ⚠️ {'、'.join(over)}，休息 {REST_SECONDS*2 // 60} 分钟…")
+            time.sleep(REST_SECONDS * 2)
+            _check_temps_only(tag, log_info, log_warn, count+1)
+        else:
+            log_warn(f"[温度守护] ⚠️ {'、'.join(over)}，休息 {REST_SECONDS // 60} 分钟…")
+            time.sleep(REST_SECONDS)
+            _check_temps_only(tag, log_info, log_warn, count+1)
         log_info("[温度守护] 休息结束，继续")
         return True
     return False

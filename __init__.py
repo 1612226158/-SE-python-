@@ -15,11 +15,8 @@ from src_v2.taxonomy import (
 )
 
 # 如果模型准确度超过预定的值, 将会强制保存
-ACC_STOP = 96
+ACC_STOP = 98
 ERROR_RATE = 0.1
-
-# 每n轮检查模型指标, 以判断是否需要更新模型层
-UPDATE_N = 10
 
 # ===== DataLoader 常驻 worker 数（集中配置，train.py 只从这里读取）=====
 # 2026-09-26 修 WinError 1455：Windows spawn worker 会重新 import 本包，

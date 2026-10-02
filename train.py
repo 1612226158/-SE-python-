@@ -6,6 +6,7 @@ import warnings
 import logging
 import os
 import json
+import hashlib
 
 import temp_guard  # 温度守护：关键节点检测 CPU/GPU 温度，过高自动休息 10 分钟
 from functools import partial
@@ -40,12 +41,11 @@ from calculate import (calculate_mean_and_std,
                        get_classnames,
                        generate_mappings, get_class_proportion,
                        get_output_class_sample_counts,
-                       get_class_weight, hierarchical_collate_fn,
-                       should_update_simple)
+                       get_class_weight, hierarchical_collate_fn)
 from calculate_update import SafeImageFolder as NewSafeImageFolder
 from src_v2 import (device, DynamicMeanPad,
                     pth_file_name, save_model_after_epoch,
-                    extensions_suffix, merged_dict, ACC_STOP, ERROR_RATE, UPDATE_N,
+                    extensions_suffix, merged_dict, ACC_STOP, ERROR_RATE,
                     TRAIN_NUM_WORKERS, VAL_NUM_WORKERS)
 from src_v2.taxonomy import (
     EXPECTED_NUM_CLASSES,
@@ -464,7 +464,7 @@ def train_and_validate(model,
             print("开始继续工作！")
             time.sleep(5)  # 防止print信息串行
         if unfreeze_mode == 'progressive':
-            # 固定 epoch 触发解冻（替换原 should_update_simple 自适应判据，保证消融可比）
+            # 按固定 epoch 触发解冻，保证不同实验的训练路径可比
             if state == 1 and epoch >= UNFREEZE1_EPOCH:
                 model.unfreeze_layer4()
                 optimizer = optim.AdamW(model.get_grouped_params(backbone_lr=BACKBONE_LR, head_lr=HEAD_LR),
@@ -595,6 +595,8 @@ def train_and_validate(model,
             train_acc_at_best = train_parent_acc
             torch.save({'epoch': epoch, 'config_id': CONFIG_ID, 'seed': SEED,
                         'arch': type(model).__name__,
+                        'model_metadata': _model_metadata(model),
+                        'model_signature_sha256': _model_identity(model)[1],
                         'state_dict': model.state_dict(), 'val_acc': val_accuracy[0],
                         'best_val_acc': best_val_acc,
                         'best_epoch': best_epoch,
@@ -735,6 +737,8 @@ def train_and_validate(model,
         if not SMOKE:
             torch.save({'epoch': epoch, 'config_id': CONFIG_ID, 'seed': SEED,
                         'arch': type(model).__name__,
+                        'model_metadata': _model_metadata(model),
+                        'model_signature_sha256': _model_identity(model)[1],
                         'state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
                         'scheduler_state_dict': scheduler.state_dict(),
@@ -796,6 +800,8 @@ def train_and_validate(model,
         'amp_gradient_clipping': 'unscale_before_clip',
         'peak_gpu_mb': round(torch.cuda.max_memory_allocated() / 1024 ** 2, 1) if torch.cuda.is_available() else 0,
         'unfreeze_mode': unfreeze_mode,
+        'model_metadata': _model_metadata(model),
+        'model_signature_sha256': _model_identity(model)[1],
         'save_time': datetime.strftime(datetime.now(), '%Y-%m-%d %H:%M:%S'),
     }
     with open(os.path.join(RUNS_DIR, f'results_{RUN_TAG}.json'), 'w', encoding='utf-8') as f:
@@ -1139,6 +1145,84 @@ def _check_arch(checkpoint, model):
         raise SystemExit(f'[arch] 断点架构 {ck_arch} ≠ 当前模型 {cur_arch}，拒绝续跑（防静默跑错模型）')
 
 
+def _model_metadata(model):
+    """生成稳定、JSON可序列化的结构元数据；用于断点身份校验和结果复核。"""
+    if hasattr(model, 'architecture_metadata'):
+        return model.architecture_metadata()
+
+    transformer = getattr(model, 'transformer', None)
+    layers = getattr(transformer, 'layers', None)
+    se_block = getattr(model, 'se_block', None)
+    classifier = getattr(model, 'parent_classifier', None)
+    return {
+        'architecture': type(model).__name__,
+        'backbone': 'resnext50_32x4d',
+        'num_classes': getattr(classifier, 'out_features', None),
+        'regions': list(getattr(se_block, 'regions', [])) if hasattr(se_block, 'regions') else None,
+        'transformer_layers': len(layers) if layers is not None else 0,
+        'd_model': getattr(classifier, 'in_features', None),
+        'nhead': None,
+        'num_patches': 1,
+        'pos_embed_type': None,
+        'readout': 'single_token',
+        'use_decouple': not isinstance(getattr(model, 'disentangle_layer', None), nn.Identity),
+    }
+
+
+def _model_identity(model):
+    metadata = _model_metadata(model)
+    payload = json.dumps(metadata, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+    signature = hashlib.sha256(payload.encode('utf-8')).hexdigest()
+    return metadata, signature
+
+
+def _check_model_identity(checkpoint, model):
+    """新格式断点必须与当前精确结构一致；旧断点缺签名时保留兼容警告。"""
+    expected_metadata, expected_signature = _model_identity(model)
+    actual_signature = checkpoint.get('model_signature_sha256')
+    if actual_signature is None:
+        logging.warning('[model_signature] 旧断点无结构签名；仅依赖arch与strict state_dict校验')
+        return
+    if actual_signature != expected_signature:
+        raise RuntimeError(
+            '断点模型结构签名与当前配置不一致，拒绝续跑。'
+            f'断点={actual_signature}，当前={expected_signature}；'
+            f'断点结构={checkpoint.get("model_metadata")}，当前结构={expected_metadata}')
+
+
+def _validate_model_before_training(model, preset):
+    """正式开跑前的轻量门禁；V2额外执行真实224输入的CPU零样本前向。"""
+    expected_v2 = preset.get('model') == 'v2'
+    actual_v2 = isinstance(model, ResNetTransformerV2)
+    if expected_v2 != actual_v2:
+        raise RuntimeError(
+            f'配置与模型实现不一致：preset model={preset.get("model", "v1")}, '
+            f'实际模型={type(model).__name__}')
+
+    metadata, signature = _model_identity(model)
+    if metadata['num_classes'] != EXPECTED_NUM_CLASSES:
+        raise RuntimeError(
+            f'模型输出头应为 {EXPECTED_NUM_CLASSES} 类，实际 {metadata["num_classes"]} 类')
+
+    if expected_v2:
+        expected_layers = int(preset['transformer_layers'])
+        if metadata['transformer_layers'] != expected_layers:
+            raise RuntimeError(
+                f'V2 Transformer层数不一致：配置={expected_layers}，模型={metadata["transformer_layers"]}')
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            output = model(torch.zeros(1, 3, 224, 224))
+        model.train(was_training)
+        if tuple(output.shape) != (1, EXPECTED_NUM_CLASSES):
+            raise RuntimeError(
+                f'V2启动前向输出形状错误：预期 (1,{EXPECTED_NUM_CLASSES})，实际 {tuple(output.shape)}')
+        logging.info(f'[V2_PRECHECK] 224输入/49-token/252类前向通过；signature={signature}')
+    else:
+        logging.info(f'[MODEL_IDENTITY] signature={signature}')
+    return metadata, signature
+
+
 def _build_model(preset, transformer_layers, d_model, nhead, id_to_main_class, renew_class_to_index):
     """按 PRESET 构建模型：preset['model']=='v2' → ResNetTransformerV2（修正版49-token Transformer）；
     缺省/'v1' → ResNetTransformer（原版，seq_len=1）。两版构造参数签名兼容。"""
@@ -1246,6 +1330,7 @@ if __name__ == '__main__':
                 model = _build_model(preset, transformer_layers, d_model, nhead,
                                      id_to_main_class, renew_class_to_index)
                 _check_arch(checkpoint, model)
+                _check_model_identity(checkpoint, model)
                 model.load_state_dict(checkpoint['state_dict'])
             logging.info(f'RESUME: 从 {_resume_path} 继续, epoch {epoch_start}, state={state}')
         else:
@@ -1254,6 +1339,8 @@ if __name__ == '__main__':
         # 从头开始训练（按 PRESETS 预设开关）
         model = _build_model(preset, transformer_layers, d_model, nhead,
                              id_to_main_class, renew_class_to_index)
+
+    model_metadata, model_signature_sha256 = _validate_model_before_training(model, preset)
 
     # 设置优化器
     print(f"设置优化器===")
@@ -1358,7 +1445,9 @@ if __name__ == '__main__':
                        'LABEL_SCHEMA_VERSION': LABEL_SCHEMA_VERSION,
                        'LABEL_SCHEMA_DEFINITION_HASH': LABEL_SCHEMA_DEFINITION_HASH,
                        'LABEL_MAPPING_HASH': mapping_fingerprint(id_to_main_class, renew_class_to_index),
-                       'NUM_CLASSES': len(renew_class_to_index)},
+                       'NUM_CLASSES': len(renew_class_to_index),
+                       'MODEL_METADATA': model_metadata,
+                       'MODEL_SIGNATURE_SHA256': model_signature_sha256},
                       f, ensure_ascii=False, indent=2)
         logging.info('已保存本次配置快照: runs/last_config.json')
 

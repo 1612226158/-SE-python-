@@ -105,7 +105,7 @@ QUEUE = [
     ("G-Full-CAWR", 1),       # 渐进式解冻(30/60) + CAWR + 多区域SE（v1 头）—— 对照 S-NoProg
 
     # ===== 块 4：训练预算（依赖块 3，顺序不可调换）=====
-    ("G-Full-CAWR-Long", 1),  # 160 轮预算；从 G-Full-CAWR 的 100 轮断点续跑（ensure_long_resume）
+    # ("G-Full-CAWR-Long", 1),  # 160 轮预算；从 G-Full-CAWR 的 100 轮断点续跑（ensure_long_resume）
 
     # ===== 块 5：2×2 网格第四格 =====
     ("G-V2", 1),              # V2 修正头 × 渐进式解冻30/60 —— 补齐 头(v1/V2) × 解冻(全/渐进) 网格

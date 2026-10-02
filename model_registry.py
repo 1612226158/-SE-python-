@@ -99,7 +99,7 @@ MODELS = {
         'short': '修正版49-token注意力',
         'cn': 'V2修正Transformer·全程全解冻·含多区域SE（49-token真注意力）',
         'target_epochs': 100,
-        'note': 'best 83.353@74（100轮预算当前最高；vs S-NoProg +0.72pp n=1）',
+        'note': '协议v2待跑；83.353@74仅为254类旧协议历史观测，不得替代当前252类结果',
     },
     'V2-NoTF': {
         'params': dict(model='v2', regions=[1, 2], transformer_layers=0, use_decouple=True, unfreeze='none'),
@@ -107,7 +107,7 @@ MODELS = {
         'short': 'V2架构去Transformer',
         'cn': 'V2架构去Transformer·全程全解冻·含多区域SE（纯注意力消融对照）',
         'target_epochs': 100,
-        'note': 'V2-Full − V2-NoTF = 纯注意力增益（跑中 09-09）',
+        'note': '协议v2待跑；与V2-Full成对比较，差值用于估计纯注意力栈增益',
     },
     'G-V2': {
         'params': dict(model='v2', regions=[1, 2], transformer_layers=3, use_decouple=True, unfreeze='progressive', scheduler='cawr'),
