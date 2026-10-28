@@ -600,12 +600,18 @@ def cli(argv=None):
 
 # ---------- 论文口径（results JSON / best checkpoint，与 metrics 略有出入） ----------
 
-def results_best(config_id):
+def results_best(config_id, seed=None):
     """从 results_<config>_seed*.json 读该模型的论文口径最佳值（跑完才生成）。
-    返回 (best_val_acc, best_val_epoch, seed) 取最高 seed；无 results → (None, None, None)。
+    返回 (best_val_acc, best_val_epoch, seed)；指定seed只读该run，未指定取最高准确率。
+    无 results → (None, None, None)。
     注：results 的 best 是训练结束时汇总的"正式成绩"（如 S-NoProg 82.63@74）；
     与 model_best()（metrics 口径，如 82.634）可能差 0.00x，引用论文数字请用本函数。"""
     config_id = _cid(config_id)
+    if seed is not None:
+        result = _result_for_run(config_id, seed)
+        if result is None:
+            return (None, None, None)
+        return (float(result['best_val_acc']), int(result['best_val_epoch']), int(seed))
     best = None
     for p in sorted(glob.glob(os.path.join(RUNS, f'results_{config_id}_seed*.json'))):
         try:
@@ -624,11 +630,14 @@ def results_best(config_id):
     return best if best else (None, None, None)
 
 
-def best_ckpt_path(config_id, verbose=False):
+def best_ckpt_path(config_id, verbose=False, seed=None):
     """返回该模型应加载的 best checkpoint 绝对路径（与 results_best 的 seed 对齐；
     无 results 时退回 glob 到的最高 val_acc 那个 best.pth）。无 → None。
-    论文图/推理脚本只需输入模型英文名即可拿到正确 checkpoint。"""
+    显式seed时仅返回该run的best路径，缺失不回退其他seed；旧自动选择行为保留。"""
     config_id = _cid(config_id)
+    if seed is not None:
+        path = os.path.join(RUNS, f'checkpoint_{config_id}_seed{int(seed)}_best.pth')
+        return path if os.path.isfile(path) else None
     _, _, seed = results_best(config_id)
     cands = sorted(glob.glob(os.path.join(RUNS, f'checkpoint_{config_id}_seed*_best.pth')))
     if not cands:
@@ -649,6 +658,55 @@ def best_ckpt_path(config_id, verbose=False):
         except Exception:
             continue
     return best_p
+
+
+def load_run_frames(config_ids, seeds=(1, 2), require_complete=True):
+    """公共多run入口；显式seed、正式结果/连续轮次及协议一致性检查。"""
+    frames, summaries, protocols = {}, {}, []
+    for config_id in config_ids:
+        for seed in seeds:
+            key = (_cid(config_id), int(seed))
+            summary = summarize_run(*key)
+            frame = load_model(*key, verbose=False)
+            if require_complete:
+                epochs = summary['epochs']
+                if (not summary['results_json'] or not epochs['continuous_from_zero']
+                        or epochs['rows'] != epochs['target']
+                        or epochs['last'] != epochs['target'] - 1):
+                    raise ValueError(f'Incomplete run: {key}')
+                official = summary['official_best_val_acc']
+                observed = summary['metrics_best_val_acc']
+                if (round(observed['value'], 4) != round(official['value'], 4)
+                        or observed['epoch'] != official['epoch']):
+                    raise ValueError(f'Results/metrics mismatch: {key}')
+            frames[key], summaries[key] = frame, summary
+            protocols.append(summary['protocol'])
+    if require_complete and any(p != protocols[0] for p in protocols):
+        raise ValueError('Run protocols differ')
+    return frames, summaries
+
+
+def window_statistics(frame, start=0, stop=100):
+    """半开epoch窗口，loss面积/下降斜率及真实记录用时；不平滑或排异常轮。"""
+    import numpy as np
+    selected = frame[(frame.epoch >= start) & (frame.epoch < stop)]
+    if len(selected) != stop - start:
+        raise ValueError(f'Missing epochs in [{start}, {stop})')
+    x = selected.epoch.to_numpy(float)
+    hours = selected.time_spend_s.to_numpy(float).cumsum() / 3600
+    result = {'start': start, 'stop_exclusive': stop, 'n_epochs': len(selected),
+              'hours': float(hours[-1])}
+    for column in ('train_loss', 'val_loss'):
+        y = selected[column].to_numpy(float)
+        result[column] = {
+            'first': float(y[0]), 'last': float(y[-1]), 'mean': float(y.mean()),
+            'minimum': float(y.min()), 'endpoint_drop': float(y[0] - y[-1]),
+            'slope_per_epoch': float(np.polyfit(x, y, 1)[0]),
+            'slope_per_hour': float(np.polyfit(hours, y, 1)[0]),
+            'normalized_auc_epoch': float(np.trapz(y, x) / (x[-1] - x[0])),
+            'normalized_auc_time': float(np.trapz(np.r_[y[0], y], np.r_[0., hours]) / hours[-1]),
+        }
+    return result
 
 
 if __name__ == '__main__':

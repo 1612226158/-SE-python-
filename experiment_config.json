@@ -1,6 +1,6 @@
 {
-  "CONFIG_ID": "G-Full-CAWR",
-  "SEED": 1,
+  "CONFIG_ID": "G-V2",
+  "SEED": 2,
   "SMOKE": false,
   "MAX_EPOCHS": 100,
   "RESUME": true,

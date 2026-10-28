@@ -86,13 +86,31 @@ def _out(name, model, ext):
 
 
 # ============ 模型与数据 ============
-def build_and_load(model_name, verbose=True):
-    """按注册表信息构建对应头结构，加载 best checkpoint（CPU）。返回 (model, ckpt, renew, idx2name, path)。"""
+def build_and_load(model_name, verbose=True, seed=None):
+    """按注册表加载CPU模型；指定seed时校验正式结果/标签/结构身份，缺失不回退。
+
+    返回 (model, ckpt, renew, idx2name, path)。
+    """
     arch, regions, tf_layers, use_decouple = _model_meta(model_name)
-    p = cd.best_ckpt_path(model_name)
+    p = cd.best_ckpt_path(model_name, seed=seed)
     if p is None:
         raise SystemExit(f'[cm] 找不到 {model_name} 的 best checkpoint（runs/ 下）')
     ck = torch.load(p, map_location='cpu')
+    if seed is not None:
+        summary = cd.summarize_run(model_name, seed)
+        from taxonomy import load_current_label_schema
+        _, _, current_mapping_hash = load_current_label_schema(_ROOT)
+        if current_mapping_hash != summary['protocol']['label_mapping_hash']:
+            raise ValueError('Current label mapping differs from the selected run')
+        expected = dict(config_id=cd._cid(model_name), seed=int(seed),
+                        training_protocol_version=summary['protocol']['training_protocol_version'],
+                        sampling_protocol_version=summary['protocol']['sampling_protocol_version'],
+                        num_classes=summary['protocol']['num_classes'],
+                        label_mapping_hash=summary['protocol']['label_mapping_hash'],
+                        epoch=summary['official_best_val_acc']['epoch'])
+        for key, value in expected.items():
+            if ck.get(key) != value:
+                raise ValueError(f'Checkpoint identity mismatch {model_name}/seed{seed}: {key}')
     ck_arch = str(ck.get('arch', ''))
     if ck_arch and (('V2' in ck_arch) != (arch == 'v2')):
         raise SystemExit(f'[cm] 架构不一致：注册表={arch}（{arch}头），checkpoint arch={ck_arch}')
@@ -103,6 +121,9 @@ def build_and_load(model_name, verbose=True):
     net.unfreeze_all()
     sd = ck.get('state_dict') or ck.get('model_state_dict')
     net.load_state_dict(sd)
+    if seed is not None and hasattr(net, 'architecture_metadata'):
+        if net.architecture_metadata() != ck.get('model_metadata'):
+            raise ValueError(f'Checkpoint architecture metadata mismatch: {model_name}/seed{seed}')
     net.eval()
     net = net.to('cpu')
     idx2name = {int(v): k for k, v in renew.items()}
@@ -329,7 +350,7 @@ def stage_plot(model_name, top_n=TOP_N_PAIRS):
     ax1.barh(range(len(vals)), vals, color='#c44e52', alpha=0.85)
     ax1.set_yticks(range(len(vals)))
     ax1.set_yticklabels(labels, fontsize=8)
-    ax1.set_xlabel(f'误判次数（{cd.N_CLS} 类验证集）')
+    ax1.set_xlabel(f'误判次数（{len(names)} 类验证集）')
     ax1.set_title(f'(a) 最典型混淆对 top{top_n}（{model_name}，整体 {acc:.2f}%）', fontsize=12)
     for yi, v in enumerate(vals):
         ax1.text(v + max(vals) * 0.01, yi, str(v), va='center', fontsize=8)
@@ -342,7 +363,8 @@ def stage_plot(model_name, top_n=TOP_N_PAIRS):
                 idxs.append(i)
     idxs = idxs[:HEATMAP_CLASSES]
     sub = cm[np.ix_(idxs, idxs)].astype(float)
-    row = sub.sum(axis=1, keepdims=True)
+    # Use the full true-class support, so diagonal entries are actual recall.
+    row = cm[idxs, :].sum(axis=1, keepdims=True)
     subn = np.divide(sub, row, out=np.zeros_like(sub), where=row > 0) * 100
     im = ax2.imshow(subn, cmap='YlOrRd', vmin=0, vmax=100)
     ax2.set_xticks(range(len(idxs)))
@@ -351,7 +373,7 @@ def stage_plot(model_name, top_n=TOP_N_PAIRS):
     ax2.set_yticklabels([names[i] for i in idxs], fontsize=7)
     ax2.set_xlabel('预测类')
     ax2.set_ylabel('真值类')
-    ax2.set_title('(b) 高混淆类子矩阵（行归一化 %，对角线=召回）', fontsize=12)
+    ax2.set_title('(b) 高混淆类子矩阵（全类分母 %）', fontsize=12)
     # colorbar 用独立 axes，避免挤压缩短 ax2、导致左右面板标题错位
     from mpl_toolkits.axes_grid1 import make_axes_locatable
     cax = make_axes_locatable(ax2).append_axes('right', size='4%', pad=0.15)

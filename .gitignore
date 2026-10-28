@@ -9,10 +9,11 @@ __pycache__/
 *.log
 
 # ReportChart: 只入库绘图脚本，产物(PDF/PNG/CSV/JSON)不入库
-ReportChart/*.pdf
-ReportChart/*.png
-ReportChart/*.csv
-ReportChart/*.json
+ReportChart/**/*.pdf
+ReportChart/**/*.png
+ReportChart/**/*.csv
+ReportChart/**/*.json
+ReportChart/**/thesis_supplement/*_content.tex
 
 # 本地自检/临时脚本（不入库）
 _check_predict_registry.py
@@ -21,7 +22,50 @@ _*.py
 # predict GUI 历史/迁移备份（不入库）
 predict_gui_snoprog-old-ui.py
 predict_gui_snoprog.py.bak_qt_migration
-ReportChart/*.npz
+ReportChart/**/*.npz
 
 # human_loop: 只入库脚本与说明；导出包（图片副本/标注表/κ 报告）不入库
 human_loop/exports/
+
+# 压缩结果不入库
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+*.tgz
+
+# 本地文档与智能体规则/交接/记忆/过程日志不入库
+docs/
+[Aa][Gg][Ee][Nn][Tt].md
+[Aa][Gg][Ee][Nn][Tt][Ss].md
+[Cc][Ll][Aa][Uu][Dd][Ee].md
+[Gg][Ee][Mm][Ii][Nn][Ii].md
+.agents/
+.agent/
+.codex/
+.claude/
+.cursor/
+.gemini/
+.workbuddy/
+.cursorrules
+[Hh][Aa][Nn][Dd][Oo][Vv][Ee][Rr]/
+[Hh][Aa][Nn][Dd][Oo][Ff][Ff]/
+*[Hh][Aa][Nn][Dd][Oo][Vv][Ee][Rr]*.md
+*[Hh][Aa][Nn][Dd][Oo][Ff][Ff]*.md
+[Mm][Ee][Mm][Oo][Rr][Yy]/
+.memory/
+.agent-memory/
+*[Mm][Ee][Mm][Oo][Rr][Yy]*.md
+*[Mm][Ee][Mm][Oo][Rr][Yy]*.json
+*[Mm][Ee][Mm][Oo][Rr][Yy]*.yaml
+*[Mm][Ee][Mm][Oo][Rr][Yy]*.yml
+*[Mm][Ee][Mm][Oo][Rr][Yy]*.txt
+*交接*
+*记忆*
+*智能体*
+task_plan.md
+findings.md
+progress.md
+用户意见迭代日志.md
+v3实验修改方案.md

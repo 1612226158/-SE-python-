@@ -112,3 +112,18 @@ fig_out('val_acc', 'G-Full-CAWR', 'S-NoProg')
 - **本目录脚本的链接约定**：数据一律 `chart_data.load_model(注册key)`；checkpoint/results 用 `best_ckpt_path/results_best`；中文全称 `chart_data.model_cn(id)`；注册校验 `chart_data.is_known(id)`。三个画图脚本（plot_progressive_vs_full / plot_snoprog_vs_snose / eval_tail_class_acc）顶部均有 id 自检：用了未注册的模型名会直接报错。
 - **key 大小写规范**：代码里一律规范写法（如 `S-NoProg`）；论文/口头的 "S-NoProG" 只是显示写法，由注册表 ALIASES 归一化——别在代码里手写两种写法。
 - 图内中文名/主色是"单图显示样式"（在各脚本顶部 MODEL_A/B 或 _META 里声明，可按图意改）；模型本身的 id/中文全称/参数在注册表，二者分工互不干扰。
+
+
+## 2026-10-26 双seed完整结果分析公共接口
+
+[完整分析入口](v2/seed1-2-full/README.md)，输出均在`v2/seed1-2-full/`。
+
+- `chart_data.load_run_frames(config_ids,seeds=(1,2))`：统一加载并核验正式结果、完整轮次、best一致和共同协议。
+- `chart_data.window_statistics(frame,start,stop)`：半开窗口的loss均值、AUC、epoch/小时下降斜率与记录耗时。
+- `chart_data.results_best(config_id,seed=...)`、`best_ckpt_path(config_id,seed=...)`：显式seed，无该run不回退；旧省略seed行为保留。
+- `eval_confusion_matrix.build_and_load(model_name,seed=...)`：复用原模型与预处理，核验结果/checkpoint/当前标签/结构身份。
+- `report_inference.validation_manifest/preload_validation_rgb/predict_validation/load_prediction_cache`：内容哈希数据清单、一次RAM裁剪、批量CUDA/CPU推理和统一缓存读取；类别名称按**数值输出索引**排列。
+- `report_inference.grad_cam/calibration_statistics`：真实目标logit梯度归因与ECE/NLL/Brier；不修改模型或拟合校准器。
+- `paper_style.save(...,tight_layout_kwargs=...)`：保留既有字体/颜色/PNG+PDF导出，仅按密集图需要调整布局间距。
+
+- `report_inference.paired_prediction_statistics(truth,prediction1,prediction2,mask=None)`：相同样本上的双正确、单seed正确、双错误与标签分歧计数，支持固定类别组布尔掩码。

@@ -4,15 +4,15 @@ run_queue.py —— 训练协议 v2 正式实验队列（G / S / V2 系列自动
 
 【本版定位（2026-09-26 重写）】
   已切换为「协议 v2 全量重跑」模式。旧协议（AMP 梯度裁剪前未 unscale）的全部产物已移出
-  runs/ 根目录、归档至 runs/DIRTY_unscale_bug_20260926/，因此 done() 不会再误判任何旧配置
-  为"已完成"，QUEUE 中每一项都会从 epoch 0 真实重跑，产出的结果才能进论文正式结果矩阵。
+  runs/ 根目录、归档至 runs/DIRTY_unscale_bug_20260926/。完成项跳过，有断点的未完成项续跑，
+  新任务从 epoch 0 开始；完成判定同时核验正式结果身份和完整指标轮次。
 
 用法（确认 PyCharm 没有手动训练在跑，二者互斥；必须用带 torch 的训练解释器）：
     D:\\Python\\Python3.10.7\\python.exe E:\\DataSet\\垃圾分类图片-2\\src_v2\\run_queue.py
 
 它会按 QUEUE 顺序依次处理每个 (CONFIG_ID, SEED)：
-  1. 已完成（有 results_<tag>.json，或 metrics_record*.csv 里存在"最后轮"行：
-     普通配置=99 行，Long 配置=目标轮数-1 行）→ 跳过
+  1. 正式 results 身份/协议正确，且指标覆盖完整目标轮次 → 跳过
+     文件不可读、轮次冲突或指标已齐但缺 results → 停队报告，不自动重跑
   2. 正在训练（checkpoint_<tag>_last.pth 最近 15 分钟还在写）→ 等待 5 分钟重查
   3. Long 配置且自己无断点 → 从源配置断点复制续跑（ensure_long_resume，省重跑前 100 轮）
   4. 有断点但已停 → 自动 RESUME=true 续跑；无断点 → RESUME=false 全新跑
@@ -26,6 +26,7 @@ run_queue.py —— 训练协议 v2 正式实验队列（G / S / V2 系列自动
 import glob
 import csv
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -34,9 +35,12 @@ import time
 from datetime import datetime
 
 import temp_guard  # 温度守护：任务切换前检测 CPU/GPU 温度，过高自动休息 10 分钟
+import model_registry
+from ReportChart.chart_data import all_metrics_files, DIRTY_RECORDS
 from taxonomy import (
     EXPECTED_NUM_CLASSES,
     LABEL_SCHEMA_ID,
+    LABEL_SCHEMA_DEFINITION_HASH,
     LABEL_SCHEMA_VERSION,
     load_current_label_schema,
 )
@@ -148,6 +152,143 @@ LONG_BASE = {
 }
 
 FRESH_SECONDS = 15 * 60  # checkpoint 最近 15 分钟有写 = 训练进行中
+# 队列侧完成守卫；公共绘图工具不承担严格完成判定。
+TRAINING_PROTOCOL_VERSION = 2
+SAMPLING_PROTOCOL_VERSION = 1
+SAMPLER_SEED_STRIDE = 1_000_000
+_metrics_cache_signature = None
+_metrics_cache = {}
+
+
+class CompletionCheckError(RuntimeError):
+    """产物状态未知或矛盾，必须停队，不能当作未完成自动开跑。"""
+
+
+def _integer(value):
+    if isinstance(value, bool):
+        raise ValueError('布尔值不是整数身份字段')
+    number = float(value)
+    if not math.isfinite(number) or not number.is_integer():
+        raise ValueError(f'不是有限整数: {value!r}')
+    return int(number)
+
+
+def _matches(record, expected):
+    """JSON数值和CSV字符串共用身份校验。"""
+    for key, value in expected.items():
+        actual = record.get(key)
+        try:
+            if isinstance(value, bool):
+                if not isinstance(actual, bool):
+                    return False
+            elif isinstance(value, int):
+                actual = _integer(actual)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if actual != value:
+            return False
+    return True
+
+
+def _label_fields():
+    return {'label_schema_version': LABEL_SCHEMA_VERSION,
+            'label_mapping_hash': CURRENT_LABEL_MAPPING_HASH,
+            'num_classes': EXPECTED_NUM_CLASSES}
+
+
+def _metrics_signature(files):
+    try:
+        signature = []
+        for path in files:
+            stat = os.stat(path)
+            signature.append((path, stat.st_mtime_ns, stat.st_size))
+        return tuple(signature)
+    except OSError as error:
+        raise CompletionCheckError(f'无法检查指标文件状态：{error}') from error
+
+
+def _metrics_index():
+    """按文件变化刷新索引；复用公共文件白名单/作废登记，不重复拼读取规则。"""
+    global _metrics_cache_signature, _metrics_cache
+    files = all_metrics_files()
+    signature = _metrics_signature(files)
+    if signature == _metrics_cache_signature:
+        return _metrics_cache
+    index = {}
+    required = {'config_id', 'seed', 'epoch', 'sampler_seed', 'val_acc', *_label_fields()}
+    for path in files:
+        try:
+            with open(path, encoding='utf-8-sig', newline='') as file:
+                reader = csv.DictReader(file, strict=True)
+                if not required.issubset(reader.fieldnames or []):
+                    raise CompletionCheckError(f'{path} 缺少完成校验所需列')
+                dirty = DIRTY_RECORDS.get(os.path.basename(path), set())
+                for row in reader:
+                    if None in row or any(value is None for value in row.values()):
+                        raise ValueError('CSV行列数不一致')
+                    key = row['config_id'], _integer(row['seed'])
+                    if key in dirty or not _matches(row, _label_fields()):
+                        continue
+                    epoch = _integer(row['epoch'])
+                    if epoch < 0 or _integer(row['sampler_seed']) != key[1] * SAMPLER_SEED_STRIDE + epoch:
+                        raise ValueError(f'{key} epoch={epoch} 的采样身份不一致')
+                    accuracy = float(row['val_acc'])
+                    if not math.isfinite(accuracy) or not 0 <= accuracy <= 100:
+                        raise ValueError('验证准确率无效')
+                    # 重复保存同一条指标可接受；同epoch的不同指标不能静默覆盖。
+                    payload = {k: v for k, v in row.items() if k != 'save_time'}
+                    entry = index.setdefault(key, {})
+                    if epoch in entry and entry[epoch] != payload:
+                        raise ValueError(f'{key} epoch={epoch} 有冲突记录')
+                    entry[epoch] = payload
+        except (OSError, UnicodeError, csv.Error, ValueError, TypeError) as error:
+            raise CompletionCheckError(f'指标读取失败 {path}：{error}') from error
+    if _metrics_signature(files) != signature or all_metrics_files() != files:
+        raise CompletionCheckError('核验期间指标文件变化，请重试状态检查')
+    _metrics_cache_signature, _metrics_cache = signature, index
+    return index
+
+
+def _result_record(config_id, seed, target_epoch):
+    path = os.path.join(RUNS, f'results_{config_id}_seed{seed}.json')
+    try:
+        with open(path, encoding='utf-8-sig') as file:
+            result = json.load(file)
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise CompletionCheckError(f'结果读取失败 {path}：{error}') from error
+    preset = model_registry.params_of(config_id)
+    expected = {**_label_fields(), 'config_id': config_id, 'seed': seed,
+                'label_schema_id': LABEL_SCHEMA_ID,
+                'label_schema_definition_hash': LABEL_SCHEMA_DEFINITION_HASH,
+                'training_protocol_version': TRAINING_PROTOCOL_VERSION,
+                'sampling_protocol_version': SAMPLING_PROTOCOL_VERSION,
+                'sampler_seed_scheme': f'run_seed*{SAMPLER_SEED_STRIDE}+epoch',
+                'last_sampler_seed': seed * SAMPLER_SEED_STRIDE + target_epoch,
+                'amp_gradient_clipping': 'unscale_before_clip',
+                'unfreeze_mode': preset['unfreeze']}
+    if not isinstance(result, dict) or not _matches(result, expected):
+        raise CompletionCheckError(f'{path} 的实验身份、训练/采样/标签协议不匹配')
+    try:
+        start, end = map(_integer, result['epochs_run'])
+        best_epoch = _integer(result['best_val_epoch'])
+        best_accuracy = float(result['best_val_acc'])
+        if not (0 <= start <= end == target_epoch and 0 <= best_epoch <= end
+                and math.isfinite(best_accuracy) and 0 <= best_accuracy <= 100):
+            raise ValueError('结果轮次或best指标无效')
+        # 旧v1结果没有结构快照，不伪造恢复；已保存的快照必须与注册配置一致。
+        if 'model_metadata' in result:
+            metadata = result['model_metadata']
+            expected_model = {k: preset[k] for k in ('regions', 'transformer_layers', 'use_decouple')}
+            expected_model.update(num_classes=EXPECTED_NUM_CLASSES,
+                                  architecture='ResNetTransformerV2' if preset.get('model') == 'v2'
+                                  else 'ResNetTransformer')
+            if not isinstance(metadata, dict) or not _matches(metadata, expected_model):
+                raise ValueError('模型结构快照与注册配置不匹配')
+    except (KeyError, TypeError, ValueError, OverflowError) as error:
+        raise CompletionCheckError(f'结果校验失败 {path}：{error}') from error
+    return result
 
 
 def log(msg):
@@ -190,60 +331,44 @@ def _preflight():
     # 现场报告（不阻断，仅提示）：确认旧协议产物确已移出 runs\ 根目录
     n_res = len(glob.glob(os.path.join(RUNS, "results_*.json")))
     n_ckpt = len(glob.glob(os.path.join(RUNS, "checkpoint_*.pth")))
-    n_mr = len(glob.glob(os.path.join(RUNS, "metrics_record*.csv")))
+    n_mr = len(all_metrics_files())
     n_legacy = len(glob.glob(os.path.join(LEGACY_DIR, "*"))) if os.path.isdir(LEGACY_DIR) else 0
     log(f"  现场：runs\\ 根目录 results={n_res} / checkpoint={n_ckpt} / metrics_record={n_mr}"
         f"；归档档 {os.path.basename(LEGACY_DIR)} 内 {n_legacy} 项")
     if n_res or n_ckpt:
-        log("  提示：runs\\ 根目录有 results/checkpoint；done() 只承认当前标签指纹的结果，")
+        log("  提示：done() 核验结果身份/协议及完整轮次，读取异常会停队，")
         log("     train.py 也会拒绝续跑旧 254 类 checkpoint。")
     return True
 
 
 def done(config_id, seed):
-    tag = f"{config_id}_seed{seed}"
-    # 强制重跑集合：仅当"还没有 results JSON"时无视归档 metrics 判定已完成。
-    # 2026-09-26 起置空：旧协议产物已全部移出 runs\ 根目录（→ DIRTY_unscale_bug_20260926\），
-    # 归档 metrics 不再落在 runs\ 根，兜底判据不会再被旧数据误触发；而 RERUN 的原用途
-    # （强制重跑 G-Full-CAWR seed1 以覆盖调度器 bug 的脏数据）已由"整体重跑"一并达成。
-    # 将来若需对某个已完成配置强制重跑，把它的 (config_id, seed) 加回本集合即可
-    # —— 跑完生成 results 后会自动恢复常规判定，不会反复重跑。
-    RERUN = set()
-    if (config_id, seed) in RERUN:
-        results_p = os.path.join(RUNS, f"results_{tag}.json")
-        if not os.path.exists(results_p):
-            return False  # 重跑中且尚未出 results → 视为未完成（跳过归档 metrics 的"已完成"误判）
-        # results 已生成（本次重跑完成）→ 继续走正常判断，视为完成
-    # 主标记：results JSON（训练结束生成，RUN_TAG 命名，不归档）
-    results_path = os.path.join(RUNS, f"results_{tag}.json")
-    if os.path.exists(results_path):
-        try:
-            with open(results_path, encoding="utf-8") as file:
-                result = json.load(file)
-            if (result.get('label_schema_version') == LABEL_SCHEMA_VERSION and
-                    result.get('label_mapping_hash') == CURRENT_LABEL_MAPPING_HASH and
-                    result.get('num_classes') == EXPECTED_NUM_CLASSES):
-                return True
-            log(f"忽略旧标签体系结果：{os.path.basename(results_path)}")
-        except (OSError, json.JSONDecodeError) as error:
-            log(f"忽略不可读结果文件 {os.path.basename(results_path)}：{error}")
-    # 兜底：扫描当前 + 所有归档的 metrics_record*.csv，找该配置该种子的"最后轮"行
-    # （普通配置=99；Long 配置=目标轮数-1，避免 Long 跑到 99 就被误判"已完成"）
-    target_epoch = LONG_CONFIGS.get(config_id, 100) - 1
-    for mr in glob.glob(os.path.join(RUNS, "metrics_record*.csv")):
-        try:
-            with open(mr, encoding="utf-8", newline='') as file:
-                for row in csv.DictReader(file):
-                    if (row.get('config_id') == config_id and
-                            row.get('seed') == str(seed) and
-                            row.get('epoch') == str(target_epoch) and
-                            row.get('label_schema_version') == str(LABEL_SCHEMA_VERSION) and
-                            row.get('label_mapping_hash') == CURRENT_LABEL_MAPPING_HASH and
-                            row.get('num_classes') == str(EXPECTED_NUM_CLASSES)):
-                        return True
-        except (OSError, csv.Error):
-            continue
-    return False
+    """True=可信完成，False=未完成；未知/矛盾状态抛异常，process负责停队。"""
+    if not model_registry.is_known(config_id):
+        raise CompletionCheckError(f'未知模型配置：{config_id}')
+    target_epoch = model_registry.target_of(config_id) - 1
+    index = _metrics_index()
+    rows = dict(index.get((config_id, seed), {}))
+    # Long的0—99允许沿用经严格核验的源实验；不要求续跑段重新生成前100轮。
+    base = LONG_BASE.get(config_id)
+    if base and rows and min(rows) >= SNAPSHOT_EPOCH and done(base, seed):
+        rows = {**index.get((base, seed), {}), **rows}
+    result = _result_record(config_id, seed, target_epoch)
+    expected_epochs = set(range(target_epoch + 1))
+    if result is None and target_epoch not in rows:
+        return False
+    if set(rows) != expected_epochs:
+        missing = sorted(expected_epochs - rows.keys())
+        extra = sorted(rows.keys() - expected_epochs)
+        raise CompletionCheckError(f'{config_id} seed{seed} 轮次不完整/越界：缺{missing}，多{extra}')
+    if result is None:
+        raise CompletionCheckError(f'{config_id} seed{seed} 指标已齐但缺正式results，请核查训练收尾；不自动重跑')
+    best_row = rows[_integer(result['best_val_epoch'])]
+    reported_best = float(result['best_val_acc'])
+    measured_best = max(float(row['val_acc']) for row in rows.values())
+    if (abs(float(best_row['val_acc']) - reported_best) > 0.00006
+            or abs(measured_best - reported_best) > 0.00006):
+        raise CompletionCheckError(f'{config_id} seed{seed} results best与完整指标矛盾')
+    return True
 
 
 def in_progress(config_id, seed):
@@ -295,6 +420,14 @@ def ensure_long_resume(config_id, seed):
 
 
 def process(config_id, seed):
+    try:
+        return _process(config_id, seed)
+    except CompletionCheckError as error:
+        log(f"✖ 完成状态无法确认，停止队列：{error}")
+        return "failed"
+
+
+def _process(config_id, seed):
     if done(config_id, seed):
         log(f"跳过已完成 {config_id} seed{seed}")
         return "done"
