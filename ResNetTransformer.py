@@ -23,11 +23,11 @@ ResNetTransformer.py —— 修正版 Transformer 分类模型（V2-Full / V2-No
 """
 import torch
 import torch.nn as nn
-from torchvision.models import resnext50_32x4d
+from torchvision.models import resnext50_32x4d, resnet18, resnet34
 
-from src_v2 import merged_dict
-from src_v2.taxonomy import EXPECTED_NUM_CLASSES
-from src_v2.SE_Block import SEBlock as NewSEBlock
+from src_v3 import merged_dict
+from src_v3.taxonomy import EXPECTED_NUM_CLASSES
+from src_v3.SE_Block import SEBlock as NewSEBlock
 
 
 class DropPath(nn.Module):
@@ -120,6 +120,9 @@ class ResNetTransformerV2(nn.Module):
                  num_patches=49,        # ResNeXt50@224 → 7×7=49 个 patch token
                  drop_path_rate=0.1,    # 随机深度：每层残差丢弃概率
                  use_cls_token=False,   # 读出方式（次级消融 V2-Mean vs V2-CLS）：False=mean-pool，True=[CLS]
+                 backbone_name='resnext50_32x4d',
+                 pretrained=True,
+                 backbone_bn_policy='frozen_stats',
                  pos_embed_type='1d',   # 位置编码（次级消融 V2-1Dpos vs V2-2Dpos）：'1d' | '2d' 行列解耦
                  ):
         super().__init__()
@@ -139,15 +142,20 @@ class ResNetTransformerV2(nn.Module):
         self.id_to_main_class = id_to_main_class
         self.merged_dict = merged_dict or {}
         num_parent_classes = len(renew_class_to_index)
-        self.backbone_name = 'resnext50_32x4d'
+        builders = {'resnext50_32x4d': resnext50_32x4d, 'resnet18': resnet18, 'resnet34': resnet34}
+        if backbone_name not in builders:
+            raise ValueError(f'不支持的骨干: {backbone_name}')
+        if backbone_bn_policy != 'frozen_stats':
+            raise ValueError('当前对照统一使用frozen_stats骨干BN策略')
+        self.backbone_name = backbone_name
+        self.backbone_bn_policy = backbone_bn_policy
         self.transformer_layers = transformer_layers
         self.d_model = d_model
         self.nhead = nhead
         self.num_patches = num_patches
         self.regions = list(regions) if regions is not None else None
         self.use_decouple = bool(use_decouple)
-        self.model_impl_version = 2
-        self.feature_dim = 2048
+        self.model_impl_version = 3
         self.ffn_dim = 4 * d_model
         self.transformer_dropout = 0.3
         self.patch_dropout = 0.1
@@ -155,8 +163,9 @@ class ResNetTransformerV2(nn.Module):
         self.drop_path_rate = float(drop_path_rate)
 
         # 加载预训练 ResNeXt50 并去掉分类头（去掉 fc + avgpool，保留 7×7 特征图）
-        backbone = resnext50_32x4d(pretrained=True)
-        in_features = backbone.fc.in_features          # 2048
+        backbone = builders[backbone_name](pretrained=pretrained)
+        in_features = backbone.fc.in_features
+        self.feature_dim = in_features
         self.resnet_backbone = nn.Sequential(*list(backbone.children())[:-2])
 
         # 多区域 SE（regions=None 时直通，用于消融 G-NoSE / G-PureBB）
@@ -264,6 +273,9 @@ class ResNetTransformerV2(nn.Module):
             'model_impl_version': self.model_impl_version,
             'backbone': self.backbone_name,
             'feature_dim': self.feature_dim,
+            'backbone_bn_policy': self.backbone_bn_policy,
+            'se_parameters': sum(p.numel() for p in self.se_block.parameters()),
+            'projection_parameters': sum(p.numel() for p in self.projection.parameters()),
             'num_classes': self.parent_classifier.out_features,
             'regions': self.regions,
             'transformer_layers': self.transformer_layers,
@@ -282,6 +294,14 @@ class ResNetTransformerV2(nn.Module):
             'drop_path_rate': self.drop_path_rate,
         }
 
+    def train(self, mode=True):
+        super().train(mode)
+        # 所有实验统一固定骨干BN运行统计；头部BN仍正常训练。
+        for module in self.resnet_backbone.modules():
+            if isinstance(module, nn.modules.batchnorm._BatchNorm):
+                module.eval()
+        return self
+
     # ---- 渐进式解冻（与原版一致，供 train.py 复用） ----
     def freeze_backbone(self):
         for p in self.resnet_backbone.parameters():
@@ -295,12 +315,12 @@ class ResNetTransformerV2(nn.Module):
         for p in self.resnet_backbone.parameters():
             p.requires_grad = True
 
-    def get_grouped_params(self, backbone_lr, head_lr):
+    def get_grouped_params(self, backbone_lr, head_lr, include_frozen=False):
         """按 backbone / head 分组返回优化器参数组（与原版一致）。"""
         backbone_ids = [id(p) for p in self.resnet_backbone.parameters()]
         backbone_params, head_params = [], []
         for param in self.parameters():
-            if param.requires_grad:
+            if include_frozen or param.requires_grad:
                 (backbone_params if id(param) in backbone_ids else head_params).append(param)
         return [
             {'params': backbone_params, 'lr': backbone_lr},
@@ -314,7 +334,7 @@ if __name__ == '__main__':
     #   python src_v2/ResNetTransformer.py
     d_model, nhead = 512, 8
     fake_class_index = {i: i for i in range(EXPECTED_NUM_CLASSES)}
-    model = ResNetTransformerV2(transformer_layers=3, d_model=d_model, nhead=nhead,
+    model = ResNetTransformerV2(transformer_layers=0, pretrained=False, d_model=d_model, nhead=nhead,
                                 renew_class_to_index=fake_class_index)
     model.eval()
     with torch.no_grad():

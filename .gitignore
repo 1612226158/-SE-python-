@@ -1,27 +1,99 @@
-# training artifacts & caches (not committed)
-runs/
-images_cache_*_v2.json
-images_cache_train.json
-images_cache_val.json
+# Python与本地环境（v3沿用全局Python，这些规则防止误加入其他环境）
+.venv/
+venv/
+env/
 __pycache__/
-*.pyc
-*.pth
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# 训练、短运行与分析产物
+# runs整个目录及其全部子目录/文件均不提交
+runs/
+smoke_runs/
+analyses/
+images_cache*.json
 *.log
 
-# ReportChart: 只入库绘图脚本，产物(PDF/PNG/CSV/JSON)不入库
-ReportChart/*.pdf
-ReportChart/*.png
-ReportChart/*.csv
-ReportChart/*.json
+# 本地文档，不提交到代码仓库
+docs/
 
-# 本地自检/临时脚本（不入库）
-_check_predict_registry.py
-_*.py
+# 智能体规则、交接记录、记忆与任务过程日志（仅本地保留）
+[Aa][Gg][Ee][Nn][Tt].md
+[Aa][Gg][Ee][Nn][Tt][Ss].md
+[Cc][Ll][Aa][Uu][Dd][Ee].md
+[Gg][Ee][Mm][Ii][Nn][Ii].md
+.agents/
+.agent/
+.codex/
+.claude/
+.cursor/
+.gemini/
+.workbuddy/
+.cursorrules
+[Hh][Aa][Nn][Dd][Oo][Vv][Ee][Rr]/
+[Hh][Aa][Nn][Dd][Oo][Ff][Ff]/
+*[Hh][Aa][Nn][Dd][Oo][Vv][Ee][Rr]*.md
+*[Hh][Aa][Nn][Dd][Oo][Ff][Ff]*.md
+[Mm][Ee][Mm][Oo][Rr][Yy]/
+.memory/
+.agent-memory/
+*[Mm][Ee][Mm][Oo][Rr][Yy]*.md
+*[Mm][Ee][Mm][Oo][Rr][Yy]*.json
+*[Mm][Ee][Mm][Oo][Rr][Yy]*.yaml
+*[Mm][Ee][Mm][Oo][Rr][Yy]*.yml
+*[Mm][Ee][Mm][Oo][Rr][Yy]*.txt
+*交接*
+*记忆*
+*智能体*
+task_plan.md
+findings.md
+progress.md
+用户意见迭代日志.md
+v3实验修改方案.md
 
-# predict GUI 历史/迁移备份（不入库）
-predict_gui_snoprog-old-ui.py
-predict_gui_snoprog.py.bak_qt_migration
-ReportChart/*.npz
+# 模型权重与导出文件
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.onnx
+*.engine
+*.tflite
 
-# human_loop: 只入库脚本与说明；导出包（图片副本/标注表/κ 报告）不入库
-human_loop/exports/
+# 数据与压缩备份；项目原图在仓库外，不提交
+/train/
+/val/
+/test/
+/datasets/
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+*.tgz
+
+# 兼容旧分析入口可能留下的图表/统计产物
+ReportChart/**/*.pdf
+ReportChart/**/*.png
+ReportChart/**/*.jpg
+ReportChart/**/*.jpeg
+ReportChart/**/*.csv
+ReportChart/**/*.json
+ReportChart/**/*.npz
+
+# 私有配置、编辑器及临时文件
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.tmp
+*.temp
+*.bak
+*~

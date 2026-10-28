@@ -40,24 +40,22 @@ import numpy as np
 from PIL import Image
 import torchvision.transforms as transforms
 
-from src_v2 import merged_dict
+from src_v3 import merged_dict
 from calculate import generate_mappings, get_classnames, calculate_mean_and_std
-from ResNet import ResNetTransformer
+from ResNetTransformer import ResNetTransformerV2
+import model_registry as mr
 
 # ============ 配置 ============
 RUNS = os.path.join(_SRC, 'runs')
 VAL_ROOT = os.path.join(_ROOT, 'val')
 TRAIN_ROOT = os.path.join(_ROOT, 'train')
-# 对比的模型：id 必须全部在 src_v2\model_registry.py 注册（key 一律用规范写法，如 S-NoProg；
-# 论文叙述里的 "S-NoProG" 只是显示写法，由下方 _META['label'] 呈现，不进 key）。
-# checkpoint 路径 / 整体 acc / 中文全称均由 chart_data(+注册表) 按 id 动态解析。
-COMPARE_MODELS = ['S-NoProg', 'G-Full-CAWR']
-# 本图固定比较"全解冻(v1头) vs 渐进式(v1头)"；换对比模型时同步改 _META（显示名/主色/csv列字母）。
+# 仅比较当前V3注册的两个NoTF基线；显示名与颜色属于分析元数据。
+COMPARE_MODELS = ['FullUnfreeze', 'ProgressiveUnfreeze']
 _META = {
-    'S-NoProg':    {'letter': 'S', 'label': 'S-NoProG（全解冻）',    'color': '#4c72b0'},
-    'G-Full-CAWR': {'letter': 'G', 'label': 'G-Full-CAWR（渐进式）', 'color': '#dd8452'},
+    'FullUnfreeze': {'letter': 'S', 'label': '全解冻', 'color': '#4c72b0'},
+    'ProgressiveUnfreeze': {'letter': 'G', 'label': '渐进式解冻', 'color': '#dd8452'},
 }
-from chart_data import (best_ckpt_path, results_best, model_best, is_known, model_cn,  # noqa: E402
+from src_v3.result_tools.chart_data import (best_ckpt_path, results_best, model_best, is_known, model_cn,  # noqa: E402
                         N_CLS)
 _unknown = [m for m in COMPARE_MODELS if not is_known(m)]
 if _unknown:
@@ -77,12 +75,13 @@ def _build_ckpt_and_overall():
         overall[name] = va if va is not None else model_best(name)[0]
     return ckpt, overall
 
-CKPT, OVERALL_ACC = _build_ckpt_and_overall()
-TAIL_JSON = os.path.join(_HERE, 'tail_classes.json')
-PER_CLASS_CSV = os.path.join(_HERE, 'per_class_acc.csv')
+CKPT, OVERALL_ACC = {}, {}
+_ANALYSIS_DIR = os.path.join(RUNS, 'analyses', 'tail_classes')
+TAIL_JSON = os.path.join(_ANALYSIS_DIR, 'tail_classes.json')
+PER_CLASS_CSV = os.path.join(_ANALYSIS_DIR, 'per_class_acc.csv')
 
 # 模型结构：两模型完全一致（与 predict_gui_snoprog.py / PRESETS 核对）
-TRANSFORMER_LAYERS = 3
+TRANSFORMER_LAYERS = 0
 D_MODEL = 512
 NHEAD = 8
 REGIONS = [1, 2]
@@ -129,7 +128,7 @@ def build_class_table():
     # 两边任一处漂移（改了 merged_dict 忘改 N_CLS，或反之）都会在此当场报错。
     assert n_classes == N_CLS, (
         f'合并类数不一致：merged_dict 实际 {n_classes}，chart_data.N_CLS = {N_CLS}。'
-        f'请同步 src_v2/ReportChart/chart_data.py 的 N_CLS（口径 = 265 − Σ(|组|−1)）')
+        f'请同步 src_v3/result_tools/chart_data.py 的 N_CLS（口径 = 265 − Σ(|组|−1)）')
     return class_table, id_to_main_class, renew_class_to_index
 
 
@@ -172,16 +171,22 @@ def _transform(mean, std):
 
 def _load_model(best_pth):
     ck = torch.load(best_pth, map_location='cpu')
-    assert ck.get('arch') == 'ResNetTransformer', f"arch 不符: {ck.get('arch')}"
+    assert ck.get('arch') == 'ResNetTransformerV2', f"arch 不符: {ck.get('arch')}"
+    config_id = ck.get('config_id')
+    preset = mr.params_of(config_id)
+    if ck.get('experiment_signature') != mr.experiment_signature_of(config_id):
+        raise ValueError('Checkpoint实验签名与当前注册不一致')
     id2main, renew = generate_mappings(merged_dict=merged_dict)
-    model = ResNetTransformer(
-        transformer_layers=TRANSFORMER_LAYERS,
+    model = ResNetTransformerV2(
+        transformer_layers=preset['transformer_layers'],
         d_model=D_MODEL,
         id_to_main_class=id2main,
         renew_class_to_index=renew,
         nhead=NHEAD,
-        regions=REGIONS,
-        use_decouple=USE_DECOUPLE,
+        regions=preset['regions'],
+        use_decouple=preset['use_decouple'],
+        backbone_name=preset['backbone'], pretrained=False,
+        backbone_bn_policy=mr.training_policy_of(config_id)['backbone_bn_policy'],
     )
     model.unfreeze_all()
     sd = ck.get('state_dict') or ck.get('model_state_dict')
@@ -448,6 +453,12 @@ def stage_plot():
 
 
 if __name__ == '__main__':
+    if '--help' in sys.argv or '-h' in sys.argv:
+        print('用法：eval_tail_class_acc.py count|smoke|infer|plot；smoke/infer需要已有模型结果。')
+        raise SystemExit(0)
+    os.makedirs(_ANALYSIS_DIR, exist_ok=True)
+    if len(sys.argv) > 1 and sys.argv[1] in ('smoke', 'infer'):
+        CKPT, OVERALL_ACC = _build_ckpt_and_overall()
     stage = sys.argv[1] if len(sys.argv) > 1 else 'count'
     if stage == 'count':
         stage_count()

@@ -13,8 +13,8 @@ from PIL import Image
 import os
 import re
 
-from src_v2 import merged_dict
-from src_v2.SE_Block import SEBlock as NewSEBlock
+from src_v3 import merged_dict
+from src_v3.SE_Block import SEBlock as NewSEBlock
 
 
 def get_train_folder_len():

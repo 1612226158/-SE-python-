@@ -1,0 +1,80 @@
+"""V3配置与运行目录；导入不创建目录、不读图片、不初始化设备。"""
+from pathlib import Path
+import hashlib
+import json
+import os
+import time
+
+try:
+    from . import model_registry as registry
+except ImportError:
+    import model_registry as registry
+
+V3_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = V3_ROOT.parent
+RUNS_ROOT = V3_ROOT / 'runs'
+CONFIG_FILE = V3_ROOT / 'experiment_config.json'
+
+
+def load_config(path=None):
+    source = Path(path or os.environ.get('V3_CONFIG_FILE', CONFIG_FILE))
+    with source.open(encoding='utf-8') as handle:
+        config = json.load(handle)
+    registry.validate_config_binding(config['CONFIG_ID'], config)
+    normalization = config.get('NORMALIZATION')
+    if not isinstance(normalization, dict):
+        raise ValueError('配置缺少冻结的NORMALIZATION.mean/std')
+    mean, std = normalization.get('mean', []), normalization.get('std', [])
+    if (len(mean) != 3 or len(std) != 3 or
+            not all(isinstance(x, (int, float)) and 0 <= x <= 1 for x in mean) or
+            not all(isinstance(x, (int, float)) and 0 < x <= 1 for x in std)):
+        raise ValueError('NORMALIZATION必须提供三个有效mean和正std')
+    return config
+
+
+def normalization_signature(config):
+    text = json.dumps(config['NORMALIZATION'], sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+
+def run_directory(config_id, seed, smoke=False, runs_root=None):
+    registry.config_for_run(config_id, seed, smoke=smoke)
+    root = Path(runs_root or RUNS_ROOT)
+    tag = f'{config_id}_seed{seed}'
+    return root / '_smoke' / tag if smoke else root / tag
+
+
+def result_path(config_id, seed, runs_root=None):
+    tag = f'{config_id}_seed{seed}'
+    return run_directory(config_id, seed, runs_root=runs_root) / f'results_{tag}.json'
+
+
+def checkpoint_path(config_id, seed, which='last', runs_root=None):
+    if which not in ('last', 'best'):
+        raise ValueError('checkpoint类型必须是last或best')
+    tag = f'{config_id}_seed{seed}'
+    return run_directory(config_id, seed, runs_root=runs_root) / f'checkpoint_{tag}_{which}.pth'
+
+
+def formal_run_directories(runs_root=None):
+    root = Path(runs_root or RUNS_ROOT)
+    if not root.is_dir():
+        return []
+    return sorted(path for path in root.iterdir()
+                  if path.is_dir() and path.name not in ('analyses', '_smoke')
+                  and not path.name.startswith('.'))
+
+
+def configure_process(config=None):
+    config = dict(config or load_config())
+    directory = run_directory(config['CONFIG_ID'], config['SEED'], config.get('SMOKE', False))
+    if config.get('SMOKE', False):
+        directory = directory.with_name(directory.name + '_' + str(time.time_ns()))
+    elif not config.get('RESUME', False) and directory.exists() and any(directory.iterdir()):
+        raise FileExistsError(f'已有运行产物：{directory}；请选择续跑，不能静默覆盖')
+    directory.mkdir(parents=True, exist_ok=True)
+    os.environ['V3_RUN_DIR'] = str(directory)
+    os.environ['V3_NORMALIZATION_SIGNATURE'] = normalization_signature(config)
+    snapshot = dict(config, RUN_DIRECTORY=str(directory))
+    (directory / 'config.json').write_text(json.dumps(snapshot, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+    return directory

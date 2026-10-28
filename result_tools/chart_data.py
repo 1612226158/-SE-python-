@@ -1,33 +1,9 @@
 # -*- coding: utf-8 -*-
-"""
-chart_data.py —— ReportChart 统一实验数据读取模块（2026-09-08 会话8 建立）
+"""V3公共结果读取：仅扫描runs下正式run目录，排除_smoke与analyses。
 
-【目的】消除各绘图脚本里"手写归档 csv 文件名 + 逐档合并"的重复逻辑。
-  之前画图前必须人工查"某模型的数据散落在哪几个 runs/metrics_record*.csv 里"，
-  新实验跑完/归档后还得改脚本。本模块自动扫描 runs/ 下全部 metrics 文件
-  （当前 metrics_record.csv + 所有 metrics_record_archive_*.csv），
-  按 CONFIG_ID（模型英文名）过滤合并 → 画图脚本只需：
-      from chart_data import load_model, model_best, list_models
-      df = load_model('S-NoProG')     # 自动取该模型最完整的 seed，含全部轮次
-      best = model_best('S-NoProG')   # -> (best_val, best_epoch)
-
-【通用性】任何新实验跑完（runs/results_*.json + metrics 归档后）无需改本模块；
-  若模型在跑（metrics_record.csv 实时追加），load_model 也能拿到"截至当前"的数据。
-
-【命令行】本文件同时是只读结果查询入口，不生成或修改训练产物：
-    python chart_data.py list
-    python chart_data.py summary S-NoProg:1 S-NoSE:1
-    python chart_data.py compare S-NoProg:1 S-NoSE:1
-    python chart_data.py data S-NoProg:1
-    python chart_data.py data S-NoProg:1 --json
-    python chart_data.py compare S-NoProg:1 S-NoSE:1 --json
-
-【口径说明】
-  - metrics_record.csv 每行含: config_id,seed,epoch,sampler_seed,train_acc,train_loss,val_acc,val_loss,
-    val_macro_f1,val_weighted_f1,lr,gradient_norm,time_spend_s,state,save_time
-  - Long 配置（G-Full-CAWR-Long=160 轮）续跑产生的 100~159 与源配置 0~99 分处不同 csv，
-    本模块按 (config_id, seed) 合并后去重排序，天然支持。
-  - G-Full 历史 seed0/1 并存：load_model 默认取"行数最完整"的 seed（可显式传 seed 覆盖）。
+按配置/seed读取metrics_record及归档、results与checkpoint路径，校验实验身份。
+查询不构造模型、不读原图；分析输出仅在显式请求时写runs/analyses。
+例：python chart_data.py summary FullUnfreeze:1
 """
 import argparse
 import glob
@@ -37,26 +13,30 @@ import os
 import sys
 import pandas as pd
 
-# ============ 路径（基于本文件定位，与 cwd 无关） ============
+# 路径与训练/队列统一；查询不构造模型或读取图片。
 _HERE = os.path.dirname(os.path.abspath(__file__))
-RUNS = os.path.join(os.path.dirname(_HERE), 'runs')
+_SRC_V3 = os.path.dirname(_HERE)
+if _SRC_V3 not in sys.path:
+    sys.path.insert(0, _SRC_V3)
+from run_paths import formal_run_directories, result_path, checkpoint_path, load_config, normalization_signature
+RUNS = os.path.join(_SRC_V3, 'runs')
 
 # ============ 合并类口径常量（2026-09-26 加：消灭各绘图/评估脚本的硬编码 254） ============
-# **唯一真源 = src_v2/taxonomy.py**（merged_dict + RAW_CLASS_COUNT）。本模块**派生**而非复制：
+# **唯一真源 = src_v3/taxonomy.py**（merged_dict + RAW_CLASS_COUNT）。本模块**派生**而非复制：
 #   口径 = 原始子类文件夹数 − Σ(|组|−1)。
 #   2026-09-26 之前：7 组 18 子类 → 265 − 11 = 254
 #   2026-09-26 起  ：并入「蔬菜+菜根菜叶→菜叶」「插头电线+充电线→插头充电线」
 #                   （组名取「插头充电线」而非「充电器」，避免与既有类别「充电头」(id 68) 语义重叠）
 #                   共 9 组 22 子类 → 265 − 13 = 252
-# ⇒ 改标签体系请**只改 src_v2/taxonomy.py**，本模块的 N_CLS 会自动跟随。
+# ⇒ 改标签体系请**只改 src_v3/taxonomy.py**，本模块的 N_CLS 会自动跟随。
 #   交叉校验：eval_tail_class_acc.build_class_table() 有 assert n_classes == N_CLS；
 #   merge_sim.py 自证 #2b 还会额外比对 chart_data.N_CLS ↔ merged_dict 实际类数 ↔ npz 类数。
 
 
 def _derive_n_cls():
-    """按**文件路径**加载 src_v2/taxonomy.py，返回 (原始子类数, 合并后类数)。
+    """按**文件路径**加载 src_v3/taxonomy.py，返回 (原始子类数, 合并后类数)。
 
-    刻意不用 `import src_v2.taxonomy` —— 那会执行 src_v2/__init__.py 从而拉起 torch，
+    刻意不用 `import src_v3.taxonomy` —— 那会执行 src_v3/__init__.py 从而拉起 torch，
     而本模块要求绘图脚本保持轻量（plot_*.py 不需要 torch）。taxonomy.py 本身只依赖
     hashlib/json/os，按路径加载是安全的。
     """
@@ -76,28 +56,19 @@ try:
     N_CLS_RAW, N_CLS = _derive_n_cls()
 except Exception as _e:      # taxonomy 缺失/改名时不静默：打印告警 + 回退字面常量
     sys.stderr.write(
-        f'[chart_data] ⚠ 无法从 src_v2/taxonomy.py 派生合并类数（{_e.__class__.__name__}: {_e}），'
+        f'[chart_data] ⚠ 无法从 src_v3/taxonomy.py 派生合并类数（{_e.__class__.__name__}: {_e}），'
         f'回退字面常量 265/252 —— 若标签体系已改，此处会画出错误口径，请立即核对。\n')
     N_CLS_RAW = 265          # 数据集原始子类文件夹数（train/ 与 val/ 各 265 个数字文件夹）
     N_CLS = 252              # 合并后模型输出类数 = N_CLS_RAW − Σ(|组|−1)（9 组 22 子类 → 减 13）
 
-# ============ 已知脏记录登记（2026-09-09 加，用户指出"只按文件新旧掩盖症状是严重bug"） ============
-# 背景：调度器 bug（CAWR 误传 val_acc → state2/3 从不重启、lr 贴 1e-6 地板）期间的
-#       G-Full-CAWR seed1 run（70.82 脏成绩）与修复后干净重跑**同名同 seed**并存于归档。
-# 规则：以下 = {归档文件名: {(config_id, seed), ...}}，命中的行一律剔除（行级，不影响
-#       同文件里其他配置的合法数据——该归档还存着 S-NoProg/S-NoSE 等正常 run 的记录）。
-# 今后再出现"已作废重跑的 run"：要么归档时把 csv 放进 runs\DIRTY* 子目录（本模块不扫），
-#       要么在此登记 (文件名, 配置, seed) —— 二者等价，都保证画图/统计永远不会吃到脏数据。
-DIRTY_RECORDS = {
-    # 调度器 bug 期 G-Full-CAWR seed1 脏 run（与 20260908 干净重跑同 tag；val 封顶 ~70.82）
-    'metrics_record_archive_20260905_230315.csv': {('G-Full-CAWR', 1)},
-}
+# V3不继承其他实验目录的历史作废记录。
+DIRTY_RECORDS = {}
 
-# ---------- 模型名 → 元数据（中文全称/短说明）唯一来源 = src_v2\model_registry.py ----------
+# ---------- 模型名 → 元数据（中文全称/短说明）唯一来源 = src_v3\model_registry.py ----------
 # 新增/改模型名一律去 model_registry.py；本模块按 id 索引，注册表缺失时优雅降级为原名。
-_SRC_V2 = os.path.dirname(_HERE)
-if _SRC_V2 not in sys.path:
-    sys.path.insert(0, _SRC_V2)
+_SRC_V3 = os.path.dirname(_HERE)
+if _SRC_V3 not in sys.path:
+    sys.path.insert(0, _SRC_V3)
 try:
     import model_registry as _mr
 except Exception:          # 注册表被隔离/未生成时降级：不查元数据，仅按原名使用
@@ -125,14 +96,10 @@ def is_known(name):
 
 # ---------- 输出文件名推导（2026-09-08 会话8 加：消灭 out*.pdf 硬编码） ----------
 
-# 论文已引用的历史对比标签（document_new.tex \includegraphics 依赖这些文件名，不能变）
-# 键 = (模型A, 模型B)（顺序无关，内部排序后匹配）；值 = 论文文件名里的对比段
+# 当前两基线对比使用本目录的分析标签，不复用既有论文文件名。
 PAIR_TAGS = {
-    ('G-Full-CAWR', 'S-NoProg'): 'progressive_vs_full',
-    ('S-NoProg', 'S-NoSE'):      'snoprog_vs_snose',
-    ('G-Full-CAWR-Long', 'S-NoProg'): 'long_vs_full',
+    ('FullUnfreeze', 'ProgressiveUnfreeze'): 'unfreeze_comparison',
 }
-
 
 def pair_tag(model_a, model_b):
     """由模型对推导文件名对比段：优先命中论文历史标签，否则自动拼 modelA_vs_modelB。
@@ -147,17 +114,21 @@ def fig_out(fig_type, model_a, model_b, out_dir=None):
     """生成绘图输出路径：<out_dir>/<fig_type>_<对比段>.pdf
     fig_type ∈ {loss_curve, val_acc, time_acc, ...}（由调用脚本传图类名）；
     模型对只需在脚本顶部声明一次，文件名（含论文历史标签）自动匹配，无需手写。"""
-    out_dir = out_dir or _HERE
+    out_dir = out_dir or os.path.join(RUNS, 'analyses')
+    os.makedirs(out_dir, exist_ok=True)
     return os.path.join(out_dir, f'{fig_type}_{pair_tag(model_a, model_b)}.pdf')
 
 
 # ---------- 基础扫描 ----------
 
 def all_metrics_files():
-    """返回全部 metrics 文件路径：当前 metrics_record.csv + 所有归档，按名称排序。"""
-    cur = os.path.join(RUNS, 'metrics_record.csv')
-    files = ([cur] if os.path.exists(cur) else [])
-    files += sorted(glob.glob(os.path.join(RUNS, 'metrics_record_archive_*.csv')))
+    """只读正式run子目录的指标，排除_smoke与analyses。"""
+    files = []
+    for directory in formal_run_directories(runs_root=RUNS):
+        current = directory / 'metrics_record.csv'
+        if current.is_file():
+            files.append(str(current))
+        files.extend(str(p) for p in sorted(directory.glob('metrics_record_archive_*.csv')))
     return files
 
 
@@ -307,7 +278,7 @@ def _metric_point(df, column, mode='max'):
 
 def _result_for_run(config_id, seed):
     """读取指定 config/seed 的正式 results JSON；未收官或不可读时返回 None。"""
-    path = os.path.join(RUNS, f'results_{_cid(config_id)}_seed{int(seed)}.json')
+    path = str(result_path(_cid(config_id), int(seed), runs_root=RUNS))
     if not os.path.exists(path):
         return None
     try:
@@ -315,8 +286,18 @@ def _result_for_run(config_id, seed):
             result = json.load(f)
     except (OSError, json.JSONDecodeError):
         return None
-    if result.get('config_id') != _cid(config_id) or int(result.get('seed', -1)) != int(seed):
-        return None
+    if not isinstance(result, dict) or result.get('config_id') != _cid(config_id) or int(result.get('seed', -1)) != int(seed):
+        raise ValueError('V3结果的配置ID/seed身份不匹配')
+    if _mr is None:
+        raise ValueError('V3注册表不可用')
+    preset = _mr.params_of(_cid(config_id))
+    expected = {'backbone': preset['backbone'], 'unfreeze_epochs': preset['unfreeze_epochs'],
+                'experiment_signature': _mr.experiment_signature_of(_cid(config_id)),
+                'normalization_signature': normalization_signature(load_config())}
+    for key, value in expected.items():
+        if result.get(key) != value:
+            raise ValueError(f'V3结果与当前注册配置不一致: {key}')
+
     return result
 
 
@@ -379,6 +360,9 @@ def summarize_run(config_id, seed=None):
         'registered_model': registered_model,
         'status': 'finished' if result else 'incomplete',
         'results_json': bool(result),
+        'backbone': result.get('backbone') if result else None,
+        'unfreeze_epochs': result.get('unfreeze_epochs') if result else None,
+        'experiment_signature': result.get('experiment_signature') if result else None,
         'epochs': {
             'rows': int(len(df)),
             'first': min_epoch,
@@ -518,7 +502,7 @@ def _json_ready(value):
 
 def cli(argv=None):
     """chart_data 命令行入口；成功返回0，数据或参数错误返回2。"""
-    parser = argparse.ArgumentParser(description='Read-only summary of src_v2/runs experiments')
+    parser = argparse.ArgumentParser(description='Read-only summary of src_v3/runs experiments')
     sub = parser.add_subparsers(dest='command')
 
     p_list = sub.add_parser('list', help='list available config/seed runs and epoch ranges')
@@ -600,55 +584,83 @@ def cli(argv=None):
 
 # ---------- 论文口径（results JSON / best checkpoint，与 metrics 略有出入） ----------
 
-def results_best(config_id):
-    """从 results_<config>_seed*.json 读该模型的论文口径最佳值（跑完才生成）。
-    返回 (best_val_acc, best_val_epoch, seed) 取最高 seed；无 results → (None, None, None)。
-    注：results 的 best 是训练结束时汇总的"正式成绩"（如 S-NoProg 82.63@74）；
-    与 model_best()（metrics 口径，如 82.634）可能差 0.00x，引用论文数字请用本函数。"""
+def results_best(config_id, seed=None):
+    """返回正式结果(best_acc, epoch, seed)，显式seed不回退其他运行。"""
     config_id = _cid(config_id)
-    best = None
-    for p in sorted(glob.glob(os.path.join(RUNS, f'results_{config_id}_seed*.json'))):
-        try:
-            import json
-            with open(p, encoding='utf-8') as f:
-                r = json.load(f)
-            seed = int(r.get('seed'))
-            va, ep = r.get('best_val_acc'), r.get('best_val_epoch')
-            if va is None:
-                continue
-            key = (float(va), int(ep), seed)
-            if best is None or key[0] > best[0]:
-                best = key
-        except Exception:
-            continue
-    return best if best else (None, None, None)
-
-
-def best_ckpt_path(config_id, verbose=False):
-    """返回该模型应加载的 best checkpoint 绝对路径（与 results_best 的 seed 对齐；
-    无 results 时退回 glob 到的最高 val_acc 那个 best.pth）。无 → None。
-    论文图/推理脚本只需输入模型英文名即可拿到正确 checkpoint。"""
-    config_id = _cid(config_id)
-    _, _, seed = results_best(config_id)
-    cands = sorted(glob.glob(os.path.join(RUNS, f'checkpoint_{config_id}_seed*_best.pth')))
-    if not cands:
-        return None
     if seed is not None:
-        p = os.path.join(RUNS, f'checkpoint_{config_id}_seed{seed}_best.pth')
-        if os.path.exists(p):
-            return p
-    # 退回：读各 best.pth 的 val_acc 取最高（需 torch；懒加载）
-    import torch
-    best_p, best_v = None, None
-    for p in cands:
-        try:
-            ck = torch.load(p, map_location='cpu')
-            v = ck.get('val_acc')
-            if v is not None and (best_v is None or v > best_v):
-                best_p, best_v = p, v
-        except Exception:
+        result = _result_for_run(config_id, seed)
+        return ((float(result['best_val_acc']), int(result['best_val_epoch']), int(seed))
+                if result else (None, None, None))
+    candidates = []
+    for directory in formal_run_directories(runs_root=RUNS):
+        prefix = config_id + '_seed'
+        if not directory.name.startswith(prefix):
             continue
-    return best_p
+        selected_seed = int(directory.name[len(prefix):])
+        result = _result_for_run(config_id, selected_seed)
+        if result:
+            candidates.append((float(result['best_val_acc']), int(result['best_val_epoch']), selected_seed))
+    return max(candidates, key=lambda value: value[0]) if candidates else (None, None, None)
+
+
+def best_ckpt_path(config_id, verbose=False, seed=None):
+    """只定位本run的best文件，不隐式加载权重猜测seed。"""
+    config_id = _cid(config_id)
+    if seed is None:
+        _, _, seed = results_best(config_id)
+    if seed is None:
+        return None
+    path = checkpoint_path(config_id, int(seed), which='best', runs_root=RUNS)
+    return str(path) if path.is_file() else None
+
+
+def load_run_frames(config_ids, seeds=(1, 2), require_complete=True):
+    """公共多run入口；显式seed、正式结果/连续轮次及协议一致性检查。"""
+    frames, summaries, protocols = {}, {}, []
+    for config_id in config_ids:
+        for seed in seeds:
+            key = (_cid(config_id), int(seed))
+            summary = summarize_run(*key)
+            frame = load_model(*key, verbose=False)
+            if require_complete:
+                epochs = summary['epochs']
+                if (not summary['results_json'] or not epochs['continuous_from_zero']
+                        or epochs['rows'] != epochs['target']
+                        or epochs['last'] != epochs['target'] - 1):
+                    raise ValueError(f'Incomplete run: {key}')
+                official = summary['official_best_val_acc']
+                observed = summary['metrics_best_val_acc']
+                if (round(observed['value'], 4) != round(official['value'], 4)
+                        or observed['epoch'] != official['epoch']):
+                    raise ValueError(f'Results/metrics mismatch: {key}')
+            frames[key], summaries[key] = frame, summary
+            protocols.append(summary['protocol'])
+    if require_complete and any(p != protocols[0] for p in protocols):
+        raise ValueError('Run protocols differ')
+    return frames, summaries
+
+
+def window_statistics(frame, start=0, stop=100):
+    """半开epoch窗口，loss面积/下降斜率及真实记录用时；不平滑或排异常轮。"""
+    import numpy as np
+    selected = frame[(frame.epoch >= start) & (frame.epoch < stop)]
+    if len(selected) != stop - start:
+        raise ValueError(f'Missing epochs in [{start}, {stop})')
+    x = selected.epoch.to_numpy(float)
+    hours = selected.time_spend_s.to_numpy(float).cumsum() / 3600
+    result = {'start': start, 'stop_exclusive': stop, 'n_epochs': len(selected),
+              'hours': float(hours[-1])}
+    for column in ('train_loss', 'val_loss'):
+        y = selected[column].to_numpy(float)
+        result[column] = {
+            'first': float(y[0]), 'last': float(y[-1]), 'mean': float(y.mean()),
+            'minimum': float(y.min()), 'endpoint_drop': float(y[0] - y[-1]),
+            'slope_per_epoch': float(np.polyfit(x, y, 1)[0]),
+            'slope_per_hour': float(np.polyfit(hours, y, 1)[0]),
+            'normalized_auc_epoch': float(np.trapz(y, x) / (x[-1] - x[0])),
+            'normalized_auc_time': float(np.trapz(np.r_[y[0], y], np.r_[0., hours]) / hours[-1]),
+        }
+    return result
 
 
 if __name__ == '__main__':

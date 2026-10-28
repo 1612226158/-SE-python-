@@ -1,10 +1,27 @@
 {
-  "CONFIG_ID": "G-Full-CAWR",
+  "CONFIG_ID": "FullUnfreeze",
   "SEED": 1,
-  "SMOKE": false,
-  "MAX_EPOCHS": 100,
-  "RESUME": true,
-  "AUTO": true,
-  "UNFREEZE1_EPOCH": 30,
-  "UNFREEZE2_EPOCH": 60
+  "SMOKE": true,
+  "MAX_EPOCHS": 3,
+  "RESUME": false,
+  "AUTO": false,
+  "TRAINING_PROTOCOL_TARGET": 3,
+  "NOTE": "train.py默认按本配置运行；SMOKE=true为3轮。run_queue.py顺序运行六项100轮；--check只读检查。",
+  "UNFREEZE1_EPOCH": null,
+  "UNFREEZE2_EPOCH": null,
+  "BACKBONE": "resnext50_32x4d",
+  "EXPERIMENT_SIGNATURE": "92f214bdf1cd0ea86aaa07dfb2fb35c5a3065ee33ae8bda069664514ba4169e1",
+  "NORMALIZATION": {
+    "mean": [
+      0.6400883197784424,
+      0.5966888666152954,
+      0.5522977709770203
+    ],
+    "std": [
+      0.2221754938364029,
+      0.22977685928344727,
+      0.24140368402004242
+    ],
+    "historical_statistics_skip_number": 590
+  }
 }

@@ -1,3 +1,16 @@
+import os as _entry_os
+import sys as _entry_sys
+from pathlib import Path as _EntryPath
+_entry_dir = _EntryPath(__file__).resolve().parent
+for _entry_path in (str(_entry_dir), str(_entry_dir.parent)):
+    if _entry_path not in _entry_sys.path:
+        _entry_sys.path.insert(0, _entry_path)
+if __name__ == '__main__':
+    from launch_checks import handle_cli as _handle_cli
+    if _handle_cli('train'):
+        raise SystemExit(0)
+    from run_paths import configure_process as _configure_process
+    _configure_process()
 import random
 import sys
 import time
@@ -43,11 +56,11 @@ from calculate import (calculate_mean_and_std,
                        get_output_class_sample_counts,
                        get_class_weight, hierarchical_collate_fn)
 from calculate_update import SafeImageFolder as NewSafeImageFolder
-from src_v2 import (device, DynamicMeanPad,
+from src_v3 import (device, DynamicMeanPad,
                     pth_file_name, save_model_after_epoch,
                     extensions_suffix, merged_dict, ACC_STOP, ERROR_RATE,
                     TRAIN_NUM_WORKERS, VAL_NUM_WORKERS)
-from src_v2.taxonomy import (
+from src_v3.taxonomy import (
     EXPECTED_NUM_CLASSES,
     LABEL_SCHEMA_DEFINITION_HASH,
     LABEL_SCHEMA_ID,
@@ -58,10 +71,10 @@ from src_v2.taxonomy import (
 # from batch_size import adjust_batch_size
 
 # ==================== 实验配置：编辑同目录 experiment_config.json（无需改本文件） ====================
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'experiment_config.json')
+CONFIG_FILE = os.environ.get('V3_CONFIG_FILE', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'experiment_config.json'))
 _DEFAULTS = {
-    'CONFIG_ID': 'G-Full',   # 配置 id 以 model_registry.py 的 MODELS 为准（含 S-StdSE）
-    'SEED': 0,               # 随机种子 0/1/2，每配置跑 3 次取 mean±std
+    'CONFIG_ID': 'FullUnfreeze',  # 默认首批全解冻NoTF基线
+    'SEED': 1,               # 随机种子 0/1/2，每配置跑 3 次取 mean±std
     'SMOKE': True,           # True=冒烟只跑 3 轮验证管线；正式训练 False
     'MAX_EPOCHS': 100,
     'RESUME': False,         # True=从 runs 下断点续跑（支持中途暂停后继续）
@@ -90,63 +103,70 @@ CONFIG_ID = _cfg.get('CONFIG_ID', _DEFAULTS['CONFIG_ID'])
 SEED = _cfg.get('SEED', _DEFAULTS['SEED'])
 SMOKE = _cfg.get('SMOKE', _DEFAULTS['SMOKE'])
 if SMOKE:
-    MAX_EPOCHS = 100
+    MAX_EPOCHS = 3
     RESUME = False
 else:
     MAX_EPOCHS = _cfg.get('MAX_EPOCHS', _DEFAULTS['MAX_EPOCHS'])
     RESUME = _cfg.get('RESUME', _DEFAULTS['RESUME'])
 AUTO = _cfg.get('AUTO', _DEFAULTS['AUTO'])
-UNFREEZE1_EPOCH = _cfg.get('UNFREEZE1_EPOCH', _DEFAULTS['UNFREEZE1_EPOCH'])
-UNFREEZE2_EPOCH = _cfg.get('UNFREEZE2_EPOCH', _DEFAULTS['UNFREEZE2_EPOCH'])
 SNAPSHOT_EPOCH = _cfg.get('SNAPSHOT_EPOCH', _DEFAULTS['SNAPSHOT_EPOCH'])
 ALLOW_LEGACY_PROTOCOL_RESUME = _cfg.get('ALLOW_LEGACY_PROTOCOL_RESUME',
                                         _DEFAULTS['ALLOW_LEGACY_PROTOCOL_RESUME'])
 
-# ==================== 预设配置表 PRESETS ====================
-# 【命名族谱（2026-09-05，防混淆必读）】
-#   前缀：G- = 渐进式解冻家族（unfreeze='progressive'，30/60 触发三层解冻）
-#         S- = 全解冻家族    （unfreeze='none'，从头到尾全参数训练）
-#   后缀：-CAWR = state2/3 用 CAWR 调度（+ backbone/head lr 提为 1e-4）
-#         无后缀 = state2/3 用 RLRP 调度（早期 RLRP 时代，数字已过时，仅留档）
-#   SE 开关：regions=[1,2]=多区域SE；regions=[1]=标准全局SE；regions=None=无SE（消融用）
-# 【"无SE"三兄弟——最容易混淆，务必按前缀区分】
-#   G-NoSE       = 渐进式+RLRP+无SE（早期消融，已完成留档，勿再跑）
-#   G-NoSE-CAWR  = 渐进式+CAWR+无SE（早期对照，已弃用——主模型候选已转全解冻，见下）
-#   S-NoSE       = 全解冻+CAWR+无SE（★当前 SE 消融，对照 S-NoProg）
-# 【当前主模型候选 = S-NoProg（全解冻+SE，82.63%@74）；其 SE 消融 = S-NoSE】
-# 【模型定义唯一真源 = src_v2\model_registry.py（2026-09-09 会话9 拆出）】
-# 改模型参数 / 中文名 / 家族 / 目标轮数 / 新增模型 → 去 model_registry.py 改 MODELS 条目；
-# 本文件只做别名导入（行为与旧 PRESETS 完全一致），不再单独维护字典。
-# 命名族谱与"无SE 三兄弟"防混淆说明见 model_registry.py 顶部 docstring。
-from model_registry import MODEL_PARAMS as PRESETS
-unfreeze_mode = PRESETS[CONFIG_ID]['unfreeze']
-# state2/3 的调度器：'cawr'=余弦退火重启（G-Full-CAWR 用，与 S-NoProg 同类型，隔离"RLRP 地板"混淆）；缺省='rlrp'（原行为）
-SCHEDULER_MODE = PRESETS[CONFIG_ID].get('scheduler', 'rlrp')
-# 渐进式解冻的 backbone/head 学习率：G-Full-CAWR 用 1e-4（对齐 S-NoProg，隔离 lr 幅度混淆）；其余默认 5e-6/5e-5
-BACKBONE_LR = 1e-4 if SCHEDULER_MODE == 'cawr' else 5e-6
-HEAD_LR = 1e-4 if SCHEDULER_MODE == 'cawr' else 5e-5
+# 注册表为骨干、解冻时点和共同训练策略的唯一来源。
+import model_registry
+PRESETS = model_registry.MODEL_PARAMS
+model_registry.validate_config_binding(CONFIG_ID, _cfg)
+PRESET = model_registry.params_of(CONFIG_ID)
+unfreeze_mode = PRESET['unfreeze']
+BACKBONE_NAME = PRESET['backbone']
+UNFREEZE_EPOCHS = model_registry.unfreeze_epochs_of(CONFIG_ID)
+UNFREEZE1_EPOCH, UNFREEZE2_EPOCH = UNFREEZE_EPOCHS if UNFREEZE_EPOCHS else (None, None)
+TRAINING_POLICY = model_registry.training_policy_of(CONFIG_ID)
+EXPERIMENT_SIGNATURE = model_registry.experiment_signature_of(CONFIG_ID)
+NORMALIZATION_SIGNATURE = os.environ.get('V3_NORMALIZATION_SIGNATURE')
+SCHEDULER_MODE = PRESET['scheduler']
+BACKBONE_LR = TRAINING_POLICY['backbone_lr']
+HEAD_LR = TRAINING_POLICY['head_lr']
+if ALLOW_LEGACY_PROTOCOL_RESUME:
+    raise ValueError('V3实验不允许绕过协议校验接续旧训练')
 
 
-def _make_state_scheduler(optimizer):
-    """构建 state2/3 的调度器：SCHEDULER_MODE='cawr' 时用 CAWR，否则用 RLRP（原行为不变）。"""
-    if SCHEDULER_MODE == 'cawr':
-        return CosineAnnealingWarmRestarts(optimizer, T_0=5, T_mult=2, eta_min=1e-6)
-    return ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2,
-                             threshold=0.1, min_lr=1e-6, verbose=True)
+def _make_optimizer(model):
+    # 从开始就保留全部参数组；冻结参数无梯度，解冻时不重建优化器。
+    return optim.AdamW(model.get_grouped_params(BACKBONE_LR, HEAD_LR, include_frozen=True),
+                       weight_decay=TRAINING_POLICY['weight_decay'])
+
+
+def _advance_unfreeze_stage(model, state, epoch):
+    """按注册时点切换梯度；不重建优化器或重启调度器。"""
+    target = 3 if unfreeze_mode == 'none' else 1 + sum(epoch >= e for e in UNFREEZE_EPOCHS)
+    if target < state:
+        raise RuntimeError('解冻状态与当前epoch不一致')
+    if target != state:
+        model.freeze_backbone()
+        if target == 2:
+            model.unfreeze_layer4()
+        elif target == 3:
+            model.unfreeze_all()
+        logging.info(f'解冻状态 {state}->{target} 于epoch {epoch}；optimizer/lr状态保持')
+    return target
+
 
 # 路径全部基于本文件定位（与 PyCharm 工作目录无关）
 SRC_V2_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SRC_V2_DIR)
-RUNS_DIR = os.path.join(SRC_V2_DIR, 'runs')
-os.makedirs(RUNS_DIR, exist_ok=True)
+RUNS_DIR = os.environ.get('V3_RUN_DIR', os.path.join(SRC_V2_DIR, 'runs'))
+if __name__ == '__main__':
+    os.makedirs(RUNS_DIR, exist_ok=True)
 TRAIN_ROOT = os.path.join(PROJECT_ROOT, 'train')
 VAL_ROOT = os.path.join(PROJECT_ROOT, 'val')
 
 RUN_TAG = f'{CONFIG_ID}_seed{SEED}'
 BEST_PTH = os.path.join(RUNS_DIR, f'checkpoint_{RUN_TAG}_best.pth')
 LAST_PTH = os.path.join(RUNS_DIR, f'checkpoint_{RUN_TAG}_last.pth')
-# 训练协议版本 2：AMP 梯度裁剪前显式 unscale，并在断点中保存全局 best / GradScaler 状态。
-TRAINING_PROTOCOL_VERSION = 2
+# 协议3：骨干/时点绑定、统一优化器/全局调度/BN及实验签名；完整启动仍受未就绪限制。
+TRAINING_PROTOCOL_VERSION = 3
 # 采样协议版本 1：每个绝对 epoch 使用可独立重建的 sampler seed，续跑不再重放随机流开头。
 SAMPLING_PROTOCOL_VERSION = 1
 SAMPLER_SEED_STRIDE = 1_000_000
@@ -463,24 +483,7 @@ def train_and_validate(model,
             sleep_all_spend += EPOCH_PERIOD_time
             print("开始继续工作！")
             time.sleep(5)  # 防止print信息串行
-        if unfreeze_mode == 'progressive':
-            # 按固定 epoch 触发解冻，保证不同实验的训练路径可比
-            if state == 1 and epoch >= UNFREEZE1_EPOCH:
-                model.unfreeze_layer4()
-                optimizer = optim.AdamW(model.get_grouped_params(backbone_lr=BACKBONE_LR, head_lr=HEAD_LR),
-                                        weight_decay=1e-2,
-                                        )
-                scheduler = _make_state_scheduler(optimizer)
-                state += 1
-                logging.info(f'state1 -> state2 于 epoch {epoch}（固定触发）')
-            elif state == 2 and epoch >= UNFREEZE2_EPOCH:
-                model.unfreeze_all()
-                optimizer = optim.AdamW(model.get_grouped_params(backbone_lr=BACKBONE_LR, head_lr=HEAD_LR),
-                                        weight_decay=1e-2,
-                                        )
-                scheduler = _make_state_scheduler(optimizer)
-                state += 1
-                logging.info(f'state2 -> state3 于 epoch {epoch}（固定触发）')
+        state = _advance_unfreeze_stage(model, state, epoch)
 
         # 每个绝对 epoch 独立播种采样器：无论中途重启多少次，同一 run_seed/epoch
         # 都会得到相同的 WeightedRandomSampler 索引序列；persistent_workers 保持不变。
@@ -597,6 +600,10 @@ def train_and_validate(model,
                         'arch': type(model).__name__,
                         'model_metadata': _model_metadata(model),
                         'model_signature_sha256': _model_identity(model)[1],
+                        'experiment_signature': EXPERIMENT_SIGNATURE,
+                        'normalization_signature': NORMALIZATION_SIGNATURE,
+                        'backbone': BACKBONE_NAME, 'unfreeze_epochs': UNFREEZE_EPOCHS,
+                        'training_policy': TRAINING_POLICY,
                         'state_dict': model.state_dict(), 'val_acc': val_accuracy[0],
                         'best_val_acc': best_val_acc,
                         'best_epoch': best_epoch,
@@ -739,6 +746,10 @@ def train_and_validate(model,
                         'arch': type(model).__name__,
                         'model_metadata': _model_metadata(model),
                         'model_signature_sha256': _model_identity(model)[1],
+                        'experiment_signature': EXPERIMENT_SIGNATURE,
+                        'normalization_signature': NORMALIZATION_SIGNATURE,
+                        'backbone': BACKBONE_NAME, 'unfreeze_epochs': UNFREEZE_EPOCHS,
+                        'training_policy': TRAINING_POLICY,
                         'state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
                         'scheduler_state_dict': scheduler.state_dict(),
@@ -802,6 +813,10 @@ def train_and_validate(model,
         'unfreeze_mode': unfreeze_mode,
         'model_metadata': _model_metadata(model),
         'model_signature_sha256': _model_identity(model)[1],
+        'experiment_signature': EXPERIMENT_SIGNATURE,
+                        'normalization_signature': NORMALIZATION_SIGNATURE,
+        'backbone': BACKBONE_NAME, 'unfreeze_epochs': UNFREEZE_EPOCHS,
+        'training_policy': TRAINING_POLICY,
         'save_time': datetime.strftime(datetime.now(), '%Y-%m-%d %H:%M:%S'),
     }
     with open(os.path.join(RUNS_DIR, f'results_{RUN_TAG}.json'), 'w', encoding='utf-8') as f:
@@ -1045,16 +1060,9 @@ def main(num_epochs, epoch_start=0, checkpoint=None, optimizer_scheduler_YN=Fals
     #     num_warmup_steps=warmup_steps,
     #     num_training_steps=total_steps
     # )
-    if unfreeze_mode == 'none' or state == 1:
-        scheduler = CosineAnnealingWarmRestarts(
-            optimizer,
-            T_0=5,  # 每 5 轮重启一次
-            T_mult=2,  # 周期递增
-            eta_min=1e-6  # 最低学习率
-        )
-    else:
-        # 续跑且 state>=2 时：建对应类型的调度器（G-Full-CAWR 用 CAWR，其余 RLRP），load_state_dict 才能对上
-        scheduler = _make_state_scheduler(optimizer)
+    scheduler = CosineAnnealingWarmRestarts(
+        optimizer, T_0=TRAINING_POLICY['t_0'], T_mult=TRAINING_POLICY['t_mult'],
+        eta_min=TRAINING_POLICY['eta_min'])
     if optimizer_scheduler_YN:
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         if checkpoint is not None and 'scheduler_state_dict' in checkpoint:
@@ -1178,11 +1186,14 @@ def _model_identity(model):
 
 def _check_model_identity(checkpoint, model):
     """新格式断点必须与当前精确结构一致；旧断点缺签名时保留兼容警告。"""
+    if NORMALIZATION_SIGNATURE and checkpoint.get('normalization_signature') != NORMALIZATION_SIGNATURE:
+        raise RuntimeError('断点归一化参数与当前配置不一致，拒绝续跑')
+    if checkpoint.get('experiment_signature') != EXPERIMENT_SIGNATURE:
+        raise RuntimeError('断点骨干/解冻时点/共同训练策略与当前实验不一致，拒绝续跑')
     expected_metadata, expected_signature = _model_identity(model)
     actual_signature = checkpoint.get('model_signature_sha256')
     if actual_signature is None:
-        logging.warning('[model_signature] 旧断点无结构签名；仅依赖arch与strict state_dict校验')
-        return
+        raise RuntimeError('V3断点缺少模型结构签名，拒绝续跑')
     if actual_signature != expected_signature:
         raise RuntimeError(
             '断点模型结构签名与当前配置不一致，拒绝续跑。'
@@ -1200,6 +1211,10 @@ def _validate_model_before_training(model, preset):
             f'实际模型={type(model).__name__}')
 
     metadata, signature = _model_identity(model)
+    if metadata['backbone'] != preset['backbone']:
+        raise RuntimeError('实际骨干与注册配置不一致')
+    if metadata['feature_dim'] != model_registry.BACKBONE_FEATURE_DIMS[preset['backbone']]:
+        raise RuntimeError('骨干输出通道与注册配置不一致')
     if metadata['num_classes'] != EXPECTED_NUM_CLASSES:
         raise RuntimeError(
             f'模型输出头应为 {EXPECTED_NUM_CLASSES} 类，实际 {metadata["num_classes"]} 类')
@@ -1224,23 +1239,15 @@ def _validate_model_before_training(model, preset):
 
 
 def _build_model(preset, transformer_layers, d_model, nhead, id_to_main_class, renew_class_to_index):
-    """按 PRESET 构建模型：preset['model']=='v2' → ResNetTransformerV2（修正版49-token Transformer）；
-    缺省/'v1' → ResNetTransformer（原版，seq_len=1）。两版构造参数签名兼容。"""
-    if preset.get('model') == 'v2':
-        return ResNetTransformerV2(transformer_layers=transformer_layers,
-                                   d_model=d_model,
-                                   id_to_main_class=id_to_main_class,
-                                   renew_class_to_index=renew_class_to_index,
-                                   nhead=nhead,
-                                   regions=preset['regions'],
-                                   use_decouple=preset['use_decouple'])
-    return ResNetTransformer(transformer_layers=transformer_layers,
-                             d_model=d_model,
-                             id_to_main_class=id_to_main_class,
-                             renew_class_to_index=renew_class_to_index,
-                             nhead=nhead,
-                             regions=preset['regions'],
-                             use_decouple=preset['use_decouple'])
+    """按当前注册骨干构造同一NoTF空间头；不回退到其他模型。"""
+    if preset.get('model') != 'v2':
+        raise ValueError('当前V3注册仅支持空间模型实现')
+    return ResNetTransformerV2(
+        transformer_layers=transformer_layers, d_model=d_model, nhead=nhead,
+        id_to_main_class=id_to_main_class, renew_class_to_index=renew_class_to_index,
+        regions=preset['regions'], use_decouple=preset['use_decouple'],
+        backbone_name=preset['backbone'], pretrained=preset['pretrained'],
+        backbone_bn_policy=TRAINING_POLICY['backbone_bn_policy'])
 
 
 if __name__ == '__main__':
@@ -1356,19 +1363,9 @@ if __name__ == '__main__':
             model.unfreeze_layer4()
     # state
     if unfreeze_mode == 'none':
-        # S-NoProg：全程全解冻 + 单一 AdamW（常规训练对照）
         model.unfreeze_all()
-        optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
-    elif state == 1:
-        optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()),
-                                lr=1e-4,
-                                # weight_decay=1e-4,
-                                weight_decay=5e-4,
-                                )
-    else:
-        optimizer = optim.AdamW(model.get_grouped_params(backbone_lr=BACKBONE_LR, head_lr=HEAD_LR),
-                                weight_decay=1e-2,
-                                )
+        state = 3
+    optimizer = _make_optimizer(model)
     if key in ['y', 'yes']:
         optimizer_scheduler_YN = True
     else:

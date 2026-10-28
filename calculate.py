@@ -19,10 +19,10 @@ from tqdm import tqdm
 from PIL import Image, ImageFile
 import pillow_avif  # 导入 AVIF 支持插件
 
-from src_v2 import merged_dict, metrics_file
+from src_v3 import merged_dict, metrics_file
 
-from src_v2 import extensions_suffix
-from src_v2.taxonomy import generate_label_mappings
+from src_v3 import extensions_suffix
+from src_v3.taxonomy import generate_label_mappings
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True  # 忽略部分损坏的图片
 
@@ -327,99 +327,14 @@ class ConvertToRGB:
         return img.convert('RGB')  # 其他情况直接转换为 RGB
 
 
-def calculate_mean_and_std(file: str = None,
-                           retrieve_file: bool = True,
-                           update: bool = False,
-                           color_bias_threshold: float = 0.8
-                           ):
-    """
-    :param file: 模型文件夹
-    :param retrieve_file: 是否从历史文件中读取
-    :param update: 是否更新文件, 前提是retrieve_file为False
-    :param color_bias_threshold: 定义剔除阈值, 默认0.8
-    :return: mean, std, skip_number
-    """
-    file_calculate_number = os.path.join(_ORIGINAL_SRC_DIR, 'calculate.config')
-    if retrieve_file and os.path.exists(file_calculate_number):
-        config = configparser.ConfigParser()
-        config.read(file_calculate_number)
-        try:
-            mean = torch.tensor(list(map(float, config["Statistics"]["mean"].split(","))))
-            std = torch.tensor(list(map(float, config["Statistics"]["std"].split(","))))
-            skip_number = config["Statistics"]["skip_number"]
-            return mean, std, int(skip_number)
-        except KeyError:
-            pass
-
-    # 数据集加载
-    transform = transforms.Compose([
-        ConvertToRGB(),
-        transforms.ToTensor()  # 将图片转换为Tensor
-    ])
-
-    dataset = SafeImageFolder(root=file, transform=transform)
-    loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=2)  # 每次处理一张图片
-
-    train_loader_len = len(loader)
-
-    # 初始化累积量
-    mean = torch.zeros(3)  # RGB三通道
-    std = torch.zeros(3)
-    valid_image_count = 0  # 有效图片计数
-    skip_number = 0
-
-    # 定义剔除阈值
-    # color_bias_threshold = 0.8  # 如果某通道均值超过总均值的80%，认为有明显偏向
-
-    with tqdm(total=train_loader_len) as tq:
-        for images, _ in loader:
-            # print("断点1")
-            # images形状为 (1, 3, H, W)
-            images = images.view(3, -1)  # 展平为 (3, H*W)
-            # print("断点2")
-            channel_means = images.mean(1)  # 计算每个通道的均值
-            # print("断点3")
-            channel_total_mean = channel_means.mean()  # 所有通道的整体均值
-            # print("断点4")
-            tq.update(1)
-            max_deviation = torch.abs(channel_means - channel_total_mean).max() / channel_total_mean
-
-            if max_deviation > color_bias_threshold:
-                skip_number += 1
-                continue  # 跳过偏色图片
-
-            image_std = images.std(dim=1)
-            # 检查标准差是否为零（即纯色图像）
-            if torch.all(image_std == 0):  # 如果所有通道的标准差都是零，说明是纯色图片
-                skip_number += 1
-                continue  # 跳过纯色图片
-
-            # 检查标准差是否为 NaN
-            if torch.any(torch.isnan(image_std)):
-                skip_number += 1
-                continue
-
-            # 累积均值和标准差
-            mean += channel_means
-            std += image_std
-            valid_image_count += 1
-
-    # 计算最终均值和标准差
-    if valid_image_count > 0:
-        mean /= valid_image_count
-        std /= valid_image_count
-
-    if update or not os.path.exists(file_calculate_number):
-        config = configparser.ConfigParser()
-        config["Statistics"] = {
-            "mean": ",".join(map(str, mean.tolist())),  # 转为逗号分隔的字符串
-            "std": ",".join(map(str, std.tolist())),
-            "skip_number": str(skip_number)
-        }
-        with open(file_calculate_number, "w") as fp:
-            config.write(fp)
-
-    return mean, std, skip_number
+def calculate_mean_and_std(file=None, retrieve_file=True, update=False, color_bias_threshold=0.8):
+    """只读本次配置冻结的归一化参数；不扫描图片或回写原项目配置。"""
+    if not retrieve_file or update:
+        raise ValueError('V3训练使用冻结归一化参数；重算统计应使用单独的数据审计任务')
+    from run_paths import load_config
+    normalization = load_config()['NORMALIZATION']
+    return (torch.tensor(normalization['mean']), torch.tensor(normalization['std']),
+            int(normalization.get('historical_statistics_skip_number', 0)))
 
 
 # 计算 Gini 系数
@@ -615,7 +530,7 @@ def add_record_metrics_v2(epoch=-1,
                           state=1):
     """新增实验记录 v2：纯数值列 + 采样/标签协议，写入 src_v2/runs/metrics_record.csv。
     原 metrics.csv（旧 18 列）仍由 add_record_metrics 照常写入，二者并存互不影响。"""
-    runs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'runs')
+    runs_dir = os.path.dirname(metrics_file)
     os.makedirs(runs_dir, exist_ok=True)
     record_file = os.path.join(runs_dir, 'metrics_record.csv')
 

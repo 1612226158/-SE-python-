@@ -4,8 +4,6 @@
 原始数据目录仍保留 265 个细类；本模块只定义训练时的逻辑合并、最终索引和可复核指纹。
 该模块不依赖 torch/torchvision，训练队列和轻量自检可以直接导入。
 """
-from __future__ import annotations
-
 import hashlib
 import json
 import os

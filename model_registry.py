@@ -1,213 +1,171 @@
 # -*- coding: utf-8 -*-
+"""V3 NoTF实验注册表：配置ID、骨干和解冻时点的唯一来源。
+
+保留两个已命名基线；新增早/晚解冻及ResNet18/34全解冻。
+不构造骨干与时点的笛卡尔积。model/arch='v2'是内部模型实现键。
+当前六项共同使用NoTF，不在ID中重复写系列/基线前缀。首轮均seed1、100轮。
 """
-model_registry.py —— 模型"配置/名字/元数据"唯一注册表（2026-09-09 会话9 建立）
+from copy import deepcopy
+import hashlib
+import json
 
-【为什么存在】此前模型定义散落 4 处、新增一个模型要改 4 个文件：
-  - train.py 的 PRESETS（训练参数）          → 现为 MODEL_PARAMS 的别名导入
-  - predict_gui_snoprog.py 的 MODEL_REGISTRY（推理参数+短说明）/ CN_NAMES（中文全称）/ TARGET_EPOCHS
-  - run_queue.py 的 QUEUE 注释里的基线数字      → 队列顺序仍留 run_queue.py（本文件只管"模型是什么"）
-  - ReportChart 各脚本对模型英文名的使用         → chart_data.py 经本文件校验/查中文名
-
-【以后怎么改】
-  - 改模型参数 / 中文名 / 家族 / 目标轮数 / 新增模型 → 只改本文件（在 MODELS 里加/改一个条目）
-  - 选择"跑哪些模型、什么顺序" → 去 run_queue.py 改 QUEUE（引用的 id 必须是本文件注册过的）
-  - ReportChart / GUI / train.py 均自动跟随（按 id 索引本文件），无需再各自登记
-  - 新增模型 = MODELS 加条目（params 必须能被 train.py 用）+ run_queue QUEUE 加一行，即完成
-
-【命名族谱（与 train.py / run_queue.py 语义一致，别混）】
-  G- = 渐进式解冻（state1→2 @30轮、state2→3 @60轮 固定触发）；S- = 全解冻（unfreeze='none'）
-  -CAWR = state2/3 或全程用 CAWR 调度（T_0=5, T_mult=2, eta_min=1e-6）；无后缀 = RLRP 旧时代（已过时仅留档）
-  V2- = 修正版 Transformer 头（ResNetTransformerV2：7×7=49 patch token + pos_embed + patch-emb dropout 0.1，
-        替代 v1 头 avgpool 1×1 单 token + dropout 0.5 + 退化 seq_len=1 注意力的组合）
-  SE 开关：regions=[1,2]=多区域SE / [1]=标准全局SE / None=无SE；transformer_layers=3（有栈）/ 0（去栈，V2-NoTF）
-  ★ key 大小写规范：注册表与 runs/ 文件名一律用规范 key（如 'S-NoProg' 小写 g）；
-    论文/叙述里的 "S-NoProG"（大写 G）只是显示写法，经 ALIASES 归一化到规范 key。
-
-【历史状态基线（results JSON 权威，254 类/CAWR 旧标签口径；新 252 类协议须重跑）】
-  S-NoProg 82.63@74 / S-NoSE 82.53@73（SE≈0.10pp）/ G-Full-CAWR 80.96@92（调度器修复后干净重跑）
-  G-Full-CAWR-Long 83.565@132（160轮）/ V2-Full 83.353@74（vs S-NoProG +0.72pp，n=1 初步）
-  V2-NoTF 跑中（09-09）/ G-V2 立项排队（2×2 第四格）
-"""
-from __future__ import annotations
-
-# =====================================================================
-# MODELS —— 唯一事实来源。字段：
-#   params:        训练参数 dict（= 原 train.py PRESETS 条目，train.py 直接引用）
-#   arch:          'v1'=ResNetTransformer（seq_len=1 退化）/ 'v2'=ResNetTransformerV2（49-token 真注意力）
-#                  （留空则由 params['model']=='v2' 推导，默认 v1）
-#   short:         短说明（GUI 报错/提示用）
-#   cn:            中文全称（GUI 说明行 / 文档 / 汇报用）
-#   target_epochs: 完整训练轮数目标（Long=160，其余 100；GUI 进度显示用）
-#   note:          补充说明（状态/成绩，仅注释性质）
-# =====================================================================
-MODELS = {
-    # —— G 系列：渐进式解冻（30/60 固定触发）——
-    'G-Full': {
-        'params': dict(regions=[1, 2], transformer_layers=3, use_decouple=True, unfreeze='progressive'),
-        'short': '渐进式·RLRP旧基线',
-        'cn': '渐进式解冻·RLRP调度·含多区域SE（历史基线）',
-        'target_epochs': 100,
-        'note': 'RLRP 时代主结果（56.88 过时，仅留档）',
-    },
-    'G-NoSE': {
-        'params': dict(regions=None, transformer_layers=3, use_decouple=True, unfreeze='progressive'),
-        'short': '渐进式·无SE·RLRP',
-        'cn': '渐进式解冻·RLRP调度·无多区域SE（历史基线）',
-        'target_epochs': 100,
-        'note': 'RLRP 旧消融（已完成留档，勿再跑）',
-    },
-    'G-Full-CAWR': {
-        'params': dict(regions=[1, 2], transformer_layers=3, use_decouple=True, unfreeze='progressive', scheduler='cawr'),
-        'short': '渐进式+CAWR调度',
-        'cn': '渐进式解冻·CAWR调度·含多区域SE',
-        'target_epochs': 100,
-        'note': '调度器修复后干净重跑 80.96@92（旧脏 70.82 已存档）',
-    },
-    'G-Full-CAWR-Long': {
-        'params': dict(regions=[1, 2], transformer_layers=3, use_decouple=True, unfreeze='progressive', scheduler='cawr'),
-        'short': '渐进式+CAWR·Long160轮',
-        'cn': '渐进式解冻·CAWR调度·Long160轮·含多区域SE',
-        'target_epochs': 160,
-        'note': '100→160 断点续跑；best 83.565@132',
-    },
-    # —— S 系列：全解冻（unfreeze='none'，标准微调）——
-    'S-NoProg': {
-        'params': dict(regions=[1, 2], transformer_layers=3, use_decouple=True, unfreeze='none'),
-        'short': '全程全解冻·含多区域SE',
-        'cn': '全程全解冻·含多区域SE·CAWR调度',
-        'target_epochs': 100,
-        'note': '主基线 82.63@74（显示写法常作 S-NoProG，key 规范为小写 g）',
-    },
-    'S-NoSE': {
-        'params': dict(regions=None, transformer_layers=3, use_decouple=True, unfreeze='none'),
-        'short': '全程全解冻·无多区域SE',
-        'cn': '全程全解冻·无多区域SE·CAWR调度（SE消融）',
-        'target_epochs': 100,
-        'note': 'SE 消融 82.53@73（SE 增益≈0.10pp）',
-    },
-    'S-StdSE': {
-        'params': dict(regions=[1], transformer_layers=3, use_decouple=True, unfreeze='none'),
-        'short': '全程全解冻·标准SE',
-        'cn': '全程全解冻·标准全局SE·CAWR调度（多区域SE归因对照）',
-        'target_epochs': 100,
-        'note': '标准 SE 对照：与 S-NoSE / S-NoProg 仅 regions 不同，用于隔离多区域描述符的净增益',
-    },
-    # —— V2 路线：修正版 49-token Transformer（v2 架构）——
-    'V2-Full': {
-        'params': dict(model='v2', regions=[1, 2], transformer_layers=3, use_decouple=True, unfreeze='none'),
-        'arch': 'v2',
-        'short': '修正版49-token注意力',
-        'cn': 'V2修正Transformer·全程全解冻·含多区域SE（49-token真注意力）',
-        'target_epochs': 100,
-        'note': '协议v2待跑；83.353@74仅为254类旧协议历史观测，不得替代当前252类结果',
-    },
-    'V2-NoTF': {
-        'params': dict(model='v2', regions=[1, 2], transformer_layers=0, use_decouple=True, unfreeze='none'),
-        'arch': 'v2',
-        'short': 'V2架构去Transformer',
-        'cn': 'V2架构去Transformer·全程全解冻·含多区域SE（纯注意力消融对照）',
-        'target_epochs': 100,
-        'note': '协议v2待跑；与V2-Full成对比较，差值用于估计纯注意力栈增益',
-    },
-    'G-V2': {
-        'params': dict(model='v2', regions=[1, 2], transformer_layers=3, use_decouple=True, unfreeze='progressive', scheduler='cawr'),
-        'arch': 'v2',
-        'short': '渐进式+V2修正头',
-        'cn': 'V2修正Transformer·渐进式解冻30/60·含多区域SE（2×2第四格）',
-        'target_epochs': 100,
-        'note': '2026-09-09 立项：2×2 网格第四格（头 v1/V2 × 解冻 全/渐进），队列排 V2-NoTF 后',
-    },
-    # —— 已弃用/暂缓（不再进队列；保留条目仅为历史推理入口/文档）——
-    # 'G-NoSE-CAWR': 渐进式无SE(弃用：SE消融须对准全解冻主模型)
-    # 'G-NoTF':      v1 头去Transformer(弃用：v1 头已整体退场，由 V2-NoTF 方案取代)
-    # 'G-SingleSE'/'G-PureBB': 单尺度SE/纯骨干（暂缓）
+FULL_UNFREEZE_ID = 'FullUnfreeze'
+PROGRESSIVE_UNFREEZE_ID = 'ProgressiveUnfreeze'
+EARLY_UNFREEZE_ID = 'ProgressiveUnfreeze-E15-40'
+LATE_UNFREEZE_ID = 'ProgressiveUnfreeze-E45-75'
+RESNET18_ID = 'ResNet18-FullUnfreeze'
+RESNET34_ID = 'ResNet34-FullUnfreeze'
+BACKBONE_FEATURE_DIMS = {'resnext50_32x4d': 2048, 'resnet18': 512, 'resnet34': 512}
+TRAINING_POLICY = {
+    'optimizer': 'adamw_all_parameter_groups', 'backbone_lr': 1e-4,
+    'head_lr': 1e-4, 'weight_decay': 1e-2,
+    'scheduler': 'cawr_global_epoch', 't_0': 5, 't_mult': 2, 'eta_min': 1e-6,
+    'backbone_bn_policy': 'frozen_stats',
+    'optimizer_state_on_unfreeze': 'preserve',
 }
 
-# 规范顺序（GUI 下拉无成绩项、文档展示按此序）
-ORDER = ['G-Full', 'G-NoSE', 'S-NoProg', 'S-NoSE', 'S-StdSE', 'G-Full-CAWR',
-         'G-Full-CAWR-Long', 'V2-Full', 'V2-NoTF', 'G-V2']
 
-# 显示写法 → 规范 key（论文/口头常用 S-NoProG，文件与注册表用 S-NoProg）
-ALIASES = {'S-NoProG': 'S-NoProg'}
-
-# 推理/预测 GUI 下拉默认模型
-DEFAULT_MODEL = 'V2-Full'
-
-# ---------------------------------------------------------------------
-# 派生字典（供旧代码原位替换：train.py 用 MODEL_PARAMS(原 PRESETS)，
-# GUI 用 MODEL_CN / MODEL_SHORT / MODEL_TARGET_EPOCHS）
-# ---------------------------------------------------------------------
-MODEL_PARAMS = {k: v['params'] for k, v in MODELS.items()}
-MODEL_CN = {k: v['cn'] for k, v in MODELS.items()}
-MODEL_SHORT = {k: v['short'] for k, v in MODELS.items()}
-MODEL_ARCH = {k: v.get('arch', 'v2' if v['params'].get('model') == 'v2' else 'v1') for k, v in MODELS.items()}
-MODEL_TARGET_EPOCHS = {k: v['target_epochs'] for k, v in MODELS.items()}
+def _make_entry(backbone, unfreeze_epochs, short, phase):
+    epochs = list(unfreeze_epochs)
+    return {
+        'params': dict(model='v2', backbone=backbone, pretrained=True,
+                       regions=[1, 2], transformer_layers=0, use_decouple=True,
+                       unfreeze='progressive' if epochs else 'none',
+                       unfreeze_epochs=epochs, scheduler='cawr'),
+        'arch': 'v2', 'short': short, 'cn': short + '（SE[1,2]）',
+        'target_epochs': 100, 'phase': phase, 'protocol_target': 3,
+        'status': 'registered',
+        'note': '首轮seed1；统一全局lr/正则化/BN规则，准备与短运行通过后执行。',
+    }
 
 
-# ---------------------------------------------------------------------
-# 工具函数（消费方不要直接 import 上面大字典，用这些；取不到时优雅回退）
-# ---------------------------------------------------------------------
+MODELS = {
+    FULL_UNFREEZE_ID: _make_entry('resnext50_32x4d', [], '全程全解冻', 'baseline'),
+    PROGRESSIVE_UNFREEZE_ID: _make_entry('resnext50_32x4d', [30, 60], '渐进式30/60', 'baseline'),
+    EARLY_UNFREEZE_ID: _make_entry('resnext50_32x4d', [15, 40], '较早解冻15/40', 'unfreeze_timing'),
+    LATE_UNFREEZE_ID: _make_entry('resnext50_32x4d', [45, 75], '较晚解冻45/75', 'unfreeze_timing'),
+    RESNET18_ID: _make_entry('resnet18', [], 'ResNet18全解冻', 'backbone'),
+    RESNET34_ID: _make_entry('resnet34', [], 'ResNet34全解冻', 'backbone'),
+}
+ORDER = list(MODELS)
+ALIASES = {}
+DEFAULT_MODEL = FULL_UNFREEZE_ID
+MODEL_PARAMS = {key: deepcopy(value['params']) for key, value in MODELS.items()}
+MODEL_CN = {key: value['cn'] for key, value in MODELS.items()}
+MODEL_SHORT = {key: value['short'] for key, value in MODELS.items()}
+MODEL_ARCH = {key: value['arch'] for key, value in MODELS.items()}
+MODEL_TARGET_EPOCHS = {key: value['target_epochs'] for key, value in MODELS.items()}
+
+
 def normalize(name: str) -> str:
-    """显示写法 → 规范 key（未知名称原样返回，由调用方自行报错）。"""
-    return ALIASES.get(name, name)
+    return name
+
+
+def _entry(name: str) -> dict:
+    try:
+        return MODELS[name]
+    except KeyError:
+        raise KeyError(f'未注册的V3实验ID: {name!r}; 可用ID: {ORDER}') from None
 
 
 def known_models() -> list:
-    """按规范顺序返回全部已注册模型 id。"""
     return list(ORDER)
 
 
 def is_known(name: str) -> bool:
-    return normalize(name) in MODELS
+    return name in MODELS
 
 
 def params_of(name: str) -> dict:
-    """某模型训练参数（= 原 PRESETS 条目）。"""
-    return dict(MODELS[normalize(name)]['params'])
+    return deepcopy(_entry(name)['params'])
 
 
 def cn_of(name: str) -> str:
-    """中文全称（GUI 说明行/文档）。"""
-    cid = normalize(name)
-    return MODEL_CN.get(cid, cid)
+    return _entry(name)['cn']
 
 
 def short_of(name: str) -> str:
-    """短说明。"""
-    cid = normalize(name)
-    return MODEL_SHORT.get(cid, cid)
+    return _entry(name)['short']
 
 
 def arch_of(name: str) -> str:
-    """模型家族：'v1' | 'v2'。"""
-    cid = normalize(name)
-    return MODEL_ARCH.get(cid, 'v1')
+    return _entry(name)['arch']
 
 
 def regions_of(name: str):
-    return params_of(name).get('regions')
+    return params_of(name)['regions']
 
 
 def tf_of(name: str) -> int:
-    return params_of(name).get('transformer_layers', 0)
+    return params_of(name)['transformer_layers']
 
 
 def dec_of(name: str) -> bool:
-    return params_of(name).get('use_decouple', False)
+    return params_of(name)['use_decouple']
 
 
 def target_of(name: str) -> int:
-    cid = normalize(name)
-    return MODEL_TARGET_EPOCHS.get(cid, 100)
+    return _entry(name)['target_epochs']
 
+
+def backbone_of(name: str) -> str:
+    return params_of(name)['backbone']
+
+
+def unfreeze_epochs_of(name: str) -> list:
+    return params_of(name)['unfreeze_epochs']
+
+
+def training_policy_of(name: str) -> dict:
+    _entry(name)
+    return deepcopy(TRAINING_POLICY)
+
+
+def experiment_signature_of(name: str) -> str:
+    payload = {'params': params_of(name), 'epochs': target_of(name),
+               'protocol_target': _entry(name)['protocol_target'],
+               'training_policy': training_policy_of(name)}
+    text = json.dumps(payload, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+
+def config_for_run(name: str, seed: int, resume=False, smoke=False) -> dict:
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise ValueError('seed必须为非负整数')
+    epochs = unfreeze_epochs_of(name)
+    return {'CONFIG_ID': name, 'SEED': seed, 'SMOKE': bool(smoke),
+            'MAX_EPOCHS': 3 if smoke else target_of(name), 'RESUME': bool(resume),
+            'AUTO': True, 'BACKBONE': backbone_of(name),
+            'UNFREEZE1_EPOCH': epochs[0] if epochs else None,
+            'UNFREEZE2_EPOCH': epochs[1] if epochs else None,
+            'EXPERIMENT_SIGNATURE': experiment_signature_of(name)}
+
+
+def validate_config_binding(name: str, config: dict):
+    expected = config_for_run(name, config.get('SEED', 1),
+                              config.get('RESUME', False), config.get('SMOKE', False))
+    for key in ('BACKBONE', 'UNFREEZE1_EPOCH', 'UNFREEZE2_EPOCH', 'EXPERIMENT_SIGNATURE'):
+        if key in config and config[key] != expected[key]:
+            raise ValueError(f'{key}与注册表冲突：{config[key]!r} != {expected[key]!r}')
+    if not config.get('SMOKE', False) and config.get('MAX_EPOCHS', target_of(name)) != target_of(name):
+        raise ValueError('正式预算与注册表不一致')
+
+
+def validate_registry():
+    for name in ORDER:
+        p = params_of(name); epochs = p['unfreeze_epochs']
+        if p['backbone'] not in BACKBONE_FEATURE_DIMS:
+            raise ValueError(f'未知骨干: {p["backbone"]}')
+        if p['unfreeze'] == 'progressive':
+            if len(epochs) != 2 or not all(type(e) is int for e in epochs) or not 0 < epochs[0] < epochs[1] < target_of(name):
+                raise ValueError(f'非法解冻时点: {name}: {epochs}')
+        elif epochs:
+            raise ValueError(f'全解冻不应设置阶段时点: {name}')
+
+
+validate_registry()
 
 if __name__ == '__main__':
-    # 自检：打印注册表总览（只读，无 torch/GPU 依赖）
-    print(f'[model_registry 自检] 共 {len(MODELS)} 个模型，默认 {DEFAULT_MODEL}')
-    for cid in ORDER:
-        m = MODELS[cid]
-        print(f'  {cid:22s} arch={MODEL_ARCH[cid]:<3s} tf={m["params"].get("transformer_layers",0)} '
-              f'regions={m["params"].get("regions")} dec={m["params"].get("use_decouple")} '
-              f'target={m["target_epochs"]}轮\n'
-              f'      cn : {m["cn"]}\n'
-              f'      note: {m["note"]}')
+    print(f'V3注册表：{len(MODELS)}项，默认{DEFAULT_MODEL}，状态registered')
+    for config_id in ORDER:
+        print(config_id, params_of(config_id), target_of(config_id))
