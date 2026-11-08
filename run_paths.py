@@ -5,15 +5,25 @@ import json
 import os
 import time
 
-try:
+if __package__:
     from . import model_registry as registry
-except ImportError:
+else:
     import model_registry as registry
 
 V3_ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = V3_ROOT.parent
 RUNS_ROOT = V3_ROOT / 'runs'
 CONFIG_FILE = V3_ROOT / 'experiment_config.json'
+
+# 唯一逐轮指标格式；恢复和队列入口校验，writer按此顺序输出。
+METRICS_COLUMNS = (
+    'config_id', 'seed', 'epoch', 'sampler_seed',
+    'label_schema_version', 'label_mapping_hash', 'num_classes',
+    'train_acc', 'train_loss', 'val_acc', 'val_loss',
+    'val_macro_f1', 'val_weighted_f1', 'lr', 'gradient_norm',
+    'time_spend_s', 'state', 'save_time',
+    'val_weighted_precision', 'val_weighted_recall',
+)
 
 
 def load_config(path=None):
@@ -70,11 +80,17 @@ def configure_process(config=None):
     directory = run_directory(config['CONFIG_ID'], config['SEED'], config.get('SMOKE', False))
     if config.get('SMOKE', False):
         directory = directory.with_name(directory.name + '_' + str(time.time_ns()))
+    elif config.get('RESUME', False):
+        last = checkpoint_path(config['CONFIG_ID'], config['SEED'])
+        if not last.is_file():
+            raise FileNotFoundError(f'要求续跑但缺少last断点：{last}；不能回退为新训练')
     elif not config.get('RESUME', False) and directory.exists() and any(directory.iterdir()):
         raise FileExistsError(f'已有运行产物：{directory}；请选择续跑，不能静默覆盖')
     directory.mkdir(parents=True, exist_ok=True)
     os.environ['V3_RUN_DIR'] = str(directory)
     os.environ['V3_NORMALIZATION_SIGNATURE'] = normalization_signature(config)
     snapshot = dict(config, RUN_DIRECTORY=str(directory))
-    (directory / 'config.json').write_text(json.dumps(snapshot, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+    snapshot_path = directory / 'config.json'
+    if not config.get('RESUME', False) or not snapshot_path.exists():
+        snapshot_path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
     return directory

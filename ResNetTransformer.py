@@ -1,29 +1,13 @@
 # -*- coding: utf-8 -*-
-"""
-ResNetTransformer.py —— 修正版 Transformer 分类模型（V2-Full / V2-NoTF 正式路线）
+"""V3 空间特征分类模型：可切换骨干、多区域 SE、可选 Transformer 和解耦分类头。
 
-【这个文件是什么】
-    把 ResNet.py 里的 ResNetTransformer 复制过来，改正了其中"Transformer 退化"的问题：
-    - 原版（ResNet.py）：backbone → avgpool(压成 1×1) → projection → unsqueeze(1) → Transformer。
-      喂给 Transformer 的序列长度 = 1，自注意力退化成"恒等 + 输出投影"，等价于一个花哨 MLP，
-      与后面的解耦层/分类头重复，增益 ≈ 0。
-    - 本版（ResNetTransformerV2）：backbone → SE → 展平成 H*W 个 patch token（7×7=49）→ projection
-      → +可学习位置编码 → Transformer（真正的多 token 自注意力）→ 平均池化 → 解耦层 → 分类头。
-      Transformer 现在能建模 49 个空间小块之间的细腻关系，契合"垃圾分类要关注小块细节"的动机。
-
-【当前状态】
-    - train.py 已按 model_registry.py 的 `model='v2'`选择本模型。
-    - V2-Full 使用 49 token + 3 层 Transformer；V2-NoTF 保持同一 V2 数据流并令层数为 0。
-    - 两项必须在同一训练协议下成对比较，不能用历史254类结果替代当前252类重跑。
-
-【参数说明】
-    - transformer_layers / d_model / nhead：与原版一致（默认 3 / 512 / 8）。
-    - num_patches：backbone 输出的 patch 数，ResNeXt50@224 输入 → 7×7 = 49（改输入尺寸需同步改）。
-    - regions / use_decouple：SE 与解耦层开关，与原版语义一致（用于消融）。
+注册实验的 SE 区域、骨干和解冻时点见 model_registry.py，当前均为 NoTF。
+支持 ResNeXt50、ResNet18/34、ShuffleNetV2 1.0×，保留正层数 Transformer 构造。
+ResNetTransformerV2 类名和 model='v2' 为现有实现接口。
 """
 import torch
 import torch.nn as nn
-from torchvision.models import resnext50_32x4d, resnet18, resnet34
+from torchvision.models import resnext50_32x4d, resnet18, resnet34, shufflenet_v2_x1_0
 
 from src_v3 import merged_dict
 from src_v3.taxonomy import EXPECTED_NUM_CLASSES
@@ -142,7 +126,8 @@ class ResNetTransformerV2(nn.Module):
         self.id_to_main_class = id_to_main_class
         self.merged_dict = merged_dict or {}
         num_parent_classes = len(renew_class_to_index)
-        builders = {'resnext50_32x4d': resnext50_32x4d, 'resnet18': resnet18, 'resnet34': resnet34}
+        builders = {'resnext50_32x4d': resnext50_32x4d, 'resnet18': resnet18,
+                    'resnet34': resnet34, 'shufflenet_v2_x1_0': shufflenet_v2_x1_0}
         if backbone_name not in builders:
             raise ValueError(f'不支持的骨干: {backbone_name}')
         if backbone_bn_policy != 'frozen_stats':
@@ -155,18 +140,25 @@ class ResNetTransformerV2(nn.Module):
         self.num_patches = num_patches
         self.regions = list(regions) if regions is not None else None
         self.use_decouple = bool(use_decouple)
-        self.model_impl_version = 3
+        self.model_impl_version = 4  # 区域池化采用FP32累加，拒绝混用修复前断点。
         self.ffn_dim = 4 * d_model
         self.transformer_dropout = 0.3
         self.patch_dropout = 0.1
         self.head_dropout = 0.5
         self.drop_path_rate = float(drop_path_rate)
 
-        # 加载预训练 ResNeXt50 并去掉分类头（去掉 fc + avgpool，保留 7×7 特征图）
+        # 保留骨干空间特征，去掉原分类读出。
         backbone = builders[backbone_name](pretrained=pretrained)
         in_features = backbone.fc.in_features
         self.feature_dim = in_features
-        self.resnet_backbone = nn.Sequential(*list(backbone.children())[:-2])
+        if backbone_name == 'shufflenet_v2_x1_0':
+            # Shuffle 的 conv5 位于 fc 前，必须保留其 1024 通道输出。
+            self.resnet_backbone = nn.Sequential(
+                backbone.conv1, backbone.maxpool, backbone.stage2,
+                backbone.stage3, backbone.stage4, backbone.conv5,
+            )
+        else:
+            self.resnet_backbone = nn.Sequential(*list(backbone.children())[:-2])
 
         # 多区域 SE（regions=None 时直通，用于消融 G-NoSE / G-PureBB）
         self.se_block = NewSEBlock(
@@ -330,8 +322,8 @@ class ResNetTransformerV2(nn.Module):
 
 if __name__ == '__main__':
     # 快速自检：构建 + 前向，验证多 token 修正后 shape 正确（不参与训练）。
-    # 用法：在项目根 E:\DataSet\垃圾分类图片-2 下执行
-    #   python src_v2/ResNetTransformer.py
+    # 用法：在项目根目录执行
+    #   python src_v3/ResNetTransformer.py
     d_model, nhead = 512, 8
     fake_class_index = {i: i for i in range(EXPECTED_NUM_CLASSES)}
     model = ResNetTransformerV2(transformer_layers=0, pretrained=False, d_model=d_model, nhead=nhead,

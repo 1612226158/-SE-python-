@@ -14,7 +14,10 @@ class SafeImageFolder(datasets.ImageFolder):
                  id_to_main_class=None,
                  renew_class_to_index=None,
                  ):
-        super(SafeImageFolder, self).__init__()  # <-- 调用基类的构造函数
+        # 初始化基础配置，类别和样本仍由下方手工扫描。
+        datasets.VisionDataset.__init__(
+            self, root, transform=transform, target_transform=target_transform
+        )
 
         self.root = root
         self.transform = transform

@@ -1,21 +1,9 @@
 # -*- coding: utf-8 -*-
-"""
-temp_guard.py —— 温度守护
+"""训练温度守护：检查CPU/GPU及可选磁盘指标，按配置告警或休眠。
 
-在训练每个 epoch 末（由 train.py 的 `temp_guard_lis` 控制，当前=每轮）检测温度，
-任一项超过阈值就让电脑休息 REST_SECONDS 秒，避免过热降频或损伤硬件。
-
-温度来源：
-  - GPU：nvidia-smi（无需管理员）
-  - CPU：Windows「Thermal Zone Information」性能计数器（cooked value 单位=开尔文，减 273.15 得摄氏）
-  - 磁盘（可选）：① 读 `runs\\disk_temp.log`（由 disk_temp_sampler.py **以管理员身份**采样写入）
-                  ② 若本进程本身是管理员，则直接读（无需采样器）
-                  —— 非管理员且无采样器时记 `?`，不影响训练、不触发休息
-
-**总开关**：`DISK_MONITOR_ENABLED = False` 时，守护点**完全不碰磁盘**
-（不采样 I/O、不读盘温日志、日志行不加磁盘段），等价于加磁盘监测之前的原逻辑。
-
-阈值与休息时长改下面常量即可。
+GPU温度来自nvidia-smi，CPU温度来自Windows热区性能计数器。
+盘温优先读取管理员采样器写入的日志；日志不可用时，仅管理员进程可备用直读。
+关闭DISK_MONITOR_ENABLED后仅检查CPU/GPU；阈值与休眠时长由本模块常量控制。
 """
 import ctypes
 import logging
@@ -28,42 +16,32 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 RUNS_DIR = os.path.join(_HERE, "runs")
 
 # ==================== 阈值与休息时长（按需修改） ====================
-GPU_MAX_C = 85.0      # GPU 超过此值 → 休息（RTX 4060 Laptop 降频线约 87°C）
-CPU_MAX_C = 93.0      # CPU 超过此值 → 休息（笔记本 CPU 降频线约 95~100°C）
+GPU_MAX_C = 85.0      # GPU温度阈值（摄氏度）。
+CPU_MAX_C = 93.0      # CPU温度阈值（摄氏度）。
 REST_SECONDS = 600    # 休息 10 分钟
 # ====================================================================
 
 # ==================== 磁盘监测总开关 ====================
-DISK_MONITOR_ENABLED = True   # False = 完全回到原逻辑：守护点不采样磁盘 I/O、不读盘温日志、
-                              #         日志行不加磁盘段、零额外开销（实测省 ~1.6s/守护点）
+DISK_MONITOR_ENABLED = True   # 是否检查磁盘I/O、空间与温度。
 # ======================================================
 
 # ==================== 磁盘守护（数据集盘；免管理员；默认仅告警不休息） ====================
-# 背景（2026-09-22 实测）：本机**读不到硬盘温度**——ACPI 只暴露 1 个热区（CPU），
-# `\\.\PhysicalDriveN` 的温度 IOCTL 无管理员时返回 err=1/err=5，smartctl 未安装，
-# 也无任何硬件监控工具。故改为监视**磁盘 I/O 与剩余空间**（两者均免管理员、实测可用）；
-# 盘温不追（SSD 过热会自行降速保护，不是"烧硬件"级风险）。
+# 通过性能计数器和磁盘空间接口读取I/O与剩余空间，默认仅告警。
 DISK_MOUNT = "E:\\"            # 监视哪个卷：数据集 train/val 与 runs/ 产物都在 E:
 DISK_LETTER = "e:"             # 用于在性能计数器实例名（形如 "1 e:"）里定位该盘
-DISK_QUEUE_WARN = 2.0          # 队列长度超过此值 → 告警（持续 >2 说明 I/O 在排队）
-DISK_LATENCY_WARN_MS = 20.0    # 平均每次传输耗时超过此值 → 告警（>20ms 说明盘拖后腿）
-DISK_FREE_MIN_GB = 50.0        # 剩余空间低于此值 → 告警（写满会导致 checkpoint 落盘失败）
-DISK_REST_ON_HIGH = False      # 磁盘高负载是否也触发"休息"：默认 False——
-                               # 休息并不能缓解 I/O 负载，只会拖长总时长，故只告警。
+DISK_QUEUE_WARN = 2.0          # 磁盘队列长度告警阈值。
+DISK_LATENCY_WARN_MS = 20.0    # 平均传输延时告警阈值（毫秒）。
+DISK_FREE_MIN_GB = 50.0        # 剩余空间告警阈值（GB）。
+DISK_REST_ON_HIGH = False      # I/O或空间告警是否计入休眠，默认仅告警。
 # =====================================================================================
 
-# ==================== 磁盘温度（需要管理员；2026-09-22 本机实测可读） ====================
-# 实测（管理员窗口）：E: = Samsung 990 PRO 2TB（NVMe）53~54°C、系统盘 MZVL21T0HCLR 41°C；
-# **非管理员读不到**（`Get-StorageReliabilityCounter` 直接"拒绝访问"）——故采用"提权采样器 + 免提权读日志"：
-#   ① 你在【管理员】终端跑一次：D:\Python\Python3.10.7\python.exe src_v2\disk_temp_sampler.py
-#      （它每 60 s 采一次，写 runs\disk_temp.log；窗口留着即可，Ctrl+C 停）
-#   ② temp_guard 只读该日志的最新一行（免提权；读不到就记 ? 并说明原因）
-#   ③ 若训练进程本身以管理员启动，则跳过日志直接读（形态 2 也兼容）
-# ⚠️ 哨兵值：部分 NVMe 的 TemperatureMax 返回 255（=不支持），一律按"读不到"处理。
+# ==================== 磁盘温度：采样器日志优先 ====================
+# 管理员单独运行disk_temp_sampler.py，普通训练进程读取其日志。
+# 日志不可用时，仅允许且具有管理员权限的进程备用直读。
 DISK_TEMP_LOG = os.path.join(RUNS_DIR, "disk_temp.log")
 DISK_TEMP_MAX_AGE_S = 180       # 日志新鲜度上限；超过视为"采样器没在跑"
 DISK_TEMP_WARN_C = 70.0         # 盘温超过此值 → 告警
-DISK_TEMP_REST_C = 80.0         # 盘温超过此值 → 休息（990 PRO 降速线约 82°C）
+DISK_TEMP_REST_C = 80.0         # 盘温达到此值时可计入休眠（摄氏度）。
 DISK_TEMP_REST_ON_HIGH = True   # 盘温过高是否触发休息（与 I/O 不同：休息确实能让 SSD 降温）
 DISK_TEMP_SENTINEL_MAX = 120    # 温度 > 此值视为哨兵/不支持（如 255）
 # =====================================================================================
@@ -123,19 +101,13 @@ _PS_DISK = (
     r"$ErrorActionPreference='SilentlyContinue';"
     r"$p=@('\PhysicalDisk(*)\Avg. Disk sec/Transfer','\PhysicalDisk(*)\Current Disk Queue Length');"
     r"$c=Get-Counter -Counter $p;"
-    # ⚠️ 用 '|' 拼接而非 '{0}`t{1}'：PowerShell 的反引号转义在**单引号字符串里不生效**
-    #    （会输出字面的 `t 而不是制表符），2026-09-22 实测踩到并改此写法。
+    # 使用|分隔实例名、计数器名和数值，供下方解析。
     r"foreach($s in $c.CounterSamples){ $s.InstanceName + '|' + ($s.Path -replace '.*\\','') + '|' + $s.CookedValue }"
 )
 
 
 def get_disk_io(letter=DISK_LETTER):
-    """读取目标盘的平均传输耗时（毫秒）与磁盘队列长度。
-
-    数据源 = Windows 性能计数器（**无需管理员**），按实例名（形如 "1 e:"）筛出目标盘，
-    因此盘符换到别的物理盘上也能自动跟随。读不到返回 None。
-    返回 dict：{"latency_ms": float|None, "queue": float|None}
-    """
+    """读取指定盘符的平均传输延时（毫秒）与队列长度；读不到返回None。"""
     try:
         out = subprocess.run(
             ["powershell", "-NoProfile", "-Command", _PS_DISK],
@@ -176,7 +148,7 @@ def get_disk_free_gb(mount=DISK_MOUNT):
 
 
 # 采样器与 temp_guard 共用这一条命令，保证"写日志"和"直读"口径一致。
-# ⚠️ 用 '|' 拼接、不用反引号转义（PowerShell 单引号里反引号不生效，2026-09-22 踩过）。
+# 使用|分隔设备ID、名称、当前/最大温度与盘符标记。
 _PS_DISK_TEMP = (
     r"$ErrorActionPreference='SilentlyContinue';"
     r"$hd=(Get-Partition | Where-Object { $_.DriveLetter -eq 'E' } | Select-Object -First 1).DiskNumber;"
@@ -186,9 +158,6 @@ _PS_DISK_TEMP = (
     r"if($hd -ne $null -and $d.DeviceId -eq $hd){$n='E'};"
     r"$d.DeviceId.ToString() + '|' + $d.FriendlyName + '|' + $c.Temperature + '|' + $c.TemperatureMax + '|' + $n}"
 )
-
-DISK_TEMP_LOG_HEADER = "# ts,E_deviceId,E_temp_C,all(dev=temp;...)"
-
 
 def is_elevated():
     """当前进程是否具备管理员权限。"""
@@ -239,7 +208,7 @@ def read_disk_temps_direct():
 
 
 def format_disk_temp_log_line(temps, when=None):
-    """把 read_disk_temps_direct() 的结果格式化为一行日志（**采样器专用**，格式与 read_disk_temp_log 对应）。"""
+    """采样器的控制台/返回文本；文件记录另由logging增加时间和等级。"""
     when = when or datetime.now()
     e_dev = e_temp = ""
     detail = []
@@ -268,9 +237,9 @@ def read_disk_temp_log(path=DISK_TEMP_LOG, max_age_s=DISK_TEMP_MAX_AGE_S):
         if not last:
             return None, None
         fields = last.split(",")
-        if len(fields) < 3:
+        if len(fields) != 5:
             return None, None
-        temp = _parse_temp(fields[2])
+        temp = _parse_temp(fields[3])
         try:
             age = (datetime.now() - datetime.strptime(fields[0].strip(), "%Y-%m-%d %H:%M:%S")).total_seconds()
         except ValueError:
@@ -345,8 +314,7 @@ def _read_twice(read_fn, interval=3.0):
 
 
 def _check_temps_only(tag="", log_info=logging.info, log_warn=logging.warning, count=0):
-    """`DISK_MONITOR_ENABLED=False` 时的路径：与"加磁盘监测之前"的**原逻辑逐字一致**
-    —— 只读 GPU/CPU、日志行只有温度段、唯一休息条件是温度。"""
+    """关闭磁盘监测时只检查GPU/CPU温度，返回是否触发休眠。"""
     gpu = _read_twice(get_gpu_temp_c)
     cpu = _read_twice(get_cpu_temp_c)
     log_info(f"[温度守护{tag}] GPU={_fmt(gpu)}°C, CPU={_fmt(cpu)}°C（双读判定；阈值 GPU>{GPU_MAX_C} / CPU>{CPU_MAX_C}）")
@@ -372,13 +340,10 @@ def _check_temps_only(tag="", log_info=logging.info, log_warn=logging.warning, c
 
 
 def check_temps_and_rest(tag="", log_info=logging.info, log_warn=logging.warning):
-    """检测 CPU/GPU 温度 +（可选）磁盘 I/O、剩余空间与盘温。
+    """检查CPU/GPU及可选磁盘指标，按现有开关告警或休眠。
 
-    - **总开关**：`DISK_MONITOR_ENABLED=False` → 直接走 `_check_temps_only`（等价于原逻辑，零磁盘开销）；
-    - **GPU/CPU 温度**任一超过阈值 → 休息 REST_SECONDS 秒，返回 True；
-    - **磁盘 I/O**（队列/延时）默认**只告警不休息**（休息无法缓解 I/O）；`DISK_REST_ON_HIGH=True` 才并入休息条件；
-    - **盘温** >= `DISK_TEMP_REST_C` 默认计入休息（`DISK_TEMP_REST_ON_HIGH=False` 可关）；
-      读不到盘温（无采样器且非管理员）时记 `?`，不参与判定。
+    磁盘I/O和空间由DISK_REST_ON_HIGH控制是否计入休眠，
+    盘温由DISK_TEMP_REST_ON_HIGH控制；总开关关闭时只检查CPU/GPU。
     """
     if not DISK_MONITOR_ENABLED:
         return _check_temps_only(tag, log_info, log_warn)

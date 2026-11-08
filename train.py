@@ -1,16 +1,23 @@
-import os as _entry_os
 import sys as _entry_sys
 from pathlib import Path as _EntryPath
 _entry_dir = _EntryPath(__file__).resolve().parent
 for _entry_path in (str(_entry_dir), str(_entry_dir.parent)):
     if _entry_path not in _entry_sys.path:
         _entry_sys.path.insert(0, _entry_path)
+from run_paths import load_config as _load_config, METRICS_COLUMNS
+_cfg = None
+_long_initialized = False
 if __name__ == '__main__':
     from launch_checks import handle_cli as _handle_cli
-    if _handle_cli('train'):
+    _cli_args = _handle_cli('train')
+    if _cli_args.check or _cli_args.list:
         raise SystemExit(0)
     from run_paths import configure_process as _configure_process
-    _configure_process()
+    _cfg = _load_config()
+    if not _cfg.get('SMOKE', False):
+        from run_queue import ensure_long_resume as _ensure_long_resume
+        _long_initialized = _ensure_long_resume(_cfg['CONFIG_ID'], _cfg['SEED'], _cfg)
+    _configure_process(_cfg)
 import random
 import sys
 import time
@@ -20,24 +27,21 @@ import logging
 import os
 import json
 import hashlib
+import tempfile
 
 import temp_guard  # 温度守护：关键节点检测 CPU/GPU 温度，过高自动休息 10 分钟
-from functools import partial
 
 import pandas as pd
 import numpy as np
 import torch
 import torch.optim as optim
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data import WeightedRandomSampler
-from torchvision import datasets, transforms
-from torch.optim.lr_scheduler import StepLR, ReduceLROnPlateau
+from torchvision import transforms
 from torch.cuda.amp import autocast, GradScaler
-from transformers import get_cosine_schedule_with_warmup
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, CosineAnnealingLR
-from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from sklearn.metrics import precision_score, recall_score, f1_score
 
 from tqdm import tqdm
 import psutil
@@ -47,18 +51,12 @@ import psutil
 # import cv2  # 通常与 Albumentations 配合使用
 
 from ResNet import ResNetTransformer
-from ResNetTransformer import ResNetTransformerV2  # 修正版 ViT 式多 token Transformer（独立路线；配置加 model='v2' 时启用）
-from calculate import (calculate_mean_and_std,
-                       SafeImageFolder,
-                       FocalLoss, add_record_metrics, add_record_metrics_v2,
-                       get_classnames,
-                       generate_mappings, get_class_proportion,
-                       get_output_class_sample_counts,
-                       get_class_weight, hierarchical_collate_fn)
-from calculate_update import SafeImageFolder as NewSafeImageFolder
-from src_v3 import (device, DynamicMeanPad,
-                    pth_file_name, save_model_after_epoch,
-                    extensions_suffix, merged_dict, ACC_STOP, ERROR_RATE,
+from ResNetTransformer import ResNetTransformerV2  # 空间分类模型；当前注册配置均使用NoTF
+from calculate import (SafeImageFolder, add_record_metrics_v2,
+                       generate_mappings, get_output_class_sample_counts,
+                       hierarchical_collate_fn)
+from src_v3 import (device, save_model_after_epoch,
+                    merged_dict, ACC_STOP, ERROR_RATE,
                     TRAIN_NUM_WORKERS, VAL_NUM_WORKERS)
 from src_v3.taxonomy import (
     EXPECTED_NUM_CLASSES,
@@ -74,7 +72,7 @@ from src_v3.taxonomy import (
 CONFIG_FILE = os.environ.get('V3_CONFIG_FILE', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'experiment_config.json'))
 _DEFAULTS = {
     'CONFIG_ID': 'FullUnfreeze',  # 默认首批全解冻NoTF基线
-    'SEED': 1,               # 随机种子 0/1/2，每配置跑 3 次取 mean±std
+    'SEED': 1,               # 当前运行随机种子；队列任务逐行指定。
     'SMOKE': True,           # True=冒烟只跑 3 轮验证管线；正式训练 False
     'MAX_EPOCHS': 100,
     'RESUME': False,         # True=从 runs 下断点续跑（支持中途暂停后继续）
@@ -82,22 +80,16 @@ _DEFAULTS = {
     'UNFREEZE1_EPOCH': 30,   # 固定解冻触发：state1→2
     'UNFREEZE2_EPOCH': 60,   # state2→3
     'SNAPSHOT_EPOCH': None,  # Long 配置跑到该轮时自动存档 100 轮快照（如 100）
-    'ALLOW_LEGACY_PROTOCOL_RESUME': False,  # 仅诊断旧实验时手动开启；正式实验禁止混合 AMP 协议
+    'ALLOW_LEGACY_PROTOCOL_RESUME': False,  # 当前V3禁止绕过协议校验，必须保持False
 }
 
 # temp_guard_lis = (25, 50, 75, 99)
 # temp_guard_lis = (10, 20, 30, 40, 50, 60, 70, 80, 90)
-temp_guard_lis = [i for i in range(100)]
 
 
-_cfg = {}
-if os.path.exists(CONFIG_FILE):
-    try:
-        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-            _cfg = json.load(f)
-        logging.info(f'[配置] 已加载 {CONFIG_FILE}: {_cfg}')
-    except Exception as e:
-        logging.warning(f'[配置] 配置文件读取失败({e})，使用内置默认值')
+if _cfg is None:
+    _cfg = _load_config(CONFIG_FILE)
+_config_log = (logging.INFO, f'[配置] 已加载 {CONFIG_FILE}: {_cfg}')
 # 显式赋值（不用 globals() 动态注入，保证 IDE 可解析、无黄字）
 CONFIG_ID = _cfg.get('CONFIG_ID', _DEFAULTS['CONFIG_ID'])
 SEED = _cfg.get('SEED', _DEFAULTS['SEED'])
@@ -109,14 +101,14 @@ else:
     MAX_EPOCHS = _cfg.get('MAX_EPOCHS', _DEFAULTS['MAX_EPOCHS'])
     RESUME = _cfg.get('RESUME', _DEFAULTS['RESUME'])
 AUTO = _cfg.get('AUTO', _DEFAULTS['AUTO'])
+temp_guard_lis = range(MAX_EPOCHS)
+LONG_SOURCE = _cfg.get('LONG_SOURCE') if not SMOKE else None
 SNAPSHOT_EPOCH = _cfg.get('SNAPSHOT_EPOCH', _DEFAULTS['SNAPSHOT_EPOCH'])
 ALLOW_LEGACY_PROTOCOL_RESUME = _cfg.get('ALLOW_LEGACY_PROTOCOL_RESUME',
                                         _DEFAULTS['ALLOW_LEGACY_PROTOCOL_RESUME'])
 
 # 注册表为骨干、解冻时点和共同训练策略的唯一来源。
 import model_registry
-PRESETS = model_registry.MODEL_PARAMS
-model_registry.validate_config_binding(CONFIG_ID, _cfg)
 PRESET = model_registry.params_of(CONFIG_ID)
 unfreeze_mode = PRESET['unfreeze']
 BACKBONE_NAME = PRESET['backbone']
@@ -138,6 +130,40 @@ def _make_optimizer(model):
                        weight_decay=TRAINING_POLICY['weight_decay'])
 
 
+def _save_checkpoint(checkpoint, path):
+    """完成写入后原子替换，写入中断时保留上一份有效断点。"""
+    if LONG_SOURCE:
+        checkpoint['long_source'] = LONG_SOURCE
+    descriptor, temporary = tempfile.mkstemp(prefix=os.path.basename(path) + '.', suffix='.tmp',
+                                            dir=os.path.dirname(path))
+    os.close(descriptor)
+    try:
+        torch.save(checkpoint, temporary)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
+
+
+def _check_resume_metrics(checkpoint_epoch):
+    """断点与指标必须覆盖同一轮次，防止重放未落盘的epoch造成冲突。"""
+    path = os.path.join(RUNS_DIR, 'metrics_record.csv')
+    frame = pd.read_csv(path)
+    if frame.columns.tolist() != list(METRICS_COLUMNS):
+        raise RuntimeError(f'指标表头不符合当前20列格式，保留文件并停止：{path}')
+    if not ((frame['config_id'] == CONFIG_ID) &
+            (pd.to_numeric(frame['seed'], errors='raise') == SEED)).all():
+        raise RuntimeError(f'指标包含其他配置或seed，拒绝混写：{path}')
+    with open(path, 'rb') as file:
+        file.seek(-1, os.SEEK_END)
+        if file.read(1) != b'\n':
+            raise RuntimeError(f'指标末行不完整或缺少换行，保留文件并停止：{path}')
+    epochs = pd.to_numeric(frame['epoch'], errors='raise').tolist()
+    if epochs != list(range(checkpoint_epoch + 1)):
+        raise RuntimeError(f'指标轮次与last断点epoch={checkpoint_epoch}不一致：{path}；'
+                           '保留现场并停止，不能自动重放或混拼指标')
+
+
 def _advance_unfreeze_stage(model, state, epoch):
     """按注册时点切换梯度；不重建优化器或重启调度器。"""
     target = 3 if unfreeze_mode == 'none' else 1 + sum(epoch >= e for e in UNFREEZE_EPOCHS)
@@ -154,9 +180,9 @@ def _advance_unfreeze_stage(model, state, epoch):
 
 
 # 路径全部基于本文件定位（与 PyCharm 工作目录无关）
-SRC_V2_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(SRC_V2_DIR)
-RUNS_DIR = os.environ.get('V3_RUN_DIR', os.path.join(SRC_V2_DIR, 'runs'))
+SRC_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(SRC_DIR)
+RUNS_DIR = os.environ.get('V3_RUN_DIR', os.path.join(SRC_DIR, 'runs'))
 if __name__ == '__main__':
     os.makedirs(RUNS_DIR, exist_ok=True)
 TRAIN_ROOT = os.path.join(PROJECT_ROOT, 'train')
@@ -165,7 +191,7 @@ VAL_ROOT = os.path.join(PROJECT_ROOT, 'val')
 RUN_TAG = f'{CONFIG_ID}_seed{SEED}'
 BEST_PTH = os.path.join(RUNS_DIR, f'checkpoint_{RUN_TAG}_best.pth')
 LAST_PTH = os.path.join(RUNS_DIR, f'checkpoint_{RUN_TAG}_last.pth')
-# 协议3：骨干/时点绑定、统一优化器/全局调度/BN及实验签名；完整启动仍受未就绪限制。
+# 协议3：骨干/时点绑定、统一优化器/全局调度/BN及实验签名。
 TRAINING_PROTOCOL_VERSION = 3
 # 采样协议版本 1：每个绝对 epoch 使用可独立重建的 sampler seed，续跑不再重放随机流开头。
 SAMPLING_PROTOCOL_VERSION = 1
@@ -223,61 +249,18 @@ def seed_all(seed):
 
 
 def _restore_best_state(checkpoint, epoch_start):
-    """恢复全局 best；兼容旧断点（旧格式缺字段时从历史 metrics CSV 回查）。"""
-    if checkpoint is not None:
-        required = ('best_val_acc', 'best_epoch', 'train_acc_at_best')
-        if all(key in checkpoint for key in required):
-            return (float(checkpoint['best_val_acc']),
-                    int(checkpoint['best_epoch']),
-                    float(checkpoint['train_acc_at_best']))
-
-    if epoch_start <= 0:
+    """新训练初始化best；续跑直接恢复断点记录的历史最佳成绩。"""
+    if checkpoint is None and epoch_start <= 0:
         return -1.0, -1, -1.0
-
-    history = []
-    for name in os.listdir(RUNS_DIR):
-        if not (name.startswith('metrics_record') and name.endswith('.csv')):
-            continue
-        path = os.path.join(RUNS_DIR, name)
-        try:
-            df = pd.read_csv(path)
-            required_columns = {'config_id', 'seed', 'epoch', 'val_acc', 'train_acc'}
-            if not required_columns.issubset(df.columns):
-                continue
-            matched = df[(df['config_id'].astype(str) == str(CONFIG_ID)) &
-                         (pd.to_numeric(df['seed'], errors='coerce') == SEED) &
-                         (pd.to_numeric(df['epoch'], errors='coerce') < epoch_start)].copy()
-            if not matched.empty:
-                history.append(matched)
-        except Exception as exc:
-            logging.warning(f'回查历史 best 时跳过 {name}: {exc}')
-
-    if not history:
-        logging.warning('旧断点不含全局 best，且 metrics 中未找到历史记录；best 将从当前续跑段重新计算')
-        return -1.0, -1, -1.0
-
-    merged = pd.concat(history, ignore_index=True)
-    merged['val_acc'] = pd.to_numeric(merged['val_acc'], errors='coerce')
-    merged['epoch'] = pd.to_numeric(merged['epoch'], errors='coerce')
-    merged['train_acc'] = pd.to_numeric(merged['train_acc'], errors='coerce')
-    merged = merged.dropna(subset=['val_acc', 'epoch', 'train_acc'])
-    if merged.empty:
-        logging.warning('历史 metrics 中 best 字段无法解析；best 将从当前续跑段重新计算')
-        return -1.0, -1, -1.0
-
-    row = merged.loc[merged['val_acc'].idxmax()]
-    restored = float(row['val_acc']), int(row['epoch']), float(row['train_acc'])
-    logging.info(f'已从历史 metrics 恢复全局 best: epoch {restored[1]}, val_acc {restored[0]:.4f}%')
-    return restored
+    return (float(checkpoint['best_val_acc']),
+            int(checkpoint['best_epoch']),
+            float(checkpoint['train_acc_at_best']))
 
 # 只关闭特定的警告
 warnings.filterwarnings("ignore", message=".*Palette images with Transparency expressed in bytes.*")
-# 设置日志配置：文件 + 控制台双写（两者都输出全部 INFO 日志）。
-# 背景：PyCharm「Python 控制台」运行时会先给 root logger 预挂 handler，使 basicConfig 变 no-op，
-#       导致 FileHandler 不生效、日志文件 0 字节。这里改为显式清空 root handler 再挂两个 handler，
-#       无论从 PyCharm 控制台 / 普通 Run / 终端 / 子进程启动，都能同时：
-#         1) 写入 runs\logging_<RUN_TAG>.log（UTF-8，事后定位用）；
-#         2) 打印到 sys.stdout（PyCharm 控制台 / 终端实时可见）。
+# 主进程配置训练日志：文件记录INFO及以上，控制台仅显示WARNING及以上。
+# 显式重建handler，避免重复运行时沿用旧配置。
+
 def _setup_logging():
     # 只在主进程调用（见 if __name__ == '__main__'）；DataLoader 的 spawn worker 会重新
     # import 本模块，若在模块层调用则每个 worker 都执行一遍、重复打印。
@@ -308,10 +291,15 @@ sleep = 5
 
 
 class DynamicCachedDataset(Dataset):
+    """按索引缓存 Dataset 返回的图像张量和标签；当前训练未启用。
+
+    缓存包含增强结果，命中时不重新增强；多 worker 缓存不共享。
+    容量按首样本估算，非内存硬上限；达到上限后直接读取原 Dataset。
+    """
     def __init__(self, dataset, max_memory_usage=0.7):
         """
-        :param dataset: 原始 PyTorch 数据集
-        :param max_memory_usage: 最大内存使用比率（0-1之间），默认70%
+        :param dataset: 返回三维图像张量及标签的 PyTorch 数据集
+        :param max_memory_usage: 按构造时可用内存估算的预算比例，默认0.7
         """
         self.dataset = dataset
         self.max_memory_usage = max_memory_usage
@@ -365,13 +353,7 @@ class DynamicCachedDataset(Dataset):
 
 
 def validate(model, val_loader, parent_criterion, alpha=1.0, beta=0.0):
-    """
-    :param model: 模型
-    :param val_loader: 验证集
-    # :param criterion: 损失函数
-    # :param id_to_main_class: 合并分类的映射元素的字典
-    :return:
-    """
+    """验证当前252类输出并返回损失与指标；子类返回项固定为零占位。"""
     model.eval()  # 设置模型为评估模式
     # correct = 0
     total = 0
@@ -405,7 +387,7 @@ def validate(model, val_loader, parent_criterion, alpha=1.0, beta=0.0):
             _, parent_predicted = torch.max(parent_output, 1)
             parent_correct += (parent_predicted == parent_labels).sum().item()
 
-            # 收集父类和子类真实和预测标签用于计算精确率等指标
+            # 收集当前分类头的真实与预测标签，用于计算指标。
             y_true_parent.extend(parent_labels.cpu().numpy())
             y_pred_parent.extend(parent_predicted.cpu().numpy())
             total += inputs.size(0)
@@ -422,7 +404,7 @@ def validate(model, val_loader, parent_criterion, alpha=1.0, beta=0.0):
     print(s, file=fp)
     logging.info(s)
 
-    # 父类和子类精确率计算
+    # 当前分类头的加权Precision/Recall/F1及Macro-F1。
     parent_precision = precision_score(y_true_parent, y_pred_parent, average='weighted', zero_division=0)
     parent_recall = recall_score(y_true_parent, y_pred_parent, average='weighted', zero_division=0)
     parent_f1 = f1_score(y_true_parent, y_pred_parent, average='weighted', zero_division=0)
@@ -473,7 +455,12 @@ def train_and_validate(model,
     sleep_all_spend = 0
     EPOCH_PERIOD = 50
     EPOCH_PERIOD_time = 600
+    if epoch_start > 0 or os.path.isfile(os.path.join(RUNS_DIR, 'metrics_record.csv')):
+        _check_resume_metrics(epoch_start - 1)
     best_val_acc, best_epoch, train_acc_at_best = _restore_best_state(resume_checkpoint, epoch_start)
+    # 本次调用的结构和标签固定；动态训练状态仍逐轮记录。
+    _run_model_metadata, _run_model_signature = _model_identity(model)
+    _run_label_metadata = _label_metadata(id_to_main_class, renew_class_to_index)
     # num_epochs 即目标总轮数：续跑时自动"补到目标轮"，而非"再跑 MAX_EPOCHS 轮"
     for epoch in range(epoch_start, num_epochs):
         # 休息一下吧
@@ -507,7 +494,7 @@ def train_and_validate(model,
         # 训练过程
         with tqdm(train_loader, desc=f"Epoch [{epoch}/{num_epochs}]", unit="batch") as tq:
             # for inputs, (parent_labels, child_labels) in tq:
-            for inputs, parent_labels in tq:
+            for batch_index, (inputs, parent_labels) in enumerate(tq):
                 inputs = inputs.to(device, non_blocking=True)  # 将数据转移到 GPU
 
                 if torch.isnan(inputs).any() or torch.isinf(inputs).any():
@@ -524,8 +511,12 @@ def train_and_validate(model,
                 with autocast():  # 自动选择精度（FP16 或 FP32）
                     # parent_output, child_output = model(inputs)
                     parent_output = model(inputs)
-                    if torch.isnan(parent_output).any():
-                        print("Model output contains NaN!")
+                    if not torch.isfinite(parent_output).all():
+                        tq.close()
+                        logging.error(
+                            '训练输出含NaN/Inf，停止且不保存本轮：config=%s seed=%s epoch=%d batch=%d AMP_scale=%s',
+                            CONFIG_ID, SEED, epoch, batch_index, scaler.get_scale())
+                        raise FloatingPointError('训练输出非有限，已保留上一轮产物并停止')
 
                     parent_loss = parent_criterion(parent_output, parent_labels)
                     child_loss = 0
@@ -590,41 +581,9 @@ def train_and_validate(model,
                                                                            parent_criterion,
                                                                            alpha=1.0,
                                                                            beta=0.0)
-        # 实时保存 best（只存 state_dict，刷新才覆盖；最后用 best.pth 测测试集）
-        # 冒烟（SMOKE）不存任何 pth：避免留下断点让 run_queue 误判"中断需续跑"；metrics 记录已足够验证管线
-        if val_accuracy[0] > best_val_acc and not SMOKE:
-            best_val_acc = val_accuracy[0]
-            best_epoch = epoch
-            train_acc_at_best = train_parent_acc
-            torch.save({'epoch': epoch, 'config_id': CONFIG_ID, 'seed': SEED,
-                        'arch': type(model).__name__,
-                        'model_metadata': _model_metadata(model),
-                        'model_signature_sha256': _model_identity(model)[1],
-                        'experiment_signature': EXPERIMENT_SIGNATURE,
-                        'normalization_signature': NORMALIZATION_SIGNATURE,
-                        'backbone': BACKBONE_NAME, 'unfreeze_epochs': UNFREEZE_EPOCHS,
-                        'training_policy': TRAINING_POLICY,
-                        'state_dict': model.state_dict(), 'val_acc': val_accuracy[0],
-                        'best_val_acc': best_val_acc,
-                        'best_epoch': best_epoch,
-                        'train_acc_at_best': train_acc_at_best,
-                        'training_protocol_version': TRAINING_PROTOCOL_VERSION,
-                        'sampling_protocol_version': SAMPLING_PROTOCOL_VERSION,
-                        'sampler_seed': sampler_seed,
-                        **_label_metadata(id_to_main_class, renew_class_to_index)},
-                       BEST_PTH)
-            logging.info(f'best 刷新: epoch {epoch}, val_acc {val_accuracy[0]:.4f}% -> {BEST_PTH}')
-        # scheduler.step(val_loss)
         print(val_accuracy)
-        # 调度器 step：CAWR 的 step(epoch=None) 无参递增；RLRP 才需要传 val 指标。
-        # ⚠️ 2026-09-07 修复：原代码 state2/3 一律 step(val_accuracy[0])，对 RLRP 正确，
-        #    但对 CAWR 会把 val_acc 误当 epoch → CAWR 永不重启、lr 贴地板（G-Full-CAWR 70.82 被污染）。
-        if unfreeze_mode == 'none' or SCHEDULER_MODE == 'cawr':
-            scheduler.step()
-        elif state in [2, 3]:
-            scheduler.step(val_accuracy[0])
-        else:
-            scheduler.step()
+        # 当前统一使用CAWR，每轮无参推进调度。
+        scheduler.step()
         epoch_end = time.time()
         epoch_time = (epoch_end - epoch_start_time - sleep)
         minute = epoch_time // 60
@@ -633,6 +592,61 @@ def train_and_validate(model,
         s = f"第{epoch}轮, 花费时常:{minute}分{second:.2f}秒!"
         print(s, file=fp)
         logging.info(s)
+        TV__time_spend_end = time.time()
+
+        if save_model_indicators:
+            try:
+                save_epoch = add_record_metrics_v2(epoch=epoch,
+                                      config_id=CONFIG_ID,
+                                      seed=SEED,
+                                      sampler_seed=sampler_seed,
+                                      label_schema_version=LABEL_SCHEMA_VERSION,
+                                      label_mapping_hash=_run_label_metadata['label_mapping_hash'],
+                                      num_classes=len(renew_class_to_index),
+                                      train_acc=train_parent_acc,
+                                      train_loss=train_loss,
+                                      val_acc=val_accuracy[0],
+                                      val_loss=val_loss,
+                                      val_macro_f1=f1_macro,
+                                      val_weighted_f1=f1[0],
+                                      lr=learning_rate,
+                                      gradient_norm=gradient_norm.item(),
+                                      time_spend=TV__time_spend_end - TV__time_spend_start - sleep,
+                                      state=state,
+                                      val_weighted_precision=precision[0],
+                                      val_weighted_recall=recall[0])
+            except OSError as error:
+                logging.error('指标写入失败，本轮pth未保存；保留上一last，排障后续跑：%s', error)
+                raise
+
+            s = f"模型指标已经保存, 第{save_epoch}轮! 当前state状态为: {state}"
+            logging.info(s)
+            print(s)
+
+        # 更新best统计；SMOKE仅跳过标准best/last保存，阈值留样规则保持。
+        if val_accuracy[0] > best_val_acc:
+            best_val_acc = val_accuracy[0]
+            best_epoch = epoch
+            train_acc_at_best = train_parent_acc
+            if not SMOKE:
+                _save_checkpoint({'epoch': epoch, 'config_id': CONFIG_ID, 'seed': SEED,
+                            'arch': type(model).__name__,
+                            'model_metadata': _run_model_metadata,
+                            'model_signature_sha256': _run_model_signature,
+                            'experiment_signature': EXPERIMENT_SIGNATURE,
+                            'normalization_signature': NORMALIZATION_SIGNATURE,
+                            'backbone': BACKBONE_NAME, 'unfreeze_epochs': UNFREEZE_EPOCHS,
+                            'training_policy': TRAINING_POLICY,
+                            'state_dict': model.state_dict(), 'val_acc': val_accuracy[0],
+                            'best_val_acc': best_val_acc,
+                            'best_epoch': best_epoch,
+                            'train_acc_at_best': train_acc_at_best,
+                            'training_protocol_version': TRAINING_PROTOCOL_VERSION,
+                            'sampling_protocol_version': SAMPLING_PROTOCOL_VERSION,
+                            'sampler_seed': sampler_seed,
+                            **_run_label_metadata},
+                           BEST_PTH)
+                logging.info(f'best 刷新: epoch {epoch}, val_acc {val_accuracy[0]:.4f}% -> {BEST_PTH}')
         # 如果有任意ACC超过了预定值, 就会把这次模型强制保存, 且只会保存一次, 以防后续模型过拟合, 留样
         if val_accuracy[0] > ACC_STOP or val_accuracy[1] > ACC_STOP:
             save_model_after_epoch(epoch=epoch,
@@ -689,63 +703,13 @@ def train_and_validate(model,
                                    training_protocol_version=TRAINING_PROTOCOL_VERSION,
                                    scaler_state_dict=scaler.state_dict())
 
-        TV__time_spend_end = time.time()
-
-        if save_model_indicators:
-            save_epoch = add_record_metrics(epoch=epoch,
-                                            train_acc_parent=train_parent_acc,
-                                            # train_acc_child=train_child_acc,
-
-                                            val_acc_parent=val_accuracy[0],
-                                            # val_acc_child=val_accuracy[1],
-
-                                            train_loss=train_loss,
-                                            val_loss=val_loss,
-
-                                            precision_parent=precision[0],
-                                            # precision_child=precision[1],
-
-                                            recall_parent=recall[0],
-                                            # recall_child=recall[1],
-
-                                            f1_parent=f1[0],
-                                            # f1_child=f1[1],
-
-                                            gradient_norm=gradient_norm,
-                                            learning_rate=learning_rate,
-                                            time_spend=TV__time_spend_end - TV__time_spend_start - sleep,
-                                            state=state
-                                            )
-            s = f"模型指标已经保存, 第{save_epoch}轮! 当前state状态为: {state}"
-            logging.info(s)
-            print(s)
-
-        if save_model_indicators:
-            add_record_metrics_v2(epoch=epoch,
-                                  config_id=CONFIG_ID,
-                                  seed=SEED,
-                                  sampler_seed=sampler_seed,
-                                  label_schema_version=LABEL_SCHEMA_VERSION,
-                                  label_mapping_hash=mapping_fingerprint(id_to_main_class, renew_class_to_index),
-                                  num_classes=len(renew_class_to_index),
-                                  train_acc=train_parent_acc,
-                                  train_loss=train_loss,
-                                  val_acc=val_accuracy[0],
-                                  val_loss=val_loss,
-                                  val_macro_f1=f1_macro,
-                                  val_weighted_f1=f1[0],
-                                  lr=learning_rate,
-                                  gradient_norm=gradient_norm.item(),
-                                  time_spend=TV__time_spend_end - TV__time_spend_start - sleep,
-                                  state=state)
-
         # 每轮保存断点（state_dict + optimizer + scheduler），支持中途暂停后续跑
         # 冒烟（SMOKE）跳过：不留 checkpoint_*_last.pth，run_queue 才不会被误导而 RESUME
         if not SMOKE:
-            torch.save({'epoch': epoch, 'config_id': CONFIG_ID, 'seed': SEED,
+            _save_checkpoint({'epoch': epoch, 'config_id': CONFIG_ID, 'seed': SEED,
                         'arch': type(model).__name__,
-                        'model_metadata': _model_metadata(model),
-                        'model_signature_sha256': _model_identity(model)[1],
+                        'model_metadata': _run_model_metadata,
+                        'model_signature_sha256': _run_model_signature,
                         'experiment_signature': EXPERIMENT_SIGNATURE,
                         'normalization_signature': NORMALIZATION_SIGNATURE,
                         'backbone': BACKBONE_NAME, 'unfreeze_epochs': UNFREEZE_EPOCHS,
@@ -761,7 +725,7 @@ def train_and_validate(model,
                         'sampling_protocol_version': SAMPLING_PROTOCOL_VERSION,
                         'sampler_seed': sampler_seed,
                         'state': state,
-                        **_label_metadata(id_to_main_class, renew_class_to_index)},
+                        **_run_label_metadata},
                        LAST_PTH)
 
         # Long 配置：跑到 SNAPSHOT_EPOCH 轮时，把该轮的 checkpoint + metrics 单独复制存档（100 轮快照）
@@ -771,16 +735,16 @@ def train_and_validate(model,
                 _snap_last = os.path.join(RUNS_DIR, f'checkpoint_{RUN_TAG}_epoch{SNAPSHOT_EPOCH}.pth')
                 _snap_best = os.path.join(RUNS_DIR, f'checkpoint_{RUN_TAG}_best_epoch{SNAPSHOT_EPOCH}.pth')
                 _snap_metrics = os.path.join(RUNS_DIR, f'metrics_record_{RUN_TAG}_epoch{SNAPSHOT_EPOCH}.csv')
+                if os.path.exists(os.path.join(RUNS_DIR, 'metrics_record.csv')):
+                    shutil.copy(os.path.join(RUNS_DIR, 'metrics_record.csv'), _snap_metrics)
                 shutil.copy(LAST_PTH, _snap_last)
                 if os.path.exists(BEST_PTH):
                     shutil.copy(BEST_PTH, _snap_best)
-                if os.path.exists(os.path.join(RUNS_DIR, 'metrics_record.csv')):
-                    shutil.copy(os.path.join(RUNS_DIR, 'metrics_record.csv'), _snap_metrics)
                 logging.info(f'[Long快照] 第 {SNAPSHOT_EPOCH} 轮快照已存档：checkpoint/metrics 各复制一份')
             except Exception as _e:
                 logging.warning(f'[Long快照] 存档失败({_e})，不影响训练')
 
-        # 温度守护：关键 epoch（10-90，0 起算）后检测 CPU/GPU 温度，过高则休息 10 分钟
+        # 按temp_guard_lis指定轮次检查温度；当前每轮检查，告警/休眠由守护配置决定。
         if epoch in temp_guard_lis:
             temp_guard.check_temps_and_rest(tag=f" epoch{epoch}")
 
@@ -796,7 +760,8 @@ def train_and_validate(model,
         'batch_size': batch_size,
         'train_samples': len(train_loader.dataset),
         'val_samples': len(val_loader.dataset),
-        'epochs_run': [epoch_start, num_epochs - 1],
+        'epochs_run': [0, num_epochs - 1],
+        'invocation_start_epoch': epoch_start,
         'best_val_epoch': best_epoch,
         'best_val_acc': round(best_val_acc, 4),
         'train_acc_at_best': round(train_acc_at_best, 4),
@@ -805,23 +770,43 @@ def train_and_validate(model,
         'label_schema_id': LABEL_SCHEMA_ID,
         'label_schema_version': LABEL_SCHEMA_VERSION,
         'label_schema_definition_hash': LABEL_SCHEMA_DEFINITION_HASH,
-        'label_mapping_hash': mapping_fingerprint(id_to_main_class, renew_class_to_index),
+        'label_mapping_hash': _run_label_metadata['label_mapping_hash'],
         'sampler_seed_scheme': f'run_seed*{SAMPLER_SEED_STRIDE}+epoch',
         'last_sampler_seed': _derive_sampler_seed(SEED, num_epochs - 1),
         'amp_gradient_clipping': 'unscale_before_clip',
         'peak_gpu_mb': round(torch.cuda.max_memory_allocated() / 1024 ** 2, 1) if torch.cuda.is_available() else 0,
         'unfreeze_mode': unfreeze_mode,
-        'model_metadata': _model_metadata(model),
-        'model_signature_sha256': _model_identity(model)[1],
+        'model_metadata': _run_model_metadata,
+        'model_signature_sha256': _run_model_signature,
         'experiment_signature': EXPERIMENT_SIGNATURE,
                         'normalization_signature': NORMALIZATION_SIGNATURE,
         'backbone': BACKBONE_NAME, 'unfreeze_epochs': UNFREEZE_EPOCHS,
         'training_policy': TRAINING_POLICY,
         'save_time': datetime.strftime(datetime.now(), '%Y-%m-%d %H:%M:%S'),
     }
+    if LONG_SOURCE:
+        _results['long_source'] = LONG_SOURCE
     with open(os.path.join(RUNS_DIR, f'results_{RUN_TAG}.json'), 'w', encoding='utf-8') as f:
         json.dump(_results, f, ensure_ascii=False, indent=2)
     logging.info(f'结果汇总已保存: results_{RUN_TAG}.json -> {_results}')
+
+    if not SMOKE and not save_model_after_epoch_flag:
+        # 使用训练结束时的实际阶段保存附属整模型；epoch记录最后一个零基轮次。
+        final_epoch = num_epochs - 1
+        save_model_after_epoch(epoch=final_epoch,
+                               model=model,
+                               optimizer=optimizer,
+                               scheduler=scheduler,
+                               renew_class_to_index=renew_class_to_index,
+                               state=state,
+                               config_id=CONFIG_ID,
+                               seed=SEED,
+                               sampler_seed=_derive_sampler_seed(SEED, final_epoch),
+                               sampling_protocol_version=SAMPLING_PROTOCOL_VERSION,
+                               id_to_main_class=id_to_main_class,
+                               training_protocol_version=TRAINING_PROTOCOL_VERSION,
+                               scaler_state_dict=scaler.state_dict(),
+                               )
 
     return num_epochs, sleep_all_spend
 
@@ -843,13 +828,6 @@ def main(num_epochs, epoch_start=0, checkpoint=None, optimizer_scheduler_YN=Fals
     # class_proportion_parent = class_proportion[0].to(device)
     # class_proportion_child = class_proportion[1].to(device)
 
-    weight = get_class_weight(
-        renew_class_to_index=renew_class_to_index,
-        # main_class_to_index=main_class_to_index,
-        #                       id_to_child_class=id_to_child_class,
-        merged_dict_user=merged_dict,
-        id_to_main_class=id_to_main_class
-    )
 
     # print(f"CrossEntropyLoss权重-parent:{len(torch.tensor(weight[1]))}")
     # print(f"CrossEntropyLoss权重-child:{len(torch.tensor(weight[0]))}")
@@ -864,7 +842,8 @@ def main(num_epochs, epoch_start=0, checkpoint=None, optimizer_scheduler_YN=Fals
                                            ).to(device)
     # child_criterion = nn.CrossEntropyLoss(label_smoothing=0.1).to(device)  # 移除权重参数避免维度不匹配
 
-    mean, std, _ = calculate_mean_and_std(file, retrieve_file=True)
+    normalization = _cfg['NORMALIZATION']
+    mean, std = torch.tensor(normalization['mean']), torch.tensor(normalization['std'])
 
 
     # 设置数据预处理
@@ -903,6 +882,8 @@ def main(num_epochs, epoch_start=0, checkpoint=None, optimizer_scheduler_YN=Fals
         transforms.ToTensor(),
         transforms.Normalize(mean=mean, std=std)
     ])
+    # 保留供后续数据增强消融实验参考的 Albumentations 示例，当前未启用。
+    # 三引号内仅为示例文本；当前训练与验证使用上方 torchvision 配置。
     """
     train_transform = A.Compose([
         # 1. Resize 和 RandomResizedCrop
@@ -1019,7 +1000,7 @@ def main(num_epochs, epoch_start=0, checkpoint=None, optimizer_scheduler_YN=Fals
         # cached_dataset,
         batch_size=batch_size,
         # shuffle=True,
-        # worker 数集中在 src_v2/__init__.py 的 TRAIN_NUM_WORKERS（2026-09-26：8→6 压提交内存峰值）
+        # 训练 worker 数由 src_v3/runtime.py 的 TRAIN_NUM_WORKERS 集中定义。
         num_workers=TRAIN_NUM_WORKERS,
         pin_memory=True,
         persistent_workers=True,
@@ -1029,18 +1010,12 @@ def main(num_epochs, epoch_start=0, checkpoint=None, optimizer_scheduler_YN=Fals
         collate_fn=hierarchical_collate_fn,
         generator=torch.Generator().manual_seed(SEED)
     )
-    # ⚠️ persistent_workers=True 不可省（2026-09-26 修）：
-    #   若 val_loader 是"非持久"的，每轮验证都会在 8 个常驻训练 worker 存活的同时
-    #   新建 4 个 worker；Windows 下新建 worker 需要重新加载整套模块链（提交内存峰值出现在
-    #   这一刻），一旦第 4 个加载失败（WinError 1455），它会在向父进程注册前就死掉，
-    #   主进程随即永久阻塞在启动握手 —— 2026-09-26 01:43 的停摆正卡在
-    #   「Epoch 0 训练结束 → 首次 iter(val_loader)」这一步（日志停在 Train Accuracy Parent，
-    #   之后 Validation Accuracy Parent 再无输出）。
-    #   常驻后 worker 只在首次验证创建一次，后续每轮复用，既消除峰值也省掉重复的启动开销。
+    # 训练和验证均复用 worker，避免每轮迭代重新创建进程。
+    # 保留 persistent_workers=True，配合集中配置的 worker 数量使用。
     val_loader = DataLoader(val_dataset,
                             batch_size=batch_size,
                             shuffle=False,
-                            # worker 数集中在 src_v2/__init__.py 的 VAL_NUM_WORKERS（2026-09-26：4→2）
+                            # 验证 worker 数由 src_v3/runtime.py 的 VAL_NUM_WORKERS 集中定义。
                             num_workers=VAL_NUM_WORKERS,
                             pin_memory=True,
                             persistent_workers=True,
@@ -1048,13 +1023,12 @@ def main(num_epochs, epoch_start=0, checkpoint=None, optimizer_scheduler_YN=Fals
                             generator=torch.Generator().manual_seed(SEED)
                             )
 
-    # 定义总步数和热身步数
-    total_steps = len(train_loader) * num_epochs
-    warmup_steps = int(total_steps * 0.1)  # 热身占 10%
-
     # 调度器
     # scheduler = ReduceLROnPlateau(optimizer, patience=3, factor=0.8, mode='min', threshold=0.01)
 
+    # 旧warmup示例（未启用；使用时需恢复对应导入）。
+    # total_steps = len(train_loader) * num_epochs
+    # warmup_steps = int(total_steps * 0.1)  # 热身占 10%
     # scheduler = get_cosine_schedule_with_warmup(
     #     optimizer,
     #     num_warmup_steps=warmup_steps,
@@ -1068,15 +1042,7 @@ def main(num_epochs, epoch_start=0, checkpoint=None, optimizer_scheduler_YN=Fals
         if checkpoint is not None and 'scheduler_state_dict' in checkpoint:
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             logging.info('已恢复 scheduler 状态（续跑无 LR 跳变）')
-        # ⚠️ 2026-09-22 移除"续跑时把 lr 抬到 ≥1e-5"的补丁（src 时代遗留）：
-        #    它存在的理由是当时 scheduler 状态不恢复（见 src/train.py 第 697 行被注释），
-        #    续跑只能靠抬 lr 以避免永久卡在 eta_min=1e-6 地板；v2 已能恢复 scheduler 状态
-        #    （上一行），根因消除，而该补丁会在续跑后第 1 个 epoch 静默覆盖刚恢复的调度值，
-        #    与论文声明的 CAWR(eta_min=1e-6) 不一致（上一句还打印"续跑无 LR 跳变"）。
-        #    核查依据：被抬过的轮次 lr 恰好等于 1e-05，可当指纹；全量 13 份 metrics 归档中
-        #    仅 5 处命中，且全部落在已废弃/已排除的 run（脏跑 G-Full-CAWR、废弃的 Long 第 1 次、
-        #    RLRP 时代 G-NoSE seed2）——论文用到的每个 run 都未执行过该分支，
-        #    故本次移除不改变任何已得结果（详见 findings.md §十七）。
+        # 续跑恢复原状态，不手工抬高学习率。
         # current_lr = optimizer.param_groups[0]['lr']
         # if current_lr < 1e-5:
         #     for param_group in optimizer.param_groups:
@@ -1109,25 +1075,6 @@ def main(num_epochs, epoch_start=0, checkpoint=None, optimizer_scheduler_YN=Fals
     # print(s, file=fp)
     # logging.info(s)
 
-    if not SMOKE and not save_model_after_epoch_flag:
-        # 这里是全部运行完, 如果没有设置每轮保存, 则在此保存, 若开启每轮保存, 则无需再进行保存
-        # train_and_validate 返回的是目标总轮数；共享模型的 epoch 元数据应写最后一个零基 epoch。
-        final_epoch = num_epochs - 1
-        save_model_after_epoch(epoch=final_epoch,
-                               model=model,
-                               optimizer=optimizer,
-                               scheduler=scheduler,
-                               renew_class_to_index=renew_class_to_index,
-                               state=state,
-                               config_id=CONFIG_ID,
-                               seed=SEED,
-                               sampler_seed=_derive_sampler_seed(SEED, final_epoch),
-                               sampling_protocol_version=SAMPLING_PROTOCOL_VERSION,
-                               id_to_main_class=id_to_main_class,
-                               training_protocol_version=TRAINING_PROTOCOL_VERSION,
-                               scaler_state_dict=scaler.state_dict(),
-                               )
-
     # checkpoint = {
     #     'epoch': epoch,
     #     'model': model,  # 保存整个模型对象
@@ -1154,27 +1101,8 @@ def _check_arch(checkpoint, model):
 
 
 def _model_metadata(model):
-    """生成稳定、JSON可序列化的结构元数据；用于断点身份校验和结果复核。"""
-    if hasattr(model, 'architecture_metadata'):
-        return model.architecture_metadata()
-
-    transformer = getattr(model, 'transformer', None)
-    layers = getattr(transformer, 'layers', None)
-    se_block = getattr(model, 'se_block', None)
-    classifier = getattr(model, 'parent_classifier', None)
-    return {
-        'architecture': type(model).__name__,
-        'backbone': 'resnext50_32x4d',
-        'num_classes': getattr(classifier, 'out_features', None),
-        'regions': list(getattr(se_block, 'regions', [])) if hasattr(se_block, 'regions') else None,
-        'transformer_layers': len(layers) if layers is not None else 0,
-        'd_model': getattr(classifier, 'in_features', None),
-        'nhead': None,
-        'num_patches': 1,
-        'pos_embed_type': None,
-        'readout': 'single_token',
-        'use_decouple': not isinstance(getattr(model, 'disentangle_layer', None), nn.Identity),
-    }
+    """读取模型必须提供的稳定、JSON可序列化结构元数据。"""
+    return model.architecture_metadata()
 
 
 def _model_identity(model):
@@ -1185,11 +1113,13 @@ def _model_identity(model):
 
 
 def _check_model_identity(checkpoint, model):
-    """新格式断点必须与当前精确结构一致；旧断点缺签名时保留兼容警告。"""
+    """核对断点实验身份和结构签名；结构签名缺失或不匹配时拒绝续跑。"""
     if NORMALIZATION_SIGNATURE and checkpoint.get('normalization_signature') != NORMALIZATION_SIGNATURE:
         raise RuntimeError('断点归一化参数与当前配置不一致，拒绝续跑')
     if checkpoint.get('experiment_signature') != EXPERIMENT_SIGNATURE:
         raise RuntimeError('断点骨干/解冻时点/共同训练策略与当前实验不一致，拒绝续跑')
+    if LONG_SOURCE and checkpoint.get('long_source') != LONG_SOURCE:
+        raise RuntimeError('Long断点来源与当前配置不一致，拒绝续跑')
     expected_metadata, expected_signature = _model_identity(model)
     actual_signature = checkpoint.get('model_signature_sha256')
     if actual_signature is None:
@@ -1252,7 +1182,11 @@ def _build_model(preset, transformer_layers, d_model, nhead, id_to_main_class, r
 
 if __name__ == '__main__':
     _setup_logging()  # 主进程才配置日志；spawn worker 不进入此块，不会重复打印
-    preset = PRESETS[CONFIG_ID]
+    if _config_log is not None:
+        logging.log(*_config_log)
+    if _long_initialized:
+        logging.info(f'Long初始化完成：继承{LONG_SOURCE}，前缀指标未重新训练')
+    preset = PRESET
     seed_all(SEED)
     state = 1
     d_model = 512
@@ -1295,26 +1229,23 @@ if __name__ == '__main__':
     # print(len(id_to_main_class), len(id_to_child_class), len(main_class_to_index), sep="\n\n\n")
     use_old_model = False
     if RESUME:
-        _resume_path = LAST_PTH if os.path.exists(LAST_PTH) else pth_file_name
+        _resume_path = LAST_PTH
         if os.path.exists(_resume_path):
             use_old_model = True
-            checkpoint = torch.load(_resume_path)
+            checkpoint = torch.load(_resume_path, map_location='cpu')
             _check_label_schema(checkpoint, id_to_main_class, renew_class_to_index)
             checkpoint_protocol = checkpoint.get('training_protocol_version', 1)
-            if (checkpoint_protocol != TRAINING_PROTOCOL_VERSION and
-                    not ALLOW_LEGACY_PROTOCOL_RESUME):
+            if checkpoint_protocol != TRAINING_PROTOCOL_VERSION:
                 raise RuntimeError(
                     f'断点训练协议 v{checkpoint_protocol} 与当前 v{TRAINING_PROTOCOL_VERSION} 不兼容：'
                     '旧断点在 AMP 梯度裁剪前未 unscale。为避免混合协议，正式实验请先归档旧产物并从 epoch 0 重跑；'
-                    '仅为诊断而明确接受混合协议时，才在 experiment_config.json 设置 '
-                    'ALLOW_LEGACY_PROTOCOL_RESUME=true。')
+                    '当前V3不支持通过 ALLOW_LEGACY_PROTOCOL_RESUME 绕过协议校验。')
             checkpoint_sampling_protocol = checkpoint.get('sampling_protocol_version', 0)
-            if (checkpoint_sampling_protocol != SAMPLING_PROTOCOL_VERSION and
-                    not ALLOW_LEGACY_PROTOCOL_RESUME):
+            if checkpoint_sampling_protocol != SAMPLING_PROTOCOL_VERSION:
                 raise RuntimeError(
                     f'断点采样协议 v{checkpoint_sampling_protocol} 与当前 v{SAMPLING_PROTOCOL_VERSION} 不兼容：'
                     '旧断点使用进程级连续随机流，当前实现使用逐 epoch sampler seed。'
-                    '为避免混合采样协议，正式实验请从 epoch 0 重跑；仅诊断时才允许 legacy resume。')
+                    '当前V3不支持绕过采样协议校验；请使用兼容断点，或归档旧产物后从 epoch 0 重新训练。')
             if checkpoint_sampling_protocol == SAMPLING_PROTOCOL_VERSION:
                 checkpoint_seed = int(checkpoint.get('seed', SEED))
                 if checkpoint_seed != int(SEED):
@@ -1331,6 +1262,7 @@ if __name__ == '__main__':
                 # 旧格式：整个模型对象
                 model = checkpoint['model']
                 _check_arch(checkpoint, model)
+                _check_model_identity(checkpoint, model)
                 model.load_state_dict(checkpoint['model_state_dict'])
             else:
                 # 新格式：state_dict 断点文件
@@ -1341,9 +1273,9 @@ if __name__ == '__main__':
                 model.load_state_dict(checkpoint['state_dict'])
             logging.info(f'RESUME: 从 {_resume_path} 继续, epoch {epoch_start}, state={state}')
         else:
-            logging.warning('RESUME=True 但未找到断点文件，改为全新训练')
+            raise FileNotFoundError(f'要求续跑但缺少last断点：{_resume_path}')
     if not use_old_model:
-        # 从头开始训练（按 PRESETS 预设开关）
+        # 从头开始训练，使用当前注册配置。
         model = _build_model(preset, transformer_layers, d_model, nhead,
                              id_to_main_class, renew_class_to_index)
 
@@ -1381,10 +1313,6 @@ if __name__ == '__main__':
             logging.info('已恢复 GradScaler 状态')
         else:
             logging.warning('旧断点不含 GradScaler 状态，将以新的缩放状态继续')
-        if checkpoint.get('training_protocol_version') != TRAINING_PROTOCOL_VERSION:
-            logging.warning('当前断点来自旧训练协议；修复 AMP 后继续会混合两种协议，正式实验应从 epoch 0 重跑')
-        if checkpoint.get('sampling_protocol_version', 0) != SAMPLING_PROTOCOL_VERSION:
-            logging.warning('当前断点来自旧采样协议；续跑会混合进程级随机流与逐 epoch sampler seed')
     model = model.to(device)  # 将模型转移到 GPU
     for name, module in model.named_children():
         print(name, " ---> ", type(module))
@@ -1423,7 +1351,7 @@ if __name__ == '__main__':
     # 触发条件：非冒烟 且 非续跑；冒烟/续跑不归档
     if not SMOKE and not use_old_model:
         _ts = datetime.strftime(datetime.now(), '%Y%m%d_%H%M%S')
-        for _name in ['garbage_classification_model.pth', 'metrics.csv', 'metrics_record.csv', 'last_config.json',
+        for _name in ['garbage_classification_model.pth', 'metrics_record.csv', 'last_config.json',
                       f'checkpoint_{RUN_TAG}_best.pth', f'checkpoint_{RUN_TAG}_last.pth',
                       f'results_{RUN_TAG}.json']:
             _p = os.path.join(RUNS_DIR, _name)

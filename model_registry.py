@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """V3 NoTF实验注册表：配置ID、骨干和解冻时点的唯一来源。
 
-保留两个已命名基线；新增早/晚解冻及ResNet18/34全解冻。
+保留原八项，新增ResNet18/ShuffleNetV2x1.0的SE[1]全解冻配置。
 不构造骨干与时点的笛卡尔积。model/arch='v2'是内部模型实现键。
-当前六项共同使用NoTF，不在ID中重复写系列/基线前缀。首轮均seed1、100轮。
+当前十项共同使用NoTF；首轮两个SE[1]配置seed1、100轮，任务以QUEUE为准。
+Shuffle已接入，RegNetX400MF仍待适配；增强研究候选仅在QUEUE注释展示。
 """
 from copy import deepcopy
 import hashlib
@@ -15,7 +16,14 @@ EARLY_UNFREEZE_ID = 'ProgressiveUnfreeze-E15-40'
 LATE_UNFREEZE_ID = 'ProgressiveUnfreeze-E45-75'
 RESNET18_ID = 'ResNet18-FullUnfreeze'
 RESNET34_ID = 'ResNet34-FullUnfreeze'
-BACKBONE_FEATURE_DIMS = {'resnext50_32x4d': 2048, 'resnet18': 512, 'resnet34': 512}
+REGNETX400MF_ID = 'RegNetX400MF-FullUnfreeze'
+SHUFFLENETV2_X1_0_ID = 'ShuffleNetV2x1.0-FullUnfreeze'
+RESNET18_SE1_ID = 'ResNet18-SE1-FullUnfreeze'
+SHUFFLENETV2_X1_0_SE1_ID = 'ShuffleNetV2x1.0-SE1-FullUnfreeze'
+BACKBONE_FEATURE_DIMS = {
+    'resnext50_32x4d': 2048, 'resnet18': 512, 'resnet34': 512,
+    'regnet_x_400mf': 400, 'shufflenet_v2_x1_0': 1024,
+}
 TRAINING_POLICY = {
     'optimizer': 'adamw_all_parameter_groups', 'backbone_lr': 1e-4,
     'head_lr': 1e-4, 'weight_decay': 1e-2,
@@ -25,14 +33,15 @@ TRAINING_POLICY = {
 }
 
 
-def _make_entry(backbone, unfreeze_epochs, short, phase):
+def _make_entry(backbone, unfreeze_epochs, short, phase, regions=(1, 2)):
     epochs = list(unfreeze_epochs)
     return {
         'params': dict(model='v2', backbone=backbone, pretrained=True,
-                       regions=[1, 2], transformer_layers=0, use_decouple=True,
+                       regions=list(regions), transformer_layers=0, use_decouple=True,
                        unfreeze='progressive' if epochs else 'none',
                        unfreeze_epochs=epochs, scheduler='cawr'),
-        'arch': 'v2', 'short': short, 'cn': short + '（SE[1,2]）',
+        'arch': 'v2', 'short': short,
+        'cn': short + '（SE[' + ','.join(map(str, regions)) + ']）',
         'target_epochs': 100, 'phase': phase, 'protocol_target': 3,
         'status': 'registered',
         'note': '首轮seed1；统一全局lr/正则化/BN规则，准备与短运行通过后执行。',
@@ -46,15 +55,21 @@ MODELS = {
     LATE_UNFREEZE_ID: _make_entry('resnext50_32x4d', [45, 75], '较晚解冻45/75', 'unfreeze_timing'),
     RESNET18_ID: _make_entry('resnet18', [], 'ResNet18全解冻', 'backbone'),
     RESNET34_ID: _make_entry('resnet34', [], 'ResNet34全解冻', 'backbone'),
+    REGNETX400MF_ID: {
+        **_make_entry('regnet_x_400mf', [], 'RegNetX400MF全解冻', 'backbone'),
+        'status': 'pending_backbone_adapter',
+        'note': '参数已登记；stem/trunk特征提取待适配，未加入QUEUE或执行训练。',
+    },
+    SHUFFLENETV2_X1_0_ID: {
+        **_make_entry('shufflenet_v2_x1_0', [], 'ShuffleNetV2x1.0全解冻', 'backbone'),
+        'note': '骨干已接入并保留conv5；SE[1,2]对照在QUEUE中注释，未执行训练。',
+    },
+    RESNET18_SE1_ID: _make_entry('resnet18', [], 'ResNet18单区域全解冻', 'backbone', regions=[1]),
+    SHUFFLENETV2_X1_0_SE1_ID: _make_entry(
+        'shufflenet_v2_x1_0', [], 'ShuffleNetV2x1.0单区域全解冻', 'backbone', regions=[1]),
 }
 ORDER = list(MODELS)
-ALIASES = {}
 DEFAULT_MODEL = FULL_UNFREEZE_ID
-MODEL_PARAMS = {key: deepcopy(value['params']) for key, value in MODELS.items()}
-MODEL_CN = {key: value['cn'] for key, value in MODELS.items()}
-MODEL_SHORT = {key: value['short'] for key, value in MODELS.items()}
-MODEL_ARCH = {key: value['arch'] for key, value in MODELS.items()}
-MODEL_TARGET_EPOCHS = {key: value['target_epochs'] for key, value in MODELS.items()}
 
 
 def normalize(name: str) -> str:
@@ -62,18 +77,19 @@ def normalize(name: str) -> str:
 
 
 def _entry(name: str) -> dict:
-    try:
+    if name in MODELS:
         return MODELS[name]
-    except KeyError:
-        raise KeyError(f'未注册的V3实验ID: {name!r}; 可用ID: {ORDER}') from None
+    from run_queue import long_entry
+    return long_entry(name)
 
 
 def known_models() -> list:
-    return list(ORDER)
+    from run_queue import LONG_CONFIGS
+    return list(ORDER) + list(LONG_CONFIGS)
 
 
 def is_known(name: str) -> bool:
-    return name in MODELS
+    return name in MODELS or name in known_models()
 
 
 def params_of(name: str) -> dict:
@@ -125,20 +141,33 @@ def experiment_signature_of(name: str) -> str:
     payload = {'params': params_of(name), 'epochs': target_of(name),
                'protocol_target': _entry(name)['protocol_target'],
                'training_policy': training_policy_of(name)}
+    source = _entry(name).get('long_source')
+    if source:
+        payload['long_source'] = source
     text = json.dumps(payload, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
     return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+
+def long_source_of(name: str, seed: int):
+    """返回Long来源身份；普通实验返回None。"""
+    source = _entry(name).get('long_source')
+    return dict(source, seed=seed) if source else None
 
 
 def config_for_run(name: str, seed: int, resume=False, smoke=False) -> dict:
     if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
         raise ValueError('seed必须为非负整数')
     epochs = unfreeze_epochs_of(name)
-    return {'CONFIG_ID': name, 'SEED': seed, 'SMOKE': bool(smoke),
-            'MAX_EPOCHS': 3 if smoke else target_of(name), 'RESUME': bool(resume),
+    source = long_source_of(name, seed) if not smoke else None
+    config = {'CONFIG_ID': name, 'SEED': seed, 'SMOKE': bool(smoke),
+            'MAX_EPOCHS': 3 if smoke else target_of(name), 'RESUME': bool(resume or source),
             'AUTO': True, 'BACKBONE': backbone_of(name),
             'UNFREEZE1_EPOCH': epochs[0] if epochs else None,
             'UNFREEZE2_EPOCH': epochs[1] if epochs else None,
             'EXPERIMENT_SIGNATURE': experiment_signature_of(name)}
+    if source:
+        config['LONG_SOURCE'] = source
+    return config
 
 
 def validate_config_binding(name: str, config: dict):
@@ -149,6 +178,9 @@ def validate_config_binding(name: str, config: dict):
             raise ValueError(f'{key}与注册表冲突：{config[key]!r} != {expected[key]!r}')
     if not config.get('SMOKE', False) and config.get('MAX_EPOCHS', target_of(name)) != target_of(name):
         raise ValueError('正式预算与注册表不一致')
+    if 'LONG_SOURCE' in expected:
+        if config.get('LONG_SOURCE') != expected['LONG_SOURCE'] or not config.get('RESUME'):
+            raise ValueError('Long必须携带登记来源并使用续跑模式')
 
 
 def validate_registry():

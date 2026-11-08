@@ -18,20 +18,16 @@ from src_v3.taxonomy import (
 ACC_STOP = 98
 ERROR_RATE = 0.1
 
-# ===== DataLoader 常驻 worker 数（集中配置，train.py 只从这里读取）=====
-# 2026-09-26 修 WinError 1455：Windows spawn worker 会重新 import 本包，
-# 每个常驻 worker 都占一份提交内存（实测即使 worker 内 device=cpu 仍 ~4.5 GB/个）。
-# 常驻合计 = TRAIN + VAL，此前 8+4 峰值 ~108.7 GB 曾撞 CommitLimit（101.11 GB），
-# 降到 6+2 后峰值 ~90 GB，留 ~10 GB 漂移余量。调整时两处一起权衡。
+# DataLoader worker 数集中配置；Windows spawn 会在子进程重新导入模块。
+# 配合持久 worker 使用，调整数量时需考虑各进程的内存开销。
 TRAIN_NUM_WORKERS = 6   # 训练 loader 常驻 worker（配合 persistent_workers=True + prefetch_factor）
 VAL_NUM_WORKERS = 2     # 验证 loader 常驻 worker（必须 persistent_workers=True，否则首轮验证新建 worker 会复现 1455 死锁）
 
-# ===== 输出路径：全部落到 src_v2/runs/（与工作目录无关） =====
+# 输出目录优先使用 V3_RUN_DIR，默认 src_v3/runs，与工作目录无关。
 _runs_dir = os.environ.get('V3_RUN_DIR', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'runs'))
-os.makedirs(_runs_dir, exist_ok=True)
 
 pth_file_name = os.path.join(_runs_dir, 'garbage_classification_model.pth')
-metrics_file = os.path.join(_runs_dir, "metrics.csv")
+metrics_file = os.path.join(_runs_dir, "metrics_record.csv")
 extensions_suffix = ('jpg', 'jpeg', 'png', 'bmp', 'tif', 'tiff', 'avif', '.jfif')
 
 # `merged_dict` 由 taxonomy.py 导入；请只在那里修改训练标签体系。
@@ -76,6 +72,7 @@ def save_model_after_epoch(epoch,
                            id_to_main_class=None,
                            training_protocol_version=None,
                            scaler_state_dict=None):
+    os.makedirs(_runs_dir, exist_ok=True)
     today = datetime.strftime(datetime.now(), '%Y-%m-%d')
     # 执行原始的训练函数
     checkpoint = {
@@ -101,12 +98,15 @@ def save_model_after_epoch(epoch,
         'today': today,
         'state': state
     }
-    from .model_registry import experiment_signature_of, params_of, training_policy_of
+    from .model_registry import experiment_signature_of, params_of, training_policy_of, long_source_of
     preset = params_of(config_id)
     checkpoint.update(experiment_signature=experiment_signature_of(config_id),
                       normalization_signature=os.environ.get('V3_NORMALIZATION_SIGNATURE'),
                       backbone=preset['backbone'], unfreeze_epochs=preset['unfreeze_epochs'],
                       training_policy=training_policy_of(config_id))
+    source = long_source_of(config_id, seed)
+    if source:
+        checkpoint['long_source'] = source
     metadata = model.architecture_metadata()
     import hashlib, json
     checkpoint.update(model_metadata=metadata, model_signature_sha256=hashlib.sha256(
@@ -117,17 +117,23 @@ def save_model_after_epoch(epoch,
     # for k, v in sorted_items[:20]:
     #     print(v, "<-", k)
     # *****************************************************
+    saved = False
     if other_pth_file_name is None:
         torch.save(checkpoint, pth_file_name)
+        saved = True
     else:
         if not os.path.isfile(other_pth_file_name):
             torch.save(checkpoint, other_pth_file_name)
+            saved = True
             s = f"特殊模型{other_pth_file_name}已保存, epoch {epoch} 完成!"
             print(s)
             logging.info(s)
     s = f"模型已保存, epoch {epoch} 完成!{today=}"
     print(s)
-    logging.info(s)
+    if saved:
+        logging.info(s)
+    else:
+        logging.info('目标模型已存在，跳过保存：%s，epoch=%s', other_pth_file_name, epoch)
 
 
 # transforms_setting = transforms.Compose([
@@ -150,24 +156,17 @@ def save_model_after_epoch(epoch,
 #     transforms.Normalize([0.485, 0.456, 0.409], [0.229, 0.224, 0.225]),  # 均值, 标准差
 # ])
 
-# ⚠️ device 必须按**进程角色**分支，不能无条件探测 CUDA（2026-09-26 修）。
-#
-# 背景：Windows 下 DataLoader 用 spawn 派生 worker，**每个 worker 子进程都会重新执行本模块**。
-#   若在模块级调用 torch.cuda.is_available()，就会在每个只负责"读图/解码/增强"的子进程里
-#   初始化 CUDA 运行时并加载整套 CUDA/cuDNN/cuBLAS DLL —— 实测单个 worker 提交内存约
-#   4.55 GB（torch_cuda_cu.dll 828 MB + cudnn_cnn_infer 626 MB + cudnn_ops_infer 271 MB
-#   + cusparse/cusolver/cufft/cublas/curand/nvrtc 等）。
-#   于是：8 个训练 worker ≈ 36 GB + 主进程 ≈ 18 GB，到首次验证再新建 4 个 val worker ≈ 18 GB，
-#   合计约 70 GB ⇒ 撞上 Windows 提交内存上限，抛
-#     OSError [WinError 1455] 页面文件太小 … Error loading "…torch\lib\cublas64_11.dll"
-#   且失败发生在 worker 向父进程注册**之前** ⇒ 主进程永久阻塞在 DataLoader 启动握手，
-#   表现为"0 CPU、日志停更、GPU 空转却占着显存"（2026-09-26 01:43 的停摆即由此而起）。
-#
-# 只有主进程需要 CUDA；worker 全程在 CPU 侧工作，给 cpu 即可（单 worker 从 ~4.55 GB 降到数百 MB）。
+# 首次获取 device 时按进程角色选择并缓存。
+# 主进程优先使用可用 CUDA；数据加载 worker 使用 CPU，不探测 CUDA。
 import multiprocessing as _mp
 
-if _mp.current_process().name == 'MainProcess':
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-else:
-    # DataLoader worker（spawn 子进程）：不触碰 CUDA，避免无谓的提交内存开销
-    device = torch.device('cpu')
+def __getattr__(name):
+    """首次获取device时按进程角色选择设备，之后复用。"""
+    if name != 'device':
+        raise AttributeError(f'{__name__}没有属性{name!r}')
+    global device
+    if _mp.current_process().name == 'MainProcess':
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    else:
+        device = torch.device('cpu')
+    return device

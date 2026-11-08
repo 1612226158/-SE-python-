@@ -1,13 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torchvision.models import resnet50, resnet34, resnet101, resnet18
-from torchvision.models import resnet101
-from torch.nn import TransformerEncoder, TransformerEncoderLayer
-from torchvision import datasets, transforms
-from PIL import Image
-import os
-import re
 
 
 class SEBlock(nn.Module):
@@ -77,10 +69,12 @@ class SEBlock(nn.Module):
 
         # ============ Squeeze阶段：多区域池化 ============
         region_features = []
+        # FP16区域求和可能溢出；池化用FP32累加，结果恢复输入dtype。
+        pool_input = x.float() if x.dtype == torch.float16 else x
 
         for pool in self.region_pools:
             # 池化：(B, C, H, W) -> (B, C, r, r)
-            pooled = pool(x)
+            pooled = pool(pool_input).to(x.dtype)
             # 展平：(B, C, r, r) -> (B, C × r × r)
             flattened = pooled.view(batch_size, -1)
             region_features.append(flattened)

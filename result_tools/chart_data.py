@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
 """V3公共结果读取：仅扫描runs下正式run目录，排除_smoke与analyses。
 
-按配置/seed读取metrics_record及归档、results与checkpoint路径，校验实验身份。
+按配置/seed读取当前metrics_record.csv、results与checkpoint路径，校验实验身份。
 查询不构造模型、不读原图；分析输出仅在显式请求时写runs/analyses。
 例：python chart_data.py summary FullUnfreeze:1
 """
 import argparse
-import glob
 import json
 import math
 import os
@@ -19,80 +18,37 @@ _SRC_V3 = os.path.dirname(_HERE)
 if _SRC_V3 not in sys.path:
     sys.path.insert(0, _SRC_V3)
 from run_paths import formal_run_directories, result_path, checkpoint_path, load_config, normalization_signature
+import taxonomy as _taxonomy
+import model_registry as _mr
 RUNS = os.path.join(_SRC_V3, 'runs')
 
-# ============ 合并类口径常量（2026-09-26 加：消灭各绘图/评估脚本的硬编码 254） ============
-# **唯一真源 = src_v3/taxonomy.py**（merged_dict + RAW_CLASS_COUNT）。本模块**派生**而非复制：
-#   口径 = 原始子类文件夹数 − Σ(|组|−1)。
-#   2026-09-26 之前：7 组 18 子类 → 265 − 11 = 254
-#   2026-09-26 起  ：并入「蔬菜+菜根菜叶→菜叶」「插头电线+充电线→插头充电线」
-#                   （组名取「插头充电线」而非「充电器」，避免与既有类别「充电头」(id 68) 语义重叠）
-#                   共 9 组 22 子类 → 265 − 13 = 252
-# ⇒ 改标签体系请**只改 src_v3/taxonomy.py**，本模块的 N_CLS 会自动跟随。
-#   交叉校验：eval_tail_class_acc.build_class_table() 有 assert n_classes == N_CLS；
-#   merge_sim.py 自证 #2b 还会额外比对 chart_data.N_CLS ↔ merged_dict 实际类数 ↔ npz 类数。
-
-
-def _derive_n_cls():
-    """按**文件路径**加载 src_v3/taxonomy.py，返回 (原始子类数, 合并后类数)。
-
-    刻意不用 `import src_v3.taxonomy` —— 那会执行 src_v3/__init__.py 从而拉起 torch，
-    而本模块要求绘图脚本保持轻量（plot_*.py 不需要 torch）。taxonomy.py 本身只依赖
-    hashlib/json/os，按路径加载是安全的。
-    """
-    import importlib.util as _ilu
-    _taxonomy = os.path.join(os.path.dirname(_HERE), 'taxonomy.py')
-    _spec = _ilu.spec_from_file_location('_taxonomy_for_chart', _taxonomy)
-    if _spec is None or _spec.loader is None:
-        raise ImportError(f'无法定位 {_taxonomy}')
-    _mod = _ilu.module_from_spec(_spec)
-    _spec.loader.exec_module(_mod)
-    raw = int(_mod.RAW_CLASS_COUNT)
-    merged = raw - sum(len(g) - 1 for g in _mod.merged_dict.values())
-    return raw, merged
-
-
-try:
-    N_CLS_RAW, N_CLS = _derive_n_cls()
-except Exception as _e:      # taxonomy 缺失/改名时不静默：打印告警 + 回退字面常量
-    sys.stderr.write(
-        f'[chart_data] ⚠ 无法从 src_v3/taxonomy.py 派生合并类数（{_e.__class__.__name__}: {_e}），'
-        f'回退字面常量 265/252 —— 若标签体系已改，此处会画出错误口径，请立即核对。\n')
-    N_CLS_RAW = 265          # 数据集原始子类文件夹数（train/ 与 val/ 各 265 个数字文件夹）
-    N_CLS = 252              # 合并后模型输出类数 = N_CLS_RAW − Σ(|组|−1)（9 组 22 子类 → 减 13）
+# 类别数按taxonomy的原始类数和合并规则派生。
+N_CLS_RAW = int(_taxonomy.RAW_CLASS_COUNT)
+N_CLS = N_CLS_RAW - sum(len(group) - 1 for group in _taxonomy.merged_dict.values())
 
 # V3不继承其他实验目录的历史作废记录。
 DIRTY_RECORDS = {}
 
-# ---------- 模型名 → 元数据（中文全称/短说明）唯一来源 = src_v3\model_registry.py ----------
-# 新增/改模型名一律去 model_registry.py；本模块按 id 索引，注册表缺失时优雅降级为原名。
-_SRC_V3 = os.path.dirname(_HERE)
-if _SRC_V3 not in sys.path:
-    sys.path.insert(0, _SRC_V3)
-try:
-    import model_registry as _mr
-except Exception:          # 注册表被隔离/未生成时降级：不查元数据，仅按原名使用
-    _mr = None
 
-
+# 模型名称及元数据统一读取model_registry。
 def _cid(name):
-    """显示写法 → 规范 key（如 S-NoProG → S-NoProg）；注册表不可用时原样返回。"""
-    return _mr.normalize(name) if _mr is not None else name
+    """通过注册表取得规范配置ID。"""
+    return _mr.normalize(name)
 
 
 def model_cn(name):
     """模型中文全称（GUI 说明行 / 汇报 / 图注用）。"""
-    return _mr.cn_of(name) if _mr is not None else name
+    return _mr.cn_of(name)
 
 
 def model_short(name):
     """模型短说明。"""
-    return _mr.short_of(name) if _mr is not None else name
+    return _mr.short_of(name)
 
 
 def is_known(name):
     """该模型 id 是否已在 model_registry.py 注册。"""
-    return _mr.is_known(name) if _mr is not None else True
+    return _mr.is_known(name)
 
 # ---------- 输出文件名推导（2026-09-08 会话8 加：消灭 out*.pdf 硬编码） ----------
 
@@ -122,21 +78,17 @@ def fig_out(fig_type, model_a, model_b, out_dir=None):
 # ---------- 基础扫描 ----------
 
 def all_metrics_files():
-    """只读正式run子目录的指标，排除_smoke与analyses。"""
+    """只读正式run子目录的当前指标，排除归档、_smoke与analyses。"""
     files = []
     for directory in formal_run_directories(runs_root=RUNS):
         current = directory / 'metrics_record.csv'
         if current.is_file():
             files.append(str(current))
-        files.extend(str(p) for p in sorted(directory.glob('metrics_record_archive_*.csv')))
     return files
 
 
 def _read_all(config_id=None):
-    """扫全部 metrics 文件，过滤出 config_id（可选）+ 剔除 DIRTY_RECORDS 已知脏行。
-    返回单 DataFrame（未排序、未去重）。附加列 _fidx = 来源文件序号（越新越大）——
-    供 load_model 去重时"同一 epoch 确定性保留最新文件"（同 epoch 多份记录时的兜底规则；
-    已知脏 run 已在上面按 (文件, 配置, seed) 行级剔除，不依赖"恰好最新"）。"""
+    """读取正式run当前指标，按配置和作废登记过滤；_fidx用于稳定去重。"""
     frames = []
     for fidx, f in enumerate(all_metrics_files()):
         try:
@@ -193,12 +145,12 @@ def list_models(verbose=True):
 def load_model(config_id, seed=None, verbose=True):
     """取某模型（按 config_id / 模型英文名）的全部训练轮次记录。
 
-    - seed=None：自动取该模型"行数最完整"的 seed（多 seed 并存如 G-Full 的 0/1 时避免混线）；
+    - seed=None：自动选择行数最多的 seed；行数相同时，优先选择最高 epoch 更大者；
     - seed=指定：只取该 seed；
     - 返回按 epoch 升序、同 epoch 去重（保留最后一条）的 DataFrame；
     - 无数据 → 抛 FileNotFoundError（提示该模型还没跑 / config_id 拼错）。
     """
-    config_id = _cid(config_id)   # 兼容 'S-NoProG' 等显示写法
+    config_id = _cid(config_id)   # 当前只传递配置ID，不转换旧名称。
     df = _read_all(config_id)
     if df.empty:
         raise FileNotFoundError(
@@ -222,11 +174,12 @@ def load_model(config_id, seed=None, verbose=True):
             print(f'[chart_data] {config_id}: 自动选用 seed={int(best_seed)} '
                   f'（共 {len(df)} 行，最高 ep{int(df["epoch"].max())}）')
     df = df.sort_values(['epoch', '_fidx'], kind='stable').reset_index(drop=True)
-    df = df.drop_duplicates(subset='epoch', keep='last').reset_index(drop=True)   # 同 epoch 保留最新文件
+    df = df.drop_duplicates(subset='epoch', keep='last').reset_index(drop=True)   # 同epoch保留扫描顺序最后一条
     df = df.drop(columns=['_fidx'], errors='ignore')
     # 数值列尽量转 float（seed 保留原样）
     for col in ('epoch', 'train_acc', 'train_loss', 'val_acc', 'val_loss',
-                'val_macro_f1', 'val_weighted_f1', 'lr', 'time_spend_s'):
+                'val_macro_f1', 'val_weighted_f1', 'val_weighted_precision',
+                'val_weighted_recall', 'lr', 'time_spend_s'):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce')
     return df
@@ -265,10 +218,10 @@ def _number(row, key):
 
 
 def _metric_point(df, column, mode='max'):
-    """返回某指标的极值点 {'value', 'epoch'}；整列无有效值时返回空值。"""
+    """从load_model已规范化的数据取极值点；缺列或全NaN返回空值。"""
     if column not in df.columns:
         return {'value': None, 'epoch': None}
-    values = pd.to_numeric(df[column], errors='coerce')
+    values = df[column]
     valid = values.dropna()
     if valid.empty:
         return {'value': None, 'epoch': None}
@@ -288,12 +241,13 @@ def _result_for_run(config_id, seed):
         return None
     if not isinstance(result, dict) or result.get('config_id') != _cid(config_id) or int(result.get('seed', -1)) != int(seed):
         raise ValueError('V3结果的配置ID/seed身份不匹配')
-    if _mr is None:
-        raise ValueError('V3注册表不可用')
     preset = _mr.params_of(_cid(config_id))
     expected = {'backbone': preset['backbone'], 'unfreeze_epochs': preset['unfreeze_epochs'],
                 'experiment_signature': _mr.experiment_signature_of(_cid(config_id)),
                 'normalization_signature': normalization_signature(load_config())}
+    source = _mr.long_source_of(_cid(config_id), int(seed))
+    if source:
+        expected['long_source'] = source
     for key, value in expected.items():
         if result.get(key) != value:
             raise ValueError(f'V3结果与当前注册配置不一致: {key}')
@@ -309,11 +263,17 @@ def summarize_run(config_id, seed=None):
     正式 best 优先采用指定 seed 的 results JSON；未收官时退回当前 metrics 峰值。
     """
     df = load_model(config_id, seed=seed, verbose=False)
+    return _summarize_frame(config_id, df)
+
+
+def _summarize_frame(config_id, df):
+    """汇总load_model已规范化的逐轮数据，不修改传入数据。"""
     config_id = _cid(config_id)
     selected_seed = int(df['seed'].iloc[0])
     result = _result_for_run(config_id, selected_seed)
-    registered_model = bool(_mr is not None and _mr.is_known(config_id))
+    registered_model = bool(_mr.is_known(config_id))
     target_epochs = int(_mr.target_of(config_id)) if registered_model else None
+    source = _mr.long_source_of(config_id, selected_seed) if registered_model else None
 
     epochs = sorted({int(e) for e in df['epoch'].dropna().tolist()})
     min_epoch = epochs[0]
@@ -336,7 +296,7 @@ def summarize_run(config_id, seed=None):
     final_val = _number(final_row, 'val_acc')
     best_train = _number(best_row, 'train_acc')
     best_val = _number(best_row, 'val_acc')
-    time_values = pd.to_numeric(df.get('time_spend_s'), errors='coerce') if 'time_spend_s' in df else None
+    time_values = df.get('time_spend_s')
 
     def protocol_value(key, cast=None):
         value = result.get(key) if result else None
@@ -357,6 +317,7 @@ def summarize_run(config_id, seed=None):
     return {
         'config_id': config_id,
         'seed': selected_seed,
+        **({'long_source': source} if source else {}),
         'registered_model': registered_model,
         'status': 'finished' if result else 'incomplete',
         'results_json': bool(result),
@@ -509,16 +470,16 @@ def cli(argv=None):
     p_list.add_argument('--json', action='store_true', help='emit machine-readable JSON')
 
     p_summary = sub.add_parser('summary', help='summarize one or more MODEL[:SEED] runs')
-    p_summary.add_argument('runs', nargs='+', help='for example: S-NoProg:1 S-NoSE:1')
+    p_summary.add_argument('runs', nargs='+', help='for example: FullUnfreeze:1 ProgressiveUnfreeze:1')
     p_summary.add_argument('--json', action='store_true', help='emit machine-readable JSON')
 
     p_compare = sub.add_parser('compare', help='compare two MODEL[:SEED] runs; delta=right-left')
-    p_compare.add_argument('left', help='left run, for example S-NoProg:1')
-    p_compare.add_argument('right', help='right run, for example S-NoSE:1')
+    p_compare.add_argument('left', help='left run, for example FullUnfreeze:1')
+    p_compare.add_argument('right', help='right run, for example ProgressiveUnfreeze:1')
     p_compare.add_argument('--json', action='store_true', help='emit machine-readable JSON')
 
     p_data = sub.add_parser('data', help='print every merged epoch row and every source column')
-    p_data.add_argument('run', help='run to read, for example S-NoProg:1')
+    p_data.add_argument('run', help='run to read, for example FullUnfreeze:1')
     p_data.add_argument('--json', action='store_true', help='emit a JSON array instead of CSV')
 
     args = parser.parse_args(argv)
@@ -620,8 +581,8 @@ def load_run_frames(config_ids, seeds=(1, 2), require_complete=True):
     for config_id in config_ids:
         for seed in seeds:
             key = (_cid(config_id), int(seed))
-            summary = summarize_run(*key)
             frame = load_model(*key, verbose=False)
+            summary = _summarize_frame(key[0], frame)
             if require_complete:
                 epochs = summary['epochs']
                 if (not summary['results_json'] or not epochs['continuous_from_zero']

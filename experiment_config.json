@@ -1,15 +1,13 @@
 {
   "CONFIG_ID": "FullUnfreeze",
   "SEED": 1,
-  "SMOKE": true,
-  "MAX_EPOCHS": 3,
+  "SMOKE": false,
+  "MAX_EPOCHS": 100,
   "RESUME": false,
-  "AUTO": false,
-  "TRAINING_PROTOCOL_TARGET": 3,
-  "NOTE": "train.py默认按本配置运行；SMOKE=true为3轮。run_queue.py顺序运行六项100轮；--check只读检查。",
+  "AUTO": true,
+  "BACKBONE": "resnext50_32x4d",
   "UNFREEZE1_EPOCH": null,
   "UNFREEZE2_EPOCH": null,
-  "BACKBONE": "resnext50_32x4d",
   "EXPERIMENT_SIGNATURE": "92f214bdf1cd0ea86aaa07dfb2fb35c5a3065ee33ae8bda069664514ba4169e1",
   "NORMALIZATION": {
     "mean": [

@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torchvision.models import (resnet50, resnet34,
                                 resnet101, resnet18,
                                 resnext101_32x8d,
@@ -8,10 +7,8 @@ from torchvision.models import (resnet50, resnet34,
                                 wide_resnet101_2)
 from torchvision.models import resnet101
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
-from torchvision import datasets, transforms
 from PIL import Image
 import os
-import re
 
 from src_v3 import merged_dict
 from src_v3.SE_Block import SEBlock as NewSEBlock

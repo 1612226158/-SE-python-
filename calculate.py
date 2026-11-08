@@ -1,9 +1,6 @@
-import configparser
 import json
 import logging
 import os
-import sys
-from copy import deepcopy
 from datetime import datetime
 
 import numpy as np
@@ -12,17 +9,15 @@ import pandas as pd
 import torch.nn as nn
 import torch.nn.functional as F
 import torch
-from torchvision import datasets, transforms
-from torch.utils.data import DataLoader
+from torchvision import datasets
 
-from tqdm import tqdm
 from PIL import Image, ImageFile
 import pillow_avif  # 导入 AVIF 支持插件
 
 from src_v3 import merged_dict, metrics_file
 
-from src_v3 import extensions_suffix
 from src_v3.taxonomy import generate_label_mappings
+from src_v3.run_paths import METRICS_COLUMNS
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True  # 忽略部分损坏的图片
 
@@ -32,23 +27,11 @@ _PROJECT_ROOT = os.path.dirname(_CALC_DIR)
 _ORIGINAL_SRC_DIR = os.path.join(_PROJECT_ROOT, 'src')   # 只读复用原缓存与配置，绝不写入
 
 
-class __OtherImport:
-    __temporary = [pillow_avif]
-
-
 def get_classnames():
     with open(os.path.join(_PROJECT_ROOT, 'classname.txt'), mode='r', encoding='utf-8') as fp:
         class_labels = fp.read().split('\n')
     # print(f"get_classnames, {class_labels}")
     return class_labels
-
-
-def custom_collate_fn(batch):
-    # 过滤掉 None
-    batch = [item for item in batch if item is not None]
-    if len(batch) == 0:
-        raise ValueError("All samples in the batch are invalid.")
-    return torch.utils.data.default_collate(batch)
 
 
 class SafeImageFolder(datasets.ImageFolder):
@@ -60,18 +43,13 @@ class SafeImageFolder(datasets.ImageFolder):
                  # main_class_to_index=None,
                  # child_class_to_index=None
                  ):
-        """
-        扩展的 SafeImageFolder 类，支持过滤损坏图片、缓存机制以及动态生成主类和子类标签。
-        :param root: 数据集根目录
-        :param transform: 数据变换
-        :param target_transform: 标签变换
-        :param train: 根据训练或验证选择缓存文件
-        :param id_to_main_class: 主类映射
-        # :param id_to_child_class: 子类映射
-        # :param main_class_to_index: 子类映射
+        """读取图片并维护坏图过滤/增量缓存，按传入映射返回合并类标签。
+
+        train选择训练或验证缓存；transform/target_transform传给ImageFolder。
+        id_to_main_class与renew_class_to_index由现有标签映射流程提供。
         """
         if train:
-            cache_file = os.path.join(_CALC_DIR, "images_cache_train_v2.json")       # v2 增量缓存（src_v2 内）
+            cache_file = os.path.join(_CALC_DIR, "images_cache_train_v2.json")       # 本模块目录的增量缓存，保留原文件名。
             seed_cache = os.path.join(_ORIGINAL_SRC_DIR, "images_cache_train.json")  # 原缓存仅作首次种子
         else:
             cache_file = os.path.join(_CALC_DIR, "images_cache_val_v2.json")
@@ -211,56 +189,40 @@ class SafeImageFolder(datasets.ImageFolder):
         return valid_samples
 
     def __getitem__(self, index):
-        exit_flag = 1
-        while True:
-            if exit_flag >= 100:
-                print("异常!多次未找到合适的图片!程序已经退出!")
-                sys.exit()
+        # 只读取指定样本；读取或增强失败时直接抛出异常。
+        path, target = self.samples[index]
+        full_path = os.path.join(self.root, path)
 
-            path, target = self.samples[index]
-            full_path = os.path.join(self.root, path)
+        sample = self.loader(full_path)
+        if self.transform is not None:
+            sample = self.transform(sample)
 
-            if not os.path.exists(full_path):
-                index = (index + 1) % len(self.samples)
-                exit_flag += 1
-                continue
+        # 处理层级标签
+        if self.id_to_main_class is not None:
+            # class_id = sorted(self.dataset_classes, key=lambda x: int(x))[target]  # 获取实际的类别ID
+            class_id = self.classes[target]
+            # print(f"处理层级标签, {class_id=}")
+            # 使用实际的类别ID而不是数据集索引
+            class_idx_str = str(class_id)
+            # class_idx_str = str(target)
 
-            try:
-                sample = self.loader(full_path)
-                if self.transform is not None:
-                    sample = self.transform(sample)
+            # 获取主类和子类名称
+            main_class = self.id_to_main_class.get(class_idx_str)
+            # child_class = self.id_to_child_class.get(class_idx_str)
 
-                # 处理层级标签
-                if self.id_to_main_class is not None:
-                    # class_id = sorted(self.dataset_classes, key=lambda x: int(x))[target]  # 获取实际的类别ID
-                    class_id = self.classes[target]
-                    # print(f"处理层级标签, {class_id=}")
-                    # 使用实际的类别ID而不是数据集索引
-                    class_idx_str = str(class_id)
-                    # class_idx_str = str(target)
+            # 处理未知类别
+            if main_class is None:
+                main_class = f"公共类-{class_idx_str}"
+                print(f"警告: 类别 {class_idx_str} 没有主类映射，使用: {main_class}")
 
-                    # 获取主类和子类名称
-                    main_class = self.id_to_main_class.get(class_idx_str)
-                    # child_class = self.id_to_child_class.get(class_idx_str)
+            parent_index = self.renew_class_to_index[main_class]
+            return sample, str(parent_index)
 
-                    # 处理未知类别
-                    if main_class is None:
-                        main_class = f"公共类-{class_idx_str}"
-                        print(f"警告: 类别 {class_idx_str} 没有主类映射，使用: {main_class}")
-
-                    parent_index = self.renew_class_to_index[main_class]
-                    return sample, str(parent_index)
-
-                # 如果没有映射，返回原始标签
-                if self.target_transform is not None:
-                    target = self.target_transform(target)
-                    print(f"原始标签, {target=}")
-                return sample, target
-
-            except (OSError, ValueError) as e:
-                print(f"加载图像错误: {full_path}, 错误: {e}")
-                exit_flag += 1
-                index = (index + 1) % len(self.samples)
+        # 如果没有映射，返回原始标签
+        if self.target_transform is not None:
+            target = self.target_transform(target)
+            print(f"原始标签, {target=}")
+        return sample, target
 
     def _validate_label_consistency(self, main_class, child_class):
         """验证父类和子类标签是否逻辑一致，基于 merged_dict 的结构"""
@@ -422,95 +384,6 @@ class FocalLoss(nn.Module):
             return loss
 
 
-def add_record_metrics(epoch=-1,
-                       train_acc_parent=0.0,
-                       train_acc_child=0.0,
-                       val_acc_parent=0.0,
-                       val_acc_child=0.0,
-                       train_loss=0.0,
-                       val_loss=0.0,
-                       precision_parent=0.0,
-                       precision_child=0.0,
-                       recall_parent=0.0,
-                       recall_child=0.0,
-                       f1_parent=0.0,
-                       f1_child=0.0,
-                       gradient_norm=0.0,
-                       learning_rate=0.0,
-                       time_spend=0,
-                       state=1
-                       ):
-    """
-    :param epoch: 当前轮数
-    :param train_acc_parent: 含有公共类的训练准确度
-    :param train_acc_child: 所有子类的训练准确度
-
-    :param val_acc_parent: 含有公共类的验证准确度
-    :param val_acc_child: 所有子类的验证准确度
-
-    :param train_loss: 训练损失
-    :param val_loss: 所有子类的验证损失
-
-    :param precision_parent: 含有公共类的精确率
-    :param precision_child: 所有子类的精确率
-
-    :param recall_parent: 含有公共类的召回率
-    :param recall_child: 所有子类的召回率
-
-    :param f1_parent: 含有公共类的f1分数
-    :param f1_child: 所有子类的f1分数
-
-    :param gradient_norm: 梯度范数
-    :param learning_rate: 学习率
-
-    :param time_spend: 花费时长, 单位秒
-    :return: epoch
-    """
-
-    learning_rate = learning_rate.cpu().item() if isinstance(learning_rate, torch.Tensor) else learning_rate
-    lr_str = f"{learning_rate:.20f}_lr"
-    gradient_norm = gradient_norm.cpu().item() if isinstance(gradient_norm, torch.Tensor) else gradient_norm
-    grad_str = f"{gradient_norm:.20f}_grad" if abs(gradient_norm) < 1e-6 else f"{gradient_norm}_grad"
-
-    metrics_data = {
-        "Epoch": [epoch],
-
-        "Train_Accuracy_Parent": [train_acc_parent],
-        "Train_Accuracy_Child": [train_acc_child],
-
-        "Validation_Accuracy_Parent": [val_acc_parent],
-        "Validation_Accuracy_Child": [val_acc_child],
-
-        "Train_Loss": [train_loss],
-        "Validation_Loss": [val_loss],
-
-        "Precision_Parent": [precision_parent],
-        "Precision_Child": [precision_child],
-
-        "Recall_Parent": [recall_parent],
-        "Recall_Child": [recall_child],
-
-        "F1_Score_Parent": [f1_parent],
-        "F1_Score_Child": [f1_child],
-
-        "Gradient_Norm": [grad_str],  # 使用字符串格式
-        "Learning_Rate": [lr_str],  # 使用字符串格式
-        "LR_Original": [learning_rate],  # 保留原始值
-
-        "Time_Spend": time_spend,  # 该epoch花费时常, 单位秒
-        "Save_Now": datetime.strftime(datetime.now(), '%Y-%m-%d %H:%M:%S'),  # 保存指标的时间
-
-        "state": [state]
-    }
-
-    if not os.path.isfile(metrics_file):
-        pd.DataFrame(metrics_data).to_csv(metrics_file, index=False)
-    else:
-        pd.DataFrame(metrics_data).to_csv(metrics_file, mode='a', header=False, index=False)
-
-    return epoch
-
-
 def add_record_metrics_v2(epoch=-1,
                           config_id='',
                           seed=0,
@@ -527,12 +400,13 @@ def add_record_metrics_v2(epoch=-1,
                           lr=0.0,
                           gradient_norm=0.0,
                           time_spend=0,
-                          state=1):
-    """新增实验记录 v2：纯数值列 + 采样/标签协议，写入 src_v2/runs/metrics_record.csv。
-    原 metrics.csv（旧 18 列）仍由 add_record_metrics 照常写入，二者并存互不影响。"""
+                          state=1,
+                          val_weighted_precision=None,
+                          val_weighted_recall=None):
+    """追加一轮指标；已有文件由训练入口校验，写入失败截回本次追加前。"""
     runs_dir = os.path.dirname(metrics_file)
     os.makedirs(runs_dir, exist_ok=True)
-    record_file = os.path.join(runs_dir, 'metrics_record.csv')
+    record_file = metrics_file
 
     lr = lr.cpu().item() if isinstance(lr, torch.Tensor) else float(lr)
     gradient_norm = gradient_norm.cpu().item() if isinstance(gradient_norm, torch.Tensor) else float(gradient_norm)
@@ -556,21 +430,19 @@ def add_record_metrics_v2(epoch=-1,
         "time_spend_s": [time_spend],
         "state": [state],
         "save_time": [datetime.strftime(datetime.now(), '%Y-%m-%d %H:%M:%S')],
+        "val_weighted_precision": [val_weighted_precision],
+        "val_weighted_recall": [val_weighted_recall],
     }
-    row_df = pd.DataFrame(row)
-    if not os.path.isfile(record_file):
-        row_df.to_csv(record_file, index=False)
-    else:
-        # 兼容修改前已经创建的 CSV：旧行的 sampler_seed 无法可靠反推，保留为空；
-        # 先升级表头再追加，避免新列导致整行错位。
-        existing_columns = pd.read_csv(record_file, nrows=0).columns.tolist()
-        if list(row_df.columns) != existing_columns:
-            existing = pd.read_csv(record_file)
-            ordered_columns = existing_columns + [c for c in row_df.columns if c not in existing_columns]
-            existing = existing.reindex(columns=ordered_columns)
-            row_df = row_df.reindex(columns=ordered_columns)
-            existing.to_csv(record_file, index=False)
-        row_df.to_csv(record_file, mode='a', header=False, index=False)
+    row_df = pd.DataFrame(row, columns=METRICS_COLUMNS)
+    with open(record_file, 'ab', buffering=0) as file:
+        previous_size = file.tell()
+        payload = row_df.to_csv(index=False, header=previous_size == 0).encode('utf-8')
+        try:
+            if file.write(payload) != len(payload):
+                raise OSError('指标行未完整写入')
+        except OSError:
+            file.truncate(previous_size)
+            raise
     return epoch
 
 
