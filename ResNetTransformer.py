@@ -5,13 +5,15 @@
 支持 ResNeXt50、ResNet18/34、ShuffleNetV2 1.0×，保留正层数 Transformer 构造。
 ResNetTransformerV2 类名和 model='v2' 为现有实现接口。
 """
+import math
+
 import torch
 import torch.nn as nn
 from torchvision.models import resnext50_32x4d, resnet18, resnet34, shufflenet_v2_x1_0
 
 from src_v3 import merged_dict
 from src_v3.taxonomy import EXPECTED_NUM_CLASSES
-from src_v3.SE_Block import SEBlock as NewSEBlock
+from src_v3.SE_Block import HierarchicalSE, SEBlock as NewSEBlock
 
 
 class DropPath(nn.Module):
@@ -108,6 +110,7 @@ class ResNetTransformerV2(nn.Module):
                  pretrained=True,
                  backbone_bn_policy='frozen_stats',
                  pos_embed_type='1d',   # 位置编码（次级消融 V2-1Dpos vs V2-2Dpos）：'1d' | '2d' 行列解耦
+                 hierarchical_se=None,
                  ):
         super().__init__()
 
@@ -140,6 +143,7 @@ class ResNetTransformerV2(nn.Module):
         self.num_patches = num_patches
         self.regions = list(regions) if regions is not None else None
         self.use_decouple = bool(use_decouple)
+        self.hierarchical_se = hierarchical_se
         self.model_impl_version = 4  # 区域池化采用FP32累加，拒绝混用修复前断点。
         self.ffn_dim = 4 * d_model
         self.transformer_dropout = 0.3
@@ -166,6 +170,11 @@ class ResNetTransformerV2(nn.Module):
             reduction=16,
             regions=regions
         ) if regions else nn.Identity()
+        if hierarchical_se is not None:
+            self.se_block = HierarchicalSE(
+                in_features, hierarchical_se['level_grids'], hierarchical_se['parent_modulation'],
+                hierarchical_se['se_reduction'], hierarchical_se['residual_limit'],
+            )
 
         # 关键修正：不做 avgpool，直接把每个空间位置当 patch token
         self.projection = nn.Linear(in_features, d_model)                    # 每个 patch: C → d_model
@@ -175,7 +184,9 @@ class ResNetTransformerV2(nn.Module):
         self.pos_embed_type = pos_embed_type
         grid = int(round(num_patches ** 0.5))
         self.expected_grid = (grid, grid) if grid * grid == num_patches else None
-        if pos_embed_type == '1d':
+        if hierarchical_se is not None:
+            self.pos_embed = self.row_emb = self.col_emb = None
+        elif pos_embed_type == '1d':
             self.pos_embed = nn.Parameter(torch.randn(1, num_patches, d_model) * 0.02)  # 1D learned（ViT-B 做法）
             self.row_emb = self.col_emb = None
         else:  # '2d' 行列解耦：位置(r,c) = row[r] + col[c]
@@ -218,7 +229,6 @@ class ResNetTransformerV2(nn.Module):
 
     def forward(self, x):
         x = self.resnet_backbone(x)                      # [B, C, H, W]
-        x = self.se_block(x)                             # [B, C, H, W]（多区域 SE，regions=None 则直通）
         B, C, H, W = x.shape
         actual_patches = H * W
         if actual_patches != self.num_patches:
@@ -229,6 +239,9 @@ class ResNetTransformerV2(nn.Module):
             raise RuntimeError(
                 f'V2空间网格不匹配：配置要求 {self.expected_grid[0]}x{self.expected_grid[1]}，'
                 f'实际为 {H}x{W}。禁止仅凭token总数相同静默改变二维布局。')
+        if self.hierarchical_se is not None:
+            return self._forward_hierarchical(x)
+        x = self.se_block(x)                             # [B, C, H, W]
         x = x.flatten(2).transpose(1, 2)                 # [B, H*W, C] = N 个 patch token
         x = self.projection(x)                           # [B, N, d_model]
 
@@ -258,6 +271,23 @@ class ResNetTransformerV2(nn.Module):
         parent_output = self.parent_classifier(disentangled_feature)
         return parent_output
 
+    def _forward_hierarchical(self, x):
+        """区域共用分类头，按层平均区域概率，再以固定比例融合。"""
+        levels = self.se_block(x)
+        counts = [level.size(1) for level in levels]
+        regions = torch.cat(levels, dim=1)
+        projected = self.dropout2(self.dropout1(self.projection(regions)))
+        logits = self.parent_classifier(self.disentangle_layer(projected.flatten(0, 1)))
+        log_probs = logits.reshape(x.size(0), sum(counts), -1).float().log_softmax(dim=-1)
+        level_log_probs = [
+            block.logsumexp(dim=1) - math.log(count)
+            for block, count in zip(log_probs.split(counts, dim=1), counts)
+        ]
+        return torch.stack([
+            scores + math.log(weight)
+            for scores, weight in zip(level_log_probs, self.hierarchical_se['level_weights'])
+        ], dim=1).logsumexp(dim=1)
+
     def architecture_metadata(self):
         """返回可写入checkpoint/results的稳定结构元数据，不含运行态对象。"""
         return {
@@ -284,6 +314,9 @@ class ResNetTransformerV2(nn.Module):
             'patch_dropout': self.patch_dropout,
             'head_dropout': self.head_dropout,
             'drop_path_rate': self.drop_path_rate,
+            **({'hierarchical_se': self.hierarchical_se, 'hierarchical_se_impl_version': 1,
+                'pos_embed_type': None, 'readout': 'hierarchical_region_probability'}
+               if self.hierarchical_se is not None else {}),
         }
 
     def train(self, mode=True):

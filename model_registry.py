@@ -68,8 +68,70 @@ MODELS = {
     SHUFFLENETV2_X1_0_SE1_ID: _make_entry(
         'shufflenet_v2_x1_0', [], 'ShuffleNetV2x1.0单区域全解冻', 'backbone', regions=[1]),
 }
-ORDER = list(MODELS)
 DEFAULT_MODEL = FULL_UNFREEZE_ID
+DEFAULT_SMOKE_EPOCHS = 3
+
+
+# P07 层级 SE 方案。固定融合项已接入，实际队列由 QUEUE 显式指定。
+# 网格为整图的 (行, 列)。子区在直属父区内细分，边界对齐。
+# 全部候选共用骨干字段。实际开跑后换骨干时，应保留旧运行的配置身份。
+HIERARCHICAL_SE_PLAN = {
+    'backbone': 'shufflenet_v2_x1_0',
+    'pretrained': True,
+    'transformer_layers': 0,
+    'unfreeze_epochs': (),
+    'seed': 1,
+    'target_epochs': 100,
+    # 全局与局部平分原 SE[1] 隐藏宽度。局部 MLP 在区域及层间共享。
+    'se_reduction': 16,
+    'residual_limit': 0.5,
+    # 各区域池化成同维向量并共享分类头。层内等权汇总区域概率，再做层间融合。
+    # 同一检查点另取父层和局部层的预测，以统计纠错、干扰和置信度变化。
+    'variants': {
+        'HierSE-Parallel-L2': {
+            'level_grids': ((1, 1), (1, 2)),
+            'parent_modulation': False,
+            'level_weights': (0.6, 0.4),
+        },
+        'HierSE-Nested-L2': {
+            'level_grids': ((1, 1), (1, 2)),
+            'parent_modulation': True,
+            'level_weights': (0.6, 0.4),
+        },
+        'HierSE-Parallel-L3': {
+            'level_grids': ((1, 1), (1, 2), (2, 2)),
+            'parent_modulation': False,
+            'level_weights': (0.6, 0.2, 0.2),
+        },
+        'HierSE-Nested-L3': {
+            'level_grids': ((1, 1), (1, 2), (2, 2)),
+            'parent_modulation': True,
+            'level_weights': (0.6, 0.2, 0.2),
+        },
+    },
+    # 后续冻结固定版分支，用单独划分的数据拟合逐图输出层间 Softmax 比例的融合器。
+    'adaptive_fusion': {'reference': 'HierSE-Nested-L2'},
+}
+
+
+for name, variant in HIERARCHICAL_SE_PLAN['variants'].items():
+    plan = HIERARCHICAL_SE_PLAN
+    mode = '父子嵌套' if variant['parent_modulation'] else '并行叠加'
+    title = f"HierSE {len(variant['level_grids'])}级{mode}"
+    entry = _make_entry(plan['backbone'], plan['unfreeze_epochs'], title, 'hierarchical_se', regions=())
+    entry['cn'] = title
+    entry['target_epochs'] = plan['target_epochs']
+    entry['params'].update(pretrained=plan['pretrained'], transformer_layers=plan['transformer_layers'],
+                           hierarchical_se={
+                               **variant,
+                               'level_grids': [list(grid) for grid in variant['level_grids']],
+                               'level_weights': list(variant['level_weights']),
+                               'se_reduction': plan['se_reduction'],
+                               'residual_limit': plan['residual_limit'],
+                           })
+    MODELS[name] = entry
+
+ORDER = list(MODELS)
 
 
 def normalize(name: str) -> str:
@@ -154,13 +216,16 @@ def long_source_of(name: str, seed: int):
     return dict(source, seed=seed) if source else None
 
 
-def config_for_run(name: str, seed: int, resume=False, smoke=False) -> dict:
+def config_for_run(name: str, seed: int, resume=False, smoke=False, *, smoke_epochs=None) -> dict:
     if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
         raise ValueError('seed必须为非负整数')
     epochs = unfreeze_epochs_of(name)
     source = long_source_of(name, seed) if not smoke else None
+    max_epochs = target_of(name)
+    if smoke:
+        max_epochs = DEFAULT_SMOKE_EPOCHS if smoke_epochs is None else smoke_epochs
     config = {'CONFIG_ID': name, 'SEED': seed, 'SMOKE': bool(smoke),
-            'MAX_EPOCHS': 3 if smoke else target_of(name), 'RESUME': bool(resume or source),
+            'MAX_EPOCHS': max_epochs, 'RESUME': bool(resume or source),
             'AUTO': True, 'BACKBONE': backbone_of(name),
             'UNFREEZE1_EPOCH': epochs[0] if epochs else None,
             'UNFREEZE2_EPOCH': epochs[1] if epochs else None,
@@ -176,7 +241,11 @@ def validate_config_binding(name: str, config: dict):
     for key in ('BACKBONE', 'UNFREEZE1_EPOCH', 'UNFREEZE2_EPOCH', 'EXPERIMENT_SIGNATURE'):
         if key in config and config[key] != expected[key]:
             raise ValueError(f'{key}与注册表冲突：{config[key]!r} != {expected[key]!r}')
-    if not config.get('SMOKE', False) and config.get('MAX_EPOCHS', target_of(name)) != target_of(name):
+    if config.get('SMOKE', False):
+        max_epochs = config.get('MAX_EPOCHS', DEFAULT_SMOKE_EPOCHS)
+        if type(max_epochs) is not int or max_epochs < 1:
+            raise ValueError('冒烟 MAX_EPOCHS 必须为正整数')
+    elif config.get('MAX_EPOCHS', target_of(name)) != target_of(name):
         raise ValueError('正式预算与注册表不一致')
     if 'LONG_SOURCE' in expected:
         if config.get('LONG_SOURCE') != expected['LONG_SOURCE'] or not config.get('RESUME'):

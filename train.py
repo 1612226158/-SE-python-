@@ -5,6 +5,7 @@ for _entry_path in (str(_entry_dir), str(_entry_dir.parent)):
     if _entry_path not in _entry_sys.path:
         _entry_sys.path.insert(0, _entry_path)
 from run_paths import load_config as _load_config, METRICS_COLUMNS
+import model_registry
 _cfg = None
 _long_initialized = False
 if __name__ == '__main__':
@@ -18,7 +19,7 @@ if __name__ == '__main__':
         verify_test_database(**mysql_verification_input())
         raise SystemExit(0)
     from run_paths import RUNS_ROOT as _RUNS_ROOT, configure_process as _configure_process
-    _cfg = _load_config()
+    _cfg = _cli_args.smoke_config or _load_config()
     _registration_root = None
     _mysql_output = (_cli_args.mysql_first_epoch if _cli_args.mysql_first_epoch is not None
                      else _cli_args.register_mysql)
@@ -90,7 +91,7 @@ CONFIG_FILE = os.environ.get('V3_CONFIG_FILE', os.path.join(os.path.dirname(os.p
 _DEFAULTS = {
     'CONFIG_ID': 'FullUnfreeze',  # 默认首批全解冻NoTF基线
     'SEED': 1,               # 当前运行随机种子；队列任务逐行指定。
-    'SMOKE': True,           # True=冒烟只跑 3 轮验证管线；正式训练 False
+    'SMOKE': True,           # True=冒烟验证管线，默认 3 轮
     'MAX_EPOCHS': 100,
     'RESUME': False,         # True=从 runs 下断点续跑（支持中途暂停后继续）
     'AUTO': True,            # 无人值守：跳过所有交互输入
@@ -112,7 +113,7 @@ CONFIG_ID = _cfg.get('CONFIG_ID', _DEFAULTS['CONFIG_ID'])
 SEED = _cfg.get('SEED', _DEFAULTS['SEED'])
 SMOKE = _cfg.get('SMOKE', _DEFAULTS['SMOKE'])
 if SMOKE:
-    MAX_EPOCHS = 3
+    MAX_EPOCHS = _cfg.get('MAX_EPOCHS', model_registry.DEFAULT_SMOKE_EPOCHS)
     RESUME = False
 else:
     MAX_EPOCHS = _cfg.get('MAX_EPOCHS', _DEFAULTS['MAX_EPOCHS'])
@@ -125,7 +126,6 @@ ALLOW_LEGACY_PROTOCOL_RESUME = _cfg.get('ALLOW_LEGACY_PROTOCOL_RESUME',
                                         _DEFAULTS['ALLOW_LEGACY_PROTOCOL_RESUME'])
 
 # 注册表为骨干、解冻时点和共同训练策略的唯一来源。
-import model_registry
 PRESET = model_registry.params_of(CONFIG_ID)
 unfreeze_mode = PRESET['unfreeze']
 BACKBONE_NAME = PRESET['backbone']
@@ -1217,6 +1217,8 @@ def _validate_model_before_training(model, preset):
 
     if expected_v2:
         expected_layers = int(preset['transformer_layers'])
+        if metadata.get('hierarchical_se') != preset.get('hierarchical_se'):
+            raise RuntimeError('模型的层级 SE 参数与注册配置不一致')
         if metadata['transformer_layers'] != expected_layers:
             raise RuntimeError(
                 f'V2 Transformer层数不一致：配置={expected_layers}，模型={metadata["transformer_layers"]}')
@@ -1243,7 +1245,8 @@ def _build_model(preset, transformer_layers, d_model, nhead, id_to_main_class, r
         id_to_main_class=id_to_main_class, renew_class_to_index=renew_class_to_index,
         regions=preset['regions'], use_decouple=preset['use_decouple'],
         backbone_name=preset['backbone'], pretrained=preset['pretrained'],
-        backbone_bn_policy=TRAINING_POLICY['backbone_bn_policy'])
+        backbone_bn_policy=TRAINING_POLICY['backbone_bn_policy'],
+        hierarchical_se=preset.get('hierarchical_se'))
 
 
 if __name__ == '__main__':
@@ -1258,7 +1261,7 @@ if __name__ == '__main__':
     d_model = 512
     transformer_layers = preset['transformer_layers']
     nhead = 8
-    num_epochs = 3 if SMOKE else MAX_EPOCHS
+    num_epochs = MAX_EPOCHS
     # fp = open("logging.txt", mode='a')
     fp = sys.stdout
     file = TRAIN_ROOT
@@ -1382,7 +1385,7 @@ if __name__ == '__main__':
     model = model.to(device)  # 将模型转移到 GPU
     for name, module in model.named_children():
         print(name, " ---> ", type(module))
-    if AUTO or _cli_args.mysql_first_epoch is not None:
+    if AUTO or SMOKE or _cli_args.mysql_first_epoch is not None:
         num_epochs_user_input = num_epochs
         save_model_after_epoch_flag = False
         save_model_indicators = True

@@ -314,9 +314,10 @@ def done(config_id, seed, config=None):
     return True
 
 
-def write_config(config_id, seed, resume, smoke=False):
+def write_config(config_id, seed, resume, smoke=False, *, smoke_epochs=None):
     # 骨干、时点及正式/冒烟预算均由注册表生成。
-    cfg = model_registry.config_for_run(config_id, seed, resume=resume, smoke=smoke)
+    cfg = model_registry.config_for_run(config_id, seed, resume=resume, smoke=smoke,
+                                        smoke_epochs=smoke_epochs)
     cfg['NORMALIZATION'] = _queue_config['NORMALIZATION']
     destination = os.path.join(RUNS, '_smoke', 'queue_config.json') if smoke else CONFIG
     if smoke:
@@ -328,8 +329,8 @@ def write_config(config_id, seed, resume, smoke=False):
     return destination
 
 
-def run_once(config_id, seed, resume, smoke=False):
-    config_path = write_config(config_id, seed, resume, smoke=smoke)
+def run_once(config_id, seed, resume, smoke=False, *, smoke_epochs=None):
+    config_path = write_config(config_id, seed, resume, smoke=smoke, smoke_epochs=smoke_epochs)
     log(f"▶ 启动 {config_id} seed{seed}（RESUME={resume}）")
     environment = os.environ.copy()
     environment['V3_CONFIG_FILE'] = config_path
@@ -473,7 +474,8 @@ def main():
     log("=" * 60)
     log("V3首批NoTF配对队列：")
     if args.smoke:
-        log('模式：各任务3轮冒烟；不续跑，不转入正式100轮。')
+        smoke_epochs = args.smoke_epochs or model_registry.DEFAULT_SMOKE_EPOCHS
+        log(f'模式：各任务{smoke_epochs}轮冒烟；不续跑，不转入正式100轮。')
     for c, s in QUEUE:
         log(f"    {c} seed{s}")
     log("=" * 60)
@@ -482,7 +484,7 @@ def main():
     while i < len(QUEUE):
         config_id, seed = QUEUE[i]
         if args.smoke:
-            rc = run_once(config_id, seed, False, smoke=True)
+            rc = run_once(config_id, seed, False, smoke=True, smoke_epochs=smoke_epochs)
             st = 'done' if rc == 0 else 'failed'
             log(f'冒烟 {config_id} seed{seed} 退出码 {rc}',
                 logging.INFO if rc == 0 else logging.ERROR)
