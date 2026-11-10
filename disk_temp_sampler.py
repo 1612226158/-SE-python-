@@ -101,10 +101,13 @@ def main():
     if temps:
         for dev in sorted(temps):
             info = temps[dev]
+            roles = ("   <== E:（数据集盘）所在" if info.get("is_E") else "")
+            if info.get("is_system"):
+                roles += "   <== Windows 系统盘"
             print("  物理盘 %d: %-28s 温度=%s°C%s" % (
                 dev, info["name"],
                 "?" if info["temp_c"] is None else "%.0f" % info["temp_c"],
-                "   <== E:（数据集盘）所在" if info.get("is_E") else ""))
+                roles))
         if not any(i.get("is_E") for i in temps.values()):
             print("  [注意] 未识别出 E: 所在物理盘 —— 请检查 E: 盘符是否存在")
     else:

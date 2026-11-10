@@ -10,7 +10,8 @@ import logging
 import os
 import subprocess
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from math import isfinite
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 RUNS_DIR = os.path.join(_HERE, "runs")
@@ -148,14 +149,18 @@ def get_disk_free_gb(mount=DISK_MOUNT):
 
 
 # 采样器与 temp_guard 共用这一条命令，保证"写日志"和"直读"口径一致。
-# 使用|分隔设备ID、名称、当前/最大温度与盘符标记。
+# 使用|分隔设备ID、名称、当前/最大温度与盘符角色（E、S 或 ES）。
 _PS_DISK_TEMP = (
     r"$ErrorActionPreference='SilentlyContinue';"
-    r"$hd=(Get-Partition | Where-Object { $_.DriveLetter -eq 'E' } | Select-Object -First 1).DiskNumber;"
+    r"$partitions=Get-Partition;"
+    r"$hd=($partitions | Where-Object { $_.DriveLetter -eq 'E' } | Select-Object -First 1).DiskNumber;"
+    r"$system=$env:SystemDrive.TrimEnd(':');"
+    r"$sd=($partitions | Where-Object { $_.DriveLetter -eq $system } | Select-Object -First 1).DiskNumber;"
     r"foreach($d in Get-PhysicalDisk){"
     r"$c=$d | Get-StorageReliabilityCounter;"
     r"$n='';"
     r"if($hd -ne $null -and $d.DeviceId -eq $hd){$n='E'};"
+    r"if($sd -ne $null -and $d.DeviceId -eq $sd){$n+='S'};"
     r"$d.DeviceId.ToString() + '|' + $d.FriendlyName + '|' + $c.Temperature + '|' + $c.TemperatureMax + '|' + $n}"
 )
 
@@ -173,7 +178,7 @@ def _parse_temp(raw):
         v = float(str(raw).strip())
     except (TypeError, ValueError):
         return None
-    if v < -40.0 or v > DISK_TEMP_SENTINEL_MAX:
+    if not isfinite(v) or v < -40.0 or v > DISK_TEMP_SENTINEL_MAX:
         return None
     return v
 
@@ -181,7 +186,7 @@ def _parse_temp(raw):
 def read_disk_temps_direct():
     """**需要管理员**：直接读所有物理盘温度。
 
-    返回 {device_id: {"name","temp_c","temp_max_c","is_E"}}；整条命令失败返回 None。
+    返回按设备 ID 组织的温度和盘符角色；整条命令失败返回 None。
     非管理员时 `Get-StorageReliabilityCounter` 会拒绝访问 → 各项 temp_c 为 None。
     """
     try:
@@ -195,13 +200,13 @@ def read_disk_temps_direct():
             parts = line.strip().split("|")
             if len(parts) != 5:
                 continue
-            dev_s, name, t, tmax, is_e = (p.strip() for p in parts)
+            dev_s, name, t, tmax, roles = (p.strip() for p in parts)
             try:
                 dev = int(dev_s)
             except ValueError:
                 continue
             res[dev] = {"name": name, "temp_c": _parse_temp(t),
-                        "temp_max_c": _parse_temp(tmax), "is_E": (is_e == "E")}
+                        "temp_max_c": _parse_temp(tmax), "is_E": "E" in roles, "is_system": "S" in roles}
         return res or None
     except Exception:
         return None
@@ -219,14 +224,13 @@ def format_disk_temp_log_line(temps, when=None):
         if info.get("is_E"):
             e_dev = str(dev)
             e_temp = "" if t is None else "%.0f" % t
+        if info.get("is_system"):
+            detail.append(f"system={dev}")
     return "%s,%s,%s,%s" % (when.strftime("%Y-%m-%d %H:%M:%S"), e_dev, e_temp, ";".join(detail))
 
 
-def read_disk_temp_log(path=DISK_TEMP_LOG, max_age_s=DISK_TEMP_MAX_AGE_S):
-    """读采样器日志的最新一行 → (E盘温度 or None, 秒龄 or None)。
-
-    温度读不到时 age 仍可能返回（用于区分"采样器没跑"与"日志过期"）。
-    """
+def _read_disk_temp_sample(path, max_age_s):
+    """Read the E drive and physical disk detail from the same sampler record."""
     try:
         last = None
         with open(path, "r", encoding="utf-8") as f:
@@ -235,38 +239,86 @@ def read_disk_temp_log(path=DISK_TEMP_LOG, max_age_s=DISK_TEMP_MAX_AGE_S):
                 if line and not line.startswith("#"):
                     last = line
         if not last:
-            return None, None
+            return None, {}, None, None, None
         fields = last.split(",")
         if len(fields) != 5:
-            return None, None
+            return None, {}, None, None, None
         temp = _parse_temp(fields[3])
         try:
-            age = (datetime.now() - datetime.strptime(fields[0].strip(), "%Y-%m-%d %H:%M:%S")).total_seconds()
+            sample_time = datetime.strptime(fields[0].strip(), "%Y-%m-%d %H:%M:%S")
         except ValueError:
-            return temp, None
+            return None, {}, None, None, None
+        age = (datetime.now() - sample_time).total_seconds()
         if age < 0 or age > max_age_s:
-            return None, age
-        return temp, age
+            return None, {}, age, None, None
+        devices = {}
+        system_id = None
+        for item in fields[4].split(";"):
+            device, _, raw = item.partition("=")
+            device, raw = device.strip(), raw.strip()
+            if device.isdigit():
+                devices[int(device)] = _parse_temp(raw)
+            elif device == "system" and raw.isdigit():
+                system_id = int(raw)
+        if fields[2].strip().isdigit() and temp is not None:
+            devices[int(fields[2])] = temp
+        return temp, devices, age, sample_time, system_id
     except Exception:
-        return None, None
+        return None, {}, None, None, None
 
 
-def get_disk_temp(use_direct=True):
+def read_disk_temp_log(path=DISK_TEMP_LOG, max_age_s=DISK_TEMP_MAX_AGE_S):
+    """Return the sampler's latest E drive temperature and record age."""
+    temp, _, age, _, _ = _read_disk_temp_sample(path, max_age_s)
+    return temp, age
+
+
+def _system_disk_device_id():
+    if os.name != "nt" or not os.environ.get("SystemDrive"):
+        return None
+    command = (
+        r"$p=Get-Partition -DriveLetter ($env:SystemDrive.TrimEnd(':')) -ErrorAction Stop;"
+        r"($p | Select-Object -First 1).DiskNumber"
+    )
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
+            capture_output=True, text=True, timeout=10, creationflags=_no_window_flag(),
+        )
+        if out.returncode == 0:
+            return int(out.stdout.strip())
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
+def get_disk_temp(use_direct=True, *, include_system=False):
     """取 E: 盘温度。返回 {"temp_c": float|None, "src": 说明字符串}。
 
     优先级：① 采样器日志（新鲜）→ ② 本进程是管理员则直读 → ③ 记 ? 并给出原因。
     """
-    temp, age = read_disk_temp_log()
+    temp, devices, age, sample_time, system_id = _read_disk_temp_sample(DISK_TEMP_LOG, DISK_TEMP_MAX_AGE_S)
+    if include_system and system_id is None and devices:
+        system_id = _system_disk_device_id()
+    system_temp = devices.get(system_id) if include_system else None
+    sample = {"temp_c": temp, "system_temp_c": system_temp, "sample_time": sample_time, "src": "采样器日志"}
     if temp is not None:
-        return {"temp_c": temp, "src": "采样器日志"}
+        return sample
     if use_direct and is_elevated():
         temps = read_disk_temps_direct()
         if temps:
-            for info in temps.values():
-                if info.get("is_E") and info.get("temp_c") is not None:
-                    return {"temp_c": info["temp_c"], "src": "管理员直读"}
-            return {"temp_c": None, "src": "管理员直读无温度"}
+            direct_e = next((info["temp_c"] for info in temps.values()
+                             if info.get("is_E") and info.get("temp_c") is not None), None)
+            direct_system = next((info["temp_c"] for info in temps.values() if info.get("is_system")), None
+                                 ) if include_system else None
+            if direct_e is not None or (system_temp is None and direct_system is not None):
+                return {"temp_c": direct_e, "system_temp_c": direct_system, "src": "管理员直读"}
+            return sample if system_temp is not None else {"temp_c": None, "src": "管理员直读无温度"}
+        if system_temp is not None:
+            return sample
         return {"temp_c": None, "src": "管理员直读失败"}
+    if system_temp is not None:
+        return sample
     if age is not None:
         if age < 0:
             return {"temp_c": None, "src": "日志时间戳异常(未来)"}
@@ -294,7 +346,7 @@ def _read_twice(read_fn, interval=3.0):
     vals = []
     for i in range(2):
         v = read_fn()
-        if v is not None:
+        if v is not None and isfinite(v):
             if i == 0:
                 time.sleep(3)  # 暂停3s
             vals.append(v)
@@ -313,11 +365,30 @@ def _read_twice(read_fn, interval=3.0):
     return hi
 
 
-def _check_temps_only(tag="", log_info=logging.info, log_warn=logging.warning, count=0):
+def _report_check(on_check, gpu, cpu, disk, message, over, disk_alerts=()):
+    if on_check is None:
+        return
+    if disk_alerts:
+        message += "；磁盘告警：" + "、".join(disk_alerts)
+    if over:
+        message += f"；结论：{'、'.join(over)}，休息 {REST_SECONDS // 60} 分钟"
+    else:
+        message += "；结论：继续训练"
+    on_check(
+        log_time=datetime.now(timezone(timedelta(hours=8))).replace(tzinfo=None),
+        disk_sample_time=disk.get("sample_time"),
+        gpu_temp_c=gpu, cpu_temp_c=cpu,
+        disk1_temp_c=disk.get("temp_c"), disk2_temp_c=disk.get("system_temp_c"),
+        level="WARNING" if over or disk_alerts else "INFO", message=message,
+    )
+
+
+def _check_temps_only(tag="", log_info=logging.info, log_warn=logging.warning, count=0, *, on_check=None):
     """关闭磁盘监测时只检查GPU/CPU温度，返回是否触发休眠。"""
     gpu = _read_twice(get_gpu_temp_c)
     cpu = _read_twice(get_cpu_temp_c)
-    log_info(f"[温度守护{tag}] GPU={_fmt(gpu)}°C, CPU={_fmt(cpu)}°C（双读判定；阈值 GPU>{GPU_MAX_C} / CPU>{CPU_MAX_C}）")
+    message = f"[温度守护{tag}] GPU={_fmt(gpu)}°C, CPU={_fmt(cpu)}°C（双读判定；阈值 GPU>{GPU_MAX_C} / CPU>{CPU_MAX_C}）"
+    log_info(message)
 
     over = []
     if gpu is not None and gpu > GPU_MAX_C:
@@ -325,6 +396,7 @@ def _check_temps_only(tag="", log_info=logging.info, log_warn=logging.warning, c
     if cpu is not None and cpu > CPU_MAX_C:
         over.append(f"CPU {cpu:.1f}°C > {CPU_MAX_C}°C")
 
+    _report_check(on_check, gpu, cpu, {}, message, over)
     if over:
         if count >= 2:
             log_warn(f"[温度守护][多次温度异常, 延长时间] ⚠️ {'、'.join(over)}，休息 {REST_SECONDS*2 // 60} 分钟…")
@@ -339,28 +411,29 @@ def _check_temps_only(tag="", log_info=logging.info, log_warn=logging.warning, c
     return False
 
 
-def check_temps_and_rest(tag="", log_info=logging.info, log_warn=logging.warning):
+def check_temps_and_rest(tag="", log_info=logging.info, log_warn=logging.warning, *, on_check=None):
     """检查CPU/GPU及可选磁盘指标，按现有开关告警或休眠。
 
     磁盘I/O和空间由DISK_REST_ON_HIGH控制是否计入休眠，
     盘温由DISK_TEMP_REST_ON_HIGH控制；总开关关闭时只检查CPU/GPU。
     """
     if not DISK_MONITOR_ENABLED:
-        return _check_temps_only(tag, log_info, log_warn)
+        return _check_temps_only(tag, log_info, log_warn, on_check=on_check)
 
     gpu = _read_twice(get_gpu_temp_c)
     cpu = _read_twice(get_cpu_temp_c)
     io = get_disk_io()
     _total_gb, free_gb = get_disk_free_gb()
-    dt = get_disk_temp()
+    dt = get_disk_temp(include_system=True) if on_check is not None else get_disk_temp()
     dtemp = dt["temp_c"]
 
     lat = _fmt(io["latency_ms"] if io else None)
     que = _fmt(io["queue"] if io else None)
     free_s = "?" if free_gb is None else f"{free_gb:.0f}"
     dtemp_s = "?" if dtemp is None else f"{dtemp:.0f}"
-    log_info(f"[温度守护{tag}] GPU={_fmt(gpu)}°C, CPU={_fmt(cpu)}°C（双读判定；阈值 GPU>{GPU_MAX_C} / CPU>{CPU_MAX_C}）"
-             f" | 磁盘{DISK_MOUNT[0]}: 盘温={dtemp_s}°C({dt['src']}) 队列={que} 延时={lat}ms 剩余={free_s}GB")
+    message = (f"[温度守护{tag}] GPU={_fmt(gpu)}°C, CPU={_fmt(cpu)}°C（双读判定；阈值 GPU>{GPU_MAX_C} / CPU>{CPU_MAX_C}）"
+               f" | 磁盘{DISK_MOUNT[0]}: 盘温={dtemp_s}°C({dt['src']}) 队列={que} 延时={lat}ms 剩余={free_s}GB")
+    log_info(message)
 
     over = []
     if gpu is not None and gpu > GPU_MAX_C:
@@ -391,6 +464,7 @@ def check_temps_and_rest(tag="", log_info=logging.info, log_warn=logging.warning
                  f"（{'已计入休息条件' if disk_rest else '仅告警，不休息'}）")
         over.extend(disk_rest)
 
+    _report_check(on_check, gpu, cpu, dt, message, over, disk_alerts)
     if over:
         log_warn(f"[温度守护] ⚠️ {'、'.join(over)}，休息 {REST_SECONDS // 60} 分钟…")
         time.sleep(REST_SECONDS)

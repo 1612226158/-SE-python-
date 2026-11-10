@@ -13,32 +13,103 @@ if __name__ == '__main__':
     _cli_args = _handle_cli('train')
     if _cli_args.check or _cli_args.list:
         raise SystemExit(0)
+    if _cli_args.register_mysql_long is not None:
+        from run_paths import register_mysql_long
+        from pymysql.err import MySQLError
+
+        try:
+            _run_id, _parent_run_id, _next_epoch = register_mysql_long(
+                _load_config(), *_cli_args.register_mysql_long)
+        except (OSError, ValueError, KeyError, RuntimeError, MySQLError) as error:
+            raise SystemExit(f'MySQL Long 登记失败：{error}') from None
+        print(f'MySQL Long 登记完成：run_id={_run_id}，parent_run_id={_parent_run_id}，起点 epoch={_next_epoch}')
+        raise SystemExit(0)
+    if _cli_args.check_mysql_resume is not None:
+        from run_paths import check_mysql_resume
+        from pymysql.err import MySQLError
+
+        try:
+            _run_id, _next_epoch = check_mysql_resume(_cli_args.check_mysql_resume)
+        except (OSError, ValueError, KeyError, RuntimeError, MySQLError) as error:
+            raise SystemExit(f'MySQL 续跑预检失败：{error}') from None
+        print(f'MySQL 续跑预检通过：run_id={_run_id}，可从 epoch={_next_epoch} 继续')
+        raise SystemExit(0)
+    if _cli_args.finalize_mysql_run is not None:
+        from run_paths import finalize_mysql_run
+        from pymysql.err import MySQLError
+
+        try:
+            _run_id = finalize_mysql_run(_cli_args.finalize_mysql_run)
+        except (OSError, ValueError, KeyError, RuntimeError, MySQLError) as error:
+            raise SystemExit(f'MySQL 收尾失败：{error}') from None
+        print(f'MySQL 收尾完成：run_id={_run_id}')
+        raise SystemExit(0)
     if _cli_args.verify_mysql:
         from launch_checks import mysql_verification_input
         from mysql_store import verify_test_database
         verify_test_database(**mysql_verification_input())
         raise SystemExit(0)
     from run_paths import RUNS_ROOT as _RUNS_ROOT, configure_process as _configure_process
-    _cfg = _cli_args.smoke_config or _load_config()
     _registration_root = None
-    _mysql_output = (_cli_args.mysql_first_epoch if _cli_args.mysql_first_epoch is not None
-                     else _cli_args.register_mysql)
+    _mysql_database = None
+    _mysql_resume_run_id = None
+    _mysql_resume_checkpoint = None
+    _mysql_output = next((path for path in (_cli_args.register_mysql, _cli_args.mysql_first_epoch,
+                                          _cli_args.train_mysql) if path is not None), None)
+    _mysql_resume = (_cli_args.resume_mysql_one_epoch if _cli_args.resume_mysql_one_epoch is not None
+                     else _cli_args.resume_mysql)
+    _mysql_single_epoch = (_cli_args.mysql_first_epoch is not None
+                           or _cli_args.resume_mysql_one_epoch is not None)
+    if _mysql_resume is not None:
+        from atexit import register as _register_exit
+        from contextlib import ExitStack
+        import os as _entry_os
+        from mysql_store import cli_password
+        from run_paths import load_mysql_resume, normalization_signature
+
+        if not _mysql_resume.strip():
+            raise SystemExit('MySQL 续跑需要指定运行目录')
+        _resume_directory = _EntryPath(_mysql_resume).resolve()
+        if (_resume_directory.is_relative_to(_RUNS_ROOT)
+                and _resume_directory.parent != _RUNS_ROOT):
+            raise SystemExit('MySQL 续跑需要 runs 下的正式运行子目录或独立运行目录')
+        _resume_credentials = ExitStack()
+        _register_exit(_resume_credentials.close)
+        _resume_credentials.enter_context(cli_password())
+        _cfg, _mysql_resume_checkpoint, _mysql_resume_run_id, _ = load_mysql_resume(_resume_directory)
+        _mysql_database = _cfg['MYSQL_DATABASE']
+        _cfg['RESUME'] = True
+        _entry_os.environ['V3_CONFIG_FILE'] = str(_resume_directory / 'config.json')
+        _entry_os.environ['V3_RUN_DIR'] = str(_resume_directory)
+        _entry_os.environ['V3_NORMALIZATION_SIGNATURE'] = normalization_signature(_cfg)
+    else:
+        _cfg = _cli_args.smoke_config or _load_config()
     if _mysql_output is not None:
+        from mysql_store import DATABASE, TEST_DATABASE, training_database
+
         if _cfg.get('SMOKE') or _cfg.get('RESUME') or _cfg.get('LONG_SOURCE'):
-            raise ValueError('MySQL 训练测试仅接受新的普通正式训练配置')
+            raise ValueError('MySQL 新训练仅接受普通正式训练配置')
         if not _mysql_output.strip():
-            raise ValueError('MySQL 训练测试需要指定独立输出目录')
+            raise ValueError('MySQL 新训练需要指定独立输出目录')
         _registration_root = _EntryPath(_mysql_output).resolve()
-        if _registration_root.is_relative_to(_RUNS_ROOT.resolve()):
-            raise ValueError('MySQL 训练测试请使用 runs 以外的独立输出目录')
-    elif not _cfg.get('SMOKE', False):
+        if _registration_root == _RUNS_ROOT and _cli_args.train_mysql is not None:
+            _mysql_database = training_database(default=DATABASE)
+            if _mysql_database != DATABASE:
+                raise ValueError('测试库新训练请使用 runs 以外的独立输出目录')
+        else:
+            if _registration_root.is_relative_to(_RUNS_ROOT):
+                raise ValueError('MySQL 新训练请使用 runs 本身或 runs 以外的独立输出目录')
+            _mysql_database = training_database() if _cli_args.train_mysql is not None else TEST_DATABASE
+    elif _mysql_resume_run_id is None and not _cfg.get('SMOKE', False):
         from run_queue import ensure_long_resume as _ensure_long_resume
         _long_initialized = _ensure_long_resume(_cfg['CONFIG_ID'], _cfg['SEED'], _cfg)
-    _configure_process(_cfg, runs_root=_registration_root)
+    if _mysql_resume_run_id is None:
+        _configure_process(_cfg, runs_root=_registration_root)
 import random
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from functools import partial
 import warnings
 import logging
 import os
@@ -457,6 +528,7 @@ def train_and_validate(model,
                        optimizer=None,
                        resume_checkpoint=None,
                        mysql_run_id=None,
+                       mysql_database=None,
                        ):
     """
     :param model: 模型
@@ -473,9 +545,10 @@ def train_and_validate(model,
     sleep_all_spend = 0
     EPOCH_PERIOD = 50
     EPOCH_PERIOD_time = 600
-    if mysql_run_id is not None and (SMOKE or epoch_start != 0 or num_epochs != 1):
-        raise ValueError('MySQL 首轮验收只允许新运行的 epoch 0')
-    if epoch_start > 0 or os.path.isfile(os.path.join(RUNS_DIR, 'metrics_record.csv')):
+    if mysql_run_id is not None and (
+            SMOKE or not 0 <= epoch_start < num_epochs <= model_registry.target_of(CONFIG_ID)):
+        raise ValueError('MySQL 验收的训练范围超出注册表预算，或使用了冒烟配置')
+    if mysql_run_id is None and (epoch_start > 0 or os.path.isfile(os.path.join(RUNS_DIR, 'metrics_record.csv'))):
         _check_resume_metrics(epoch_start - 1)
     best_val_acc, best_epoch, train_acc_at_best = _restore_best_state(resume_checkpoint, epoch_start)
     # 本次调用的结构和标签固定；动态训练状态仍逐轮记录。
@@ -499,7 +572,8 @@ def train_and_validate(model,
         if sampler_generator is None:
             raise RuntimeError('训练采样器缺少独立 generator，无法应用逐 epoch sampler seed')
         sampler_generator.manual_seed(sampler_seed)
-        logging.info(f'epoch {epoch} sampler_seed={sampler_seed}')
+        logging.info(f'epoch {epoch} sampler_seed={sampler_seed}',
+                     extra={'db_log_type': 'train', 'db_epoch': epoch})
 
         TV__time_spend_start = time.time()
         epoch_start_time = time.time()
@@ -536,7 +610,7 @@ def train_and_validate(model,
                         logging.error(
                             '训练输出含NaN/Inf，停止且不保存本轮：config=%s seed=%s epoch=%d batch=%d AMP_scale=%s',
                             CONFIG_ID, SEED, epoch, batch_index, scaler.get_scale())
-                        raise FloatingPointError('训练输出非有限，已保留上一轮产物并停止')
+                        raise FloatingPointError(f'第 {batch_index + 1} 批训练输出非有限，已保留上一轮产物并停止')
 
                     parent_loss = parent_criterion(parent_output, parent_labels)
                     child_loss = 0
@@ -624,16 +698,16 @@ def train_and_validate(model,
             )
             time_spend = TV__time_spend_end - TV__time_spend_start - sleep
         if mysql_run_id is not None:
-            from mysql_store import write_first_epoch
+            from mysql_store import write_epoch
 
             try:
-                write_first_epoch(mysql_run_id, time_spend_s=time_spend, **metrics)
+                write_epoch(mysql_run_id, database=mysql_database, time_spend_s=time_spend, **metrics)
             except Exception:
                 logging.exception('MySQL 指标保存未确认，本轮断点未保存，停止并核对 run_id=%s epoch=%s',
-                                  mysql_run_id, epoch)
+                                  mysql_run_id, epoch, extra={'db_log_type': 'storage', 'db_epoch': epoch})
                 raise
-            message = f'MySQL 测试库指标已提交：run_id={mysql_run_id} epoch={epoch}'
-            logging.info(message)
+            message = f'MySQL 指标已提交：{mysql_database} run_id={mysql_run_id} epoch={epoch}'
+            logging.info(message, extra={'db_log_type': 'storage', 'db_epoch': epoch})
             print(message)
         elif save_model_indicators:
             try:
@@ -752,7 +826,8 @@ def train_and_validate(model,
                         'sampling_protocol_version': SAMPLING_PROTOCOL_VERSION,
                         'sampler_seed': sampler_seed,
                         'state': state,
-                        **({'mysql_run_id': mysql_run_id} if mysql_run_id is not None else {}),
+                        **({'mysql_run_id': mysql_run_id, 'mysql_database': mysql_database}
+                           if mysql_run_id is not None else {}),
                         **_run_label_metadata},
                        LAST_PTH)
 
@@ -774,7 +849,12 @@ def train_and_validate(model,
 
         # 按temp_guard_lis指定轮次检查温度；当前每轮检查，告警/休眠由守护配置决定。
         if epoch in temp_guard_lis:
-            temp_guard.check_temps_and_rest(tag=f" epoch{epoch}")
+            on_check = None
+            if mysql_run_id is not None and not SMOKE:
+                from mysql_store import write_temperature_log
+
+                on_check = partial(write_temperature_log, database=mysql_database, run_id=mysql_run_id, epoch=epoch)
+            temp_guard.check_temps_and_rest(tag=f" epoch{epoch}", on_check=on_check)
 
         time.sleep(sleep)
         sleep_all_spend += sleep * 2
@@ -843,7 +923,8 @@ def train_and_validate(model,
 
 
 def main(num_epochs, epoch_start=0, checkpoint=None, optimizer_scheduler_YN=False, optimizer=None,
-         register_mysql=False, mysql_first_epoch=False):
+         register_mysql=False, mysql_registration_only=False, mysql_single_epoch=False,
+         mysql_run_id=None, mysql_database=None):
     """
     :param num_epochs: epoch几轮
     :param epoch_start: 从多少轮开始, 默认从0开始时, 不为0时一般是继续训练
@@ -1055,9 +1136,7 @@ def main(num_epochs, epoch_start=0, checkpoint=None, optimizer_scheduler_YN=Fals
                             generator=torch.Generator().manual_seed(SEED)
                             )
 
-    mysql_run_id = None
-    if register_mysql or mysql_first_epoch:
-        from mysql_store import TEST_DATABASE
+    if register_mysql:
         from run_paths import normalization_signature, register_mysql_run
 
         target_epochs = model_registry.target_of(CONFIG_ID)
@@ -1078,14 +1157,14 @@ def main(num_epochs, epoch_start=0, checkpoint=None, optimizer_scheduler_YN=Fals
         }
         snapshot_path = _EntryPath(RUNS_DIR) / 'config.json'
         mysql_run_id = register_mysql_run(
-            snapshot_path, model=model_record, database=TEST_DATABASE,
+            snapshot_path, model=model_record, database=mysql_database,
             run=dict(seed=SEED, training_params=training_params,
                      batch_size=train_loader.batch_size, train_samples=len(train_loader.dataset),
                      val_samples=len(val_loader.dataset),
                      started_at=datetime.now(timezone(timedelta(hours=8))).replace(tzinfo=None)),
         )
-        print(f'MySQL 测试库运行已登记：run_id={mysql_run_id}，配置：{snapshot_path}')
-        if not mysql_first_epoch:
+        print(f'MySQL 运行已登记：{mysql_database} run_id={mysql_run_id}，配置：{snapshot_path}')
+        if mysql_registration_only:
             return
 
     # 调度器
@@ -1121,18 +1200,36 @@ def main(num_epochs, epoch_start=0, checkpoint=None, optimizer_scheduler_YN=Fals
     # train_loader_len = len(train_loader)
     start = time.time()
 
-    epoch, sleep_all_spend = train_and_validate(model,
-                                                train_loader,
-                                                val_loader,
-                                                parent_criterion,
-                                                scheduler,
-                                                1 if mysql_first_epoch else num_epochs,
-                                                epoch_start,
-                                                state=state,
-                                                optimizer=optimizer,
-                                                resume_checkpoint=checkpoint,
-                                                mysql_run_id=mysql_run_id,
-                                                )
+    training_logs = nullcontext()
+    if mysql_run_id is not None:
+        from mysql_store import training_log_context
+
+        training_logs = training_log_context(mysql_run_id, database=mysql_database, smoke=SMOKE)
+    with training_logs:
+        if mysql_run_id is not None:
+            action = '续跑' if checkpoint is not None else '开始训练'
+            logging.info('MySQL %s：%s run_id=%s config=%s seed=%s epoch=%s',
+                         action, mysql_database, mysql_run_id, CONFIG_ID, SEED, epoch_start,
+                         extra={'db_log_type': 'runtime', 'db_epoch': epoch_start})
+        epoch, sleep_all_spend = train_and_validate(
+            model, train_loader, val_loader, parent_criterion, scheduler,
+            epoch_start + 1 if mysql_single_epoch else num_epochs, epoch_start,
+            state=state, optimizer=optimizer, resume_checkpoint=checkpoint,
+            mysql_run_id=mysql_run_id, mysql_database=mysql_database,
+        )
+
+        if mysql_run_id is not None and epoch == model_registry.target_of(CONFIG_ID):
+            from run_paths import finalize_mysql_run
+
+            try:
+                finalize_mysql_run(RUNS_DIR)
+            except Exception:
+                logging.exception('MySQL 训练收尾失败：run_id=%s', mysql_run_id,
+                                  extra={'db_log_type': 'storage', 'db_epoch': epoch - 1})
+                raise
+            message = f'MySQL 收尾完成：{mysql_database} run_id={mysql_run_id}'
+            logging.info(message, extra={'db_log_type': 'storage', 'db_epoch': epoch - 1})
+            print(message)
 
     end = time.time()
 
@@ -1301,7 +1398,13 @@ if __name__ == '__main__':
         _resume_path = LAST_PTH
         if os.path.exists(_resume_path):
             use_old_model = True
-            checkpoint = torch.load(_resume_path, map_location='cpu')
+            checkpoint = (_mysql_resume_checkpoint if _mysql_resume_checkpoint is not None
+                          else torch.load(_resume_path, map_location='cpu'))
+            if _mysql_resume_run_id is not None:
+                required = ('optimizer_state_dict', 'scheduler_state_dict', 'scaler_state_dict')
+                missing = [key for key in required if key not in checkpoint]
+                if missing:
+                    raise ValueError(f'MySQL 续跑断点缺少训练状态：{missing}')
             _check_label_schema(checkpoint, id_to_main_class, renew_class_to_index)
             checkpoint_protocol = checkpoint.get('training_protocol_version', 1)
             if checkpoint_protocol != TRAINING_PROTOCOL_VERSION:
@@ -1385,7 +1488,8 @@ if __name__ == '__main__':
     model = model.to(device)  # 将模型转移到 GPU
     for name, module in model.named_children():
         print(name, " ---> ", type(module))
-    if AUTO or SMOKE or _cli_args.mysql_first_epoch is not None:
+    if (AUTO or SMOKE or _cli_args.mysql_first_epoch is not None
+            or _cli_args.train_mysql is not None or _mysql_resume_run_id is not None):
         num_epochs_user_input = num_epochs
         save_model_after_epoch_flag = False
         save_model_indicators = True
@@ -1451,20 +1555,30 @@ if __name__ == '__main__':
 
     if _cli_args.mysql_first_epoch is not None:
         print(f"MySQL 首轮验收只运行 epoch 0，登记的正式预算为 {num_epochs_user_input} 轮")
+    elif _cli_args.resume_mysql_one_epoch is not None:
+        print(f"MySQL 续跑验收只运行 epoch={epoch_start}，沿用 run_id={_mysql_resume_run_id}")
+    elif _cli_args.resume_mysql is not None:
+        print(f"MySQL 续跑：{_mysql_database} run_id={_mysql_resume_run_id}，从 epoch={epoch_start} 跑至预算 {num_epochs_user_input} 轮")
+    elif _cli_args.train_mysql is not None:
+        print(f"MySQL 新训练：{_mysql_database}，正式预算 {num_epochs_user_input} 轮")
     else:
         print(f"从第{epoch_start}轮继续, 本次目标轮数:{num_epochs_user_input}")
 
     credentials = nullcontext()
-    if _mysql_output is not None:
+    if _mysql_resume_run_id is not None:
+        credentials = _resume_credentials
+    elif _mysql_output is not None:
         from mysql_store import cli_password
         credentials = cli_password()
     with credentials:
         main(num_epochs_user_input, epoch_start, checkpoint=checkpoint,
              optimizer_scheduler_YN=optimizer_scheduler_YN, optimizer=optimizer,
-             register_mysql=_cli_args.register_mysql is not None,
-             mysql_first_epoch=_cli_args.mysql_first_epoch is not None)
+             register_mysql=_mysql_output is not None,
+             mysql_registration_only=_cli_args.register_mysql is not None,
+             mysql_single_epoch=_mysql_single_epoch,
+             mysql_run_id=_mysql_resume_run_id, mysql_database=_mysql_database)
 
-    if _mysql_output is not None:
+    if _mysql_output is not None or _mysql_resume_run_id is not None:
         raise SystemExit(0)
 
     print(f"以{str(datetime.now())}结束", file=fp)

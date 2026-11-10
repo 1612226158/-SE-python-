@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """V3公共结果读取：仅扫描runs下正式run目录，排除_smoke与analyses。
 
-按配置/seed读取当前metrics_record.csv、results与checkpoint路径，校验实验身份。
+按配置/seed读取本地绑定的MySQL指标与结果，历史运行读取CSV与results JSON。
+checkpoint始终留在本地；可通过V3_RESULTS_ROOT指定其他运行目录的上级目录。
 查询不构造模型、不读原图；分析输出仅在显式请求时写runs/analyses。
 例：python chart_data.py summary FullUnfreeze:1
 """
@@ -17,10 +18,11 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _SRC_V3 = os.path.dirname(_HERE)
 if _SRC_V3 not in sys.path:
     sys.path.insert(0, _SRC_V3)
-from run_paths import formal_run_directories, result_path, checkpoint_path, load_config, normalization_signature
+from run_paths import (RUNS_ROOT, checkpoint_path, formal_run_directories, load_config,
+                       normalization_signature, result_path, run_directory)
 import taxonomy as _taxonomy
 import model_registry as _mr
-RUNS = os.path.join(_SRC_V3, 'runs')
+RUNS = os.environ.get('V3_RESULTS_ROOT') or str(RUNS_ROOT)
 
 # 类别数按taxonomy的原始类数和合并规则派生。
 N_CLS_RAW = int(_taxonomy.RAW_CLASS_COUNT)
@@ -77,20 +79,79 @@ def fig_out(fig_type, model_a, model_b, out_dir=None):
 
 # ---------- 基础扫描 ----------
 
-def all_metrics_files():
+def all_metrics_files(*, runs_root=RUNS_ROOT):
     """只读正式run子目录的当前指标，排除归档、_smoke与analyses。"""
     files = []
-    for directory in formal_run_directories(runs_root=RUNS):
+    for directory in formal_run_directories(runs_root=runs_root):
         current = directory / 'metrics_record.csv'
         if current.is_file():
             files.append(str(current))
     return files
 
 
-def _read_all(config_id=None):
+def _mysql_binding(directory, config_id, seed):
+    path = directory / 'config.json'
+    try:
+        with path.open(encoding='utf-8') as f:
+            snapshot = json.load(f)
+    except FileNotFoundError:
+        return None
+    if not isinstance(snapshot, dict):
+        raise ValueError(f'运行配置必须是 JSON 对象：{path}')
+    if 'MYSQL_RUN_ID' not in snapshot and 'MYSQL_DATABASE' not in snapshot:
+        return None
+    run_id = snapshot.get('MYSQL_RUN_ID')
+    database = snapshot.get('MYSQL_DATABASE')
+    if (snapshot.get('CONFIG_ID') != config_id or snapshot.get('SEED') != seed
+            or snapshot.get('SMOKE') or type(run_id) is not int or run_id <= 0
+            or not isinstance(database, str) or not database):
+        raise ValueError(f'MySQL 运行绑定不完整或身份不匹配：{path}')
+    return run_id, database
+
+
+def _read_mysql(config_id, seed, binding):
+    from mysql_store import read_run_results
+
+    run_id, database = binding
+    data = read_run_results(run_id, database=database)
+    run = data['run']
+    if (run['config_id'], run['seed']) != (config_id, seed):
+        raise ValueError(f'MySQL {database} run_id={run_id} 与目录的模型或 seed 不匹配')
+    return data
+
+
+def _read_all(config_id=None, seed=None):
     """读取正式run当前指标，按配置和作废登记过滤；_fidx用于稳定去重。"""
     frames = []
-    for fidx, f in enumerate(all_metrics_files()):
+    mysql_runs = {}
+    bound_dirs = set()
+    for directory in formal_run_directories(runs_root=RUNS):
+        cid, marker, seed_text = directory.name.rpartition('_seed')
+        if not marker or not seed_text.isascii() or not seed_text.isdecimal():
+            continue
+        run_seed = int(seed_text)
+        if seed_text != str(run_seed):
+            continue
+        if (config_id is not None and cid != config_id) or (seed is not None and run_seed != seed):
+            continue
+        binding = _mysql_binding(directory, cid, run_seed)
+        if binding is None:
+            continue
+        data = _read_mysql(cid, run_seed, binding)
+        mysql_runs[cid, run_seed] = data['run'], data['result']
+        bound_dirs.add(str(directory))
+        rows = data['metrics']
+        if rows:
+            df = pd.DataFrame(rows)
+            # 混合历史指标时仍保留 BIGINT UNSIGNED 采样种子的整数精度。
+            df['sampler_seed'] = pd.Series([row['sampler_seed'] for row in rows], dtype=object)
+            df['save_time'] = [str(row['save_time']) if row['save_time'] is not None else None
+                               for row in rows]
+            frames.append(df.assign(config_id=cid, seed=run_seed, _fidx=0))
+
+    for fidx, f in enumerate(all_metrics_files(runs_root=RUNS)):
+        if os.path.dirname(f) in bound_dirs:
+            continue
         try:
             df = pd.read_csv(f)
             df.columns = df.columns.str.strip()
@@ -108,20 +169,25 @@ def _read_all(config_id=None):
                 print(f'[chart_data] 剔除脏记录 {dropped} 行（{tag}: 已知作废 run {sorted(dirty)}）')
         if config_id is not None:
             df = df[df['config_id'] == config_id]
+        if seed is not None:
+            df = df[df['seed'].astype(int) == seed]
+        if mysql_runs and len(df):
+            bound = pd.MultiIndex.from_frame(df[['config_id', 'seed']]).isin(mysql_runs)
+            df = df[~bound]
         if len(df):
             df = df.copy()
             df['_fidx'] = fidx
             frames.append(df)
     if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
+        return pd.DataFrame(), mysql_runs
+    return pd.concat(frames, ignore_index=True), mysql_runs
 
 
 # ---------- 对外 API ----------
 
 def available_models():
     """返回 {config_id: {seed: {'rows': n, 'max_epoch': e}}}：当前有哪些模型、各 seed 记录情况。"""
-    df = _read_all()
+    df, _ = _read_all()
     out = {}
     if df.empty:
         return out
@@ -151,17 +217,13 @@ def load_model(config_id, seed=None, verbose=True):
     - 无数据 → 抛 FileNotFoundError（提示该模型还没跑 / config_id 拼错）。
     """
     config_id = _cid(config_id)   # 当前只传递配置ID，不转换旧名称。
-    df = _read_all(config_id)
+    seed = int(seed) if seed is not None else None
+    df, mysql_runs = _read_all(config_id, seed)
     if df.empty:
-        raise FileNotFoundError(
-            f'[chart_data] 未找到 config={config_id} 的任何记录。可用模型: '
-            f'{", ".join(sorted(available_models())) or "(暂无)"}（检查 runs/ 下 metrics_record*.csv）')
+        identity = config_id if seed is None else f'{config_id} seed={seed}'
+        raise FileNotFoundError(f'[chart_data] {identity} 没有逐轮指标（运行目录：{RUNS}）')
     # seed 归一化
-    if seed is not None:
-        df = df[df['seed'].astype(int) == int(seed)]
-        if df.empty:
-            raise FileNotFoundError(f'[chart_data] {config_id} 没有 seed={seed} 的记录')
-    else:
+    if seed is None:
         # 自动选最完整 seed：行数最多；同数取 max_epoch 大者
         best_seed = None
         best_key = (-1, -1)
@@ -182,6 +244,9 @@ def load_model(config_id, seed=None, verbose=True):
                 'val_weighted_recall', 'lr', 'time_spend_s'):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce')
+    mysql_run = mysql_runs.get((config_id, int(df['seed'].iloc[0])))
+    if mysql_run is not None:
+        df.attrs['mysql_run'] = mysql_run
     return df
 
 
@@ -230,7 +295,16 @@ def _metric_point(df, column, mode='max'):
 
 
 def _result_for_run(config_id, seed):
-    """读取指定 config/seed 的正式 results JSON；未收官或不可读时返回 None。"""
+    """读取指定 config/seed 的 MySQL 结果或历史 results JSON。"""
+    seed = int(seed)
+    directory = run_directory(config_id, seed, runs_root=RUNS)
+    binding = _mysql_binding(directory, config_id, seed)
+    if binding is not None:
+        return _read_mysql(config_id, seed, binding)['result']
+    return _legacy_result_for_run(config_id, seed)
+
+
+def _legacy_result_for_run(config_id, seed):
     path = str(result_path(_cid(config_id), int(seed), runs_root=RUNS))
     if not os.path.exists(path):
         return None
@@ -260,7 +334,7 @@ def summarize_run(config_id, seed=None):
 
     数据仍由 load_model() 负责扫描、合并、去重和排除脏记录。本函数不直接打开
     metrics CSV，只在其规范化结果上计算完整性、best/final、F1、loss、泛化差距和耗时。
-    正式 best 优先采用指定 seed 的 results JSON；未收官时退回当前 metrics 峰值。
+    正式 best 优先采用该运行的数据源所提供的结果；未收官时使用当前指标峰值。
     """
     df = load_model(config_id, seed=seed, verbose=False)
     return _summarize_frame(config_id, df)
@@ -270,9 +344,13 @@ def _summarize_frame(config_id, df):
     """汇总load_model已规范化的逐轮数据，不修改传入数据。"""
     config_id = _cid(config_id)
     selected_seed = int(df['seed'].iloc[0])
-    result = _result_for_run(config_id, selected_seed)
+    mysql_run = df.attrs.get('mysql_run')
+    if mysql_run is None:
+        run, result = {}, _legacy_result_for_run(config_id, selected_seed)
+    else:
+        run, result = mysql_run
     registered_model = bool(_mr.is_known(config_id))
-    target_epochs = int(_mr.target_of(config_id)) if registered_model else None
+    target_epochs = run['target_epochs'] if run else (int(_mr.target_of(config_id)) if registered_model else None)
     source = _mr.long_source_of(config_id, selected_seed) if registered_model else None
 
     epochs = sorted({int(e) for e in df['epoch'].dropna().tolist()})
@@ -285,13 +363,16 @@ def _summarize_frame(config_id, df):
     best_row = df[df['epoch'].astype(int) == best_epoch].iloc[-1]
     final_row = df.iloc[-1]
 
-    official_best = {
-        'value': float(result['best_val_acc']) if result and result.get('best_val_acc') is not None
-                 else metrics_best['value'],
-        'epoch': int(result['best_val_epoch']) if result and result.get('best_val_epoch') is not None
-                 else metrics_best['epoch'],
-        'source': 'results_json' if result else 'metrics',
-    }
+    official_best = dict(metrics_best, source='metrics')
+    if result and result.get('best_val_acc') is not None and result.get('best_val_epoch') is not None:
+        official_best = {
+            'value': float(result['best_val_acc']),
+            'epoch': int(result['best_val_epoch']),
+            'source': 'mysql' if run else 'results_json',
+        }
+    metadata = (dict(run['training_params'], backbone=run['backbone'], num_classes=run['num_classes'],
+                     unfreeze_epochs=run['model_params'].get('unfreeze_epochs'))
+                if run else result or {})
     final_train = _number(final_row, 'train_acc')
     final_val = _number(final_row, 'val_acc')
     best_train = _number(best_row, 'train_acc')
@@ -299,7 +380,7 @@ def _summarize_frame(config_id, df):
     time_values = df.get('time_spend_s')
 
     def protocol_value(key, cast=None):
-        value = result.get(key) if result else None
+        value = metadata.get(key)
         if value is None and key in final_row:
             value = final_row[key]
         try:
@@ -320,10 +401,10 @@ def _summarize_frame(config_id, df):
         **({'long_source': source} if source else {}),
         'registered_model': registered_model,
         'status': 'finished' if result else 'incomplete',
-        'results_json': bool(result),
-        'backbone': result.get('backbone') if result else None,
-        'unfreeze_epochs': result.get('unfreeze_epochs') if result else None,
-        'experiment_signature': result.get('experiment_signature') if result else None,
+        'results_json': mysql_run is None and bool(result),
+        'backbone': metadata.get('backbone'),
+        'unfreeze_epochs': metadata.get('unfreeze_epochs'),
+        'experiment_signature': metadata.get('experiment_signature'),
         'epochs': {
             'rows': int(len(df)),
             'first': min_epoch,
@@ -549,17 +630,18 @@ def results_best(config_id, seed=None):
     """返回正式结果(best_acc, epoch, seed)，显式seed不回退其他运行。"""
     config_id = _cid(config_id)
     if seed is not None:
-        result = _result_for_run(config_id, seed)
-        return ((float(result['best_val_acc']), int(result['best_val_epoch']), int(seed))
-                if result else (None, None, None))
-    candidates = []
-    for directory in formal_run_directories(runs_root=RUNS):
+        seeds = [int(seed)]
+    else:
         prefix = config_id + '_seed'
-        if not directory.name.startswith(prefix):
-            continue
-        selected_seed = int(directory.name[len(prefix):])
+        seeds = []
+        for directory in formal_run_directories(runs_root=RUNS):
+            suffix = directory.name[len(prefix):]
+            if directory.name.startswith(prefix) and suffix.isascii() and suffix.isdecimal():
+                seeds.append(int(suffix))
+    candidates = []
+    for selected_seed in seeds:
         result = _result_for_run(config_id, selected_seed)
-        if result:
+        if result and result.get('best_val_acc') is not None and result.get('best_val_epoch') is not None:
             candidates.append((float(result['best_val_acc']), int(result['best_val_epoch']), selected_seed))
     return max(candidates, key=lambda value: value[0]) if candidates else (None, None, None)
 
@@ -585,7 +667,7 @@ def load_run_frames(config_ids, seeds=(1, 2), require_complete=True):
             summary = _summarize_frame(key[0], frame)
             if require_complete:
                 epochs = summary['epochs']
-                if (not summary['results_json'] or not epochs['continuous_from_zero']
+                if (summary['status'] != 'finished' or not epochs['continuous_from_zero']
                         or epochs['rows'] != epochs['target']
                         or epochs['last'] != epochs['target'] - 1):
                     raise ValueError(f'Incomplete run: {key}')

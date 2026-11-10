@@ -12,6 +12,7 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 _source_dir = Path(__file__).resolve().parent
 # 脚本入口和注册表查询共用同一份Long声明。
@@ -43,6 +44,7 @@ PROJECT_ROOT = os.path.dirname(SRC_DIR)
 CURRENT_LABEL_MAPPING_HASH = None
 _queue_config = None
 _logger = logging.getLogger('src_v3.run_queue')
+_LOCAL_LOG_ONLY = object()
 
 # 执行队列：每行是 (模型配置名, seed)，严格按列表顺序运行。
 # 未注释的行才执行；结构在model_registry.py定义，不自动展开模型或seed。
@@ -254,28 +256,40 @@ def _result_record(config_id, seed, target_epoch, config=None):
     return result
 
 
-def log(msg, level=logging.INFO):
+def log(msg, level=logging.INFO, *, db_run=_LOCAL_LOG_ONLY, exc_info=False):
     line = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}"
     print(line, flush=True)
-    _logger.log(level, msg)
+    extra = None
+    if db_run is None:
+        extra = {'db_log_type': 'queue', 'db_run_id': None}
+    elif db_run is not _LOCAL_LOG_ONLY:
+        database, run_id = db_run
+        extra = {'db_log_type': 'queue', 'db_run_id': run_id, 'db_database': database}
+    _logger.log(level, msg, extra=extra, exc_info=exc_info)
 
 
-def _preflight():
+def _preflight(*, mysql=False):
     """检查配置和显式队列，报告标签协议及已有产物。"""
     global _queue_config
     try:
         _queue_config = load_config(CONFIG)
-        for config_id in LONG_CONFIGS:
-            long_entry(config_id)
+        if not mysql:
+            for config_id in LONG_CONFIGS:
+                long_entry(config_id)
         if len(QUEUE) != len(set(QUEUE)):
             raise ValueError('QUEUE存在重复的(模型名, seed)任务')
         for config_id, seed in QUEUE:
-            model_registry.config_for_run(config_id, seed)
+            config = model_registry.config_for_run(config_id, seed)
+            if mysql and config.get('LONG_SOURCE'):
+                raise ValueError(f'MySQL 队列暂不支持 Long：{config_id}')
     except (OSError, ValueError, KeyError, TypeError) as error:
         log(f'✖ 队列/配置校验失败：{error}', logging.ERROR)
         return False
     log(f"✔ 标签协议：{LABEL_SCHEMA_ID} v{LABEL_SCHEMA_VERSION} / "
         f"{EXPECTED_NUM_CLASSES}类 / hash={CURRENT_LABEL_MAPPING_HASH}")
+
+    if mysql:
+        return True
 
     # 现场报告（不阻断，仅提示）：确认旧协议产物确已移出 runs\ 根目录
     n_res = len(glob.glob(os.path.join(RUNS, "*", "results_*.json")))
@@ -453,12 +467,108 @@ def _process(config_id, seed):
     return "failed"
 
 
+def _mysql_action(config_id, seed, directory, *, database):
+    from mysql_store import has_run
+    from run_paths import inspect_mysql_run
+
+    if not directory.exists() and not directory.is_symlink():
+        if has_run(config_id, seed, database=database):
+            raise CompletionCheckError(f'{database} 已有有效运行，当前输出根目录缺少本地绑定')
+        return 'new', _LOCAL_LOG_ONLY
+    config, _, run_id, action = inspect_mysql_run(directory)
+    if (config['CONFIG_ID'] != config_id or config['SEED'] != seed
+            or normalization_signature(config) != normalization_signature(_queue_config)):
+        raise CompletionCheckError('本地绑定的模型、seed 或归一化配置与队列不一致')
+    return action, (config['MYSQL_DATABASE'], run_id)
+
+
+def _new_run_binding_for_stop(config_id, seed, directory):
+    """Check a new task's binding even if the child failed before saving a checkpoint."""
+    from mysql_store import MySQLError, read_run_progress
+    from run_paths import load_mysql_binding
+
+    try:
+        config, run_id = load_mysql_binding(directory)
+        signature = normalization_signature(_queue_config)
+        if (config['CONFIG_ID'], config['SEED'], normalization_signature(config)) != (config_id, seed, signature):
+            return _LOCAL_LOG_ONLY
+        database = config['MYSQL_DATABASE']
+        rows = read_run_progress(run_id, database=database)
+    except (OSError, ValueError, KeyError, RuntimeError, MySQLError):
+        return _LOCAL_LOG_ONLY
+    if rows:
+        run = rows[0]
+        if (run['config_id'], run['seed'], run['is_valid'], run['parent_run_id'],
+                run['normalization_signature']) == (config_id, seed, 1, None, signature):
+            return database, run_id
+    return _LOCAL_LOG_ONLY
+
+
+def _run_mysql_once(action, config_id, seed, output_root, directory, *, database):
+    environment = os.environ.copy()
+    if action == 'new':
+        from mysql_store import TRAINING_DATABASE_ENV
+
+        environment[TRAINING_DATABASE_ENV] = database
+        config = model_registry.config_for_run(config_id, seed)
+        config['NORMALIZATION'] = _queue_config['NORMALIZATION']
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'config.json'
+            path.write_text(json.dumps(config, ensure_ascii=False), encoding='utf-8')
+            environment['V3_CONFIG_FILE'] = str(path)
+            return subprocess.run([PYTHON, TRAIN, '--train-mysql', str(output_root)],
+                                  cwd=SRC_DIR, env=environment).returncode
+    mode = '--resume-mysql' if action == 'resume' else '--finalize-mysql-run'
+    return subprocess.run([PYTHON, TRAIN, mode, str(directory)],
+                          cwd=SRC_DIR, env=environment).returncode
+
+
+def process_mysql(config_id, seed, output_root, *, database):
+    from mysql_store import cli_password, MySQLError
+
+    binding = _LOCAL_LOG_ONLY
+    try:
+        directory = run_directory(config_id, seed, runs_root=output_root)
+        with cli_password():
+            action, binding = _mysql_action(config_id, seed, directory, database=database)
+            if action == 'done':
+                log(f"跳过已完成 {config_id} seed{seed}", db_run=binding)
+                return 'done'
+            label = {'new': '新建训练', 'resume': '沿用原编号续跑', 'finalize': '补做收尾'}[action]
+            log(f"▶ {label} {config_id} seed{seed}", db_run=binding)
+            rc = _run_mysql_once(action, config_id, seed, output_root, directory, database=database)
+            if rc != 0:
+                if binding is _LOCAL_LOG_ONLY:
+                    binding = _new_run_binding_for_stop(config_id, seed, directory)
+                log(f"✖ MySQL 队列停止：{config_id} seed{seed}：训练进程退出码 {rc}，保留现场",
+                    logging.ERROR, db_run=binding)
+                return 'failed'
+            action, binding = _mysql_action(config_id, seed, directory, database=database)
+            if action != 'done':
+                raise CompletionCheckError('子进程退出后，MySQL 完成状态仍未确认')
+            log(f"完成 {config_id} seed{seed}", db_run=binding)
+        return 'done'
+    except (OSError, ValueError, KeyError, RuntimeError, MySQLError) as error:
+        log(f"✖ MySQL 队列停止：{config_id} seed{seed}：{error}", logging.ERROR,
+            db_run=binding, exc_info=isinstance(error, (OSError, MySQLError)))
+        return 'failed'
+
+
 def main():
     args = handle_cli('queue', queue_tasks=QUEUE)
     if args.check or args.list:
         return 0
 
-    log_path = os.path.join(RUNS, '_smoke', 'queue_log.txt') if args.smoke else LOG
+    if args.mysql_output is not None:
+        from mysql_store import DATABASE, TEST_DATABASE, queue_log_context, training_database
+
+        use_standard_root = args.mysql_output == Path(RUNS)
+        database = training_database(default=DATABASE if use_standard_root else TEST_DATABASE)
+        if use_standard_root and database != DATABASE:
+            raise SystemExit('测试库队列请通过 --mysql 指定 runs 以外的独立输出目录')
+        log_path = args.mysql_output / 'queue_log.txt'
+    else:
+        log_path = os.path.join(RUNS, '_smoke', 'queue_log.txt') if args.smoke else LOG
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
     _logger.setLevel(logging.INFO)
     _logger.propagate = False
@@ -467,10 +577,19 @@ def main():
         '%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
     _logger.addHandler(handler)
 
+    if args.mysql_output is not None:
+        with queue_log_context(_logger, database=database):
+            return _run_queue(args, database=database)
+    return _run_queue(args)
+
+
+def _run_queue(args, *, database=None):
     print("提示：盘温采样可单独运行 disk_temp_sampler.py。")
     _label_fields()
-    if not _preflight():
+    if not _preflight(mysql=args.mysql_output is not None):
         return 1
+    if args.mysql_output is not None:
+        log(f'MySQL 队列启动（新运行目标库 {database}，{len(QUEUE)} 个任务）', db_run=None)
     log("=" * 60)
     log("V3首批NoTF配对队列：")
     if args.smoke:
@@ -488,6 +607,8 @@ def main():
             st = 'done' if rc == 0 else 'failed'
             log(f'冒烟 {config_id} seed{seed} 退出码 {rc}',
                 logging.INFO if rc == 0 else logging.ERROR)
+        elif args.mysql_output is not None:
+            st = process_mysql(config_id, seed, args.mysql_output, database=database)
         else:
             st = process(config_id, seed)
         if st == "done":
@@ -501,7 +622,7 @@ def main():
                 )
         else:  # failed
             return 1
-    log("队列全部完成")
+    log("队列全部完成", db_run=None if args.mysql_output is not None else _LOCAL_LOG_ONLY)
     return 0
 
 
