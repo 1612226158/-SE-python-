@@ -11,13 +11,47 @@ else:
     from run_paths import PROJECT_ROOT, RUNS_ROOT, load_config, run_directory
 
 
+def mysql_verification_input():
+    config = load_config()
+    config_id = config['CONFIG_ID']
+    if config.get('SMOKE') or config.get('LONG_SOURCE'):
+        raise ValueError('MySQL 首轮联机验证请选用普通正式训练配置')
+    params = registry.params_of(config_id)
+    return {
+        'model': {
+            'config_id': config_id,
+            'backbone': params['backbone'],
+            'model_params': params,
+            'target_epochs': registry.target_of(config_id),
+        },
+        'seed': config['SEED'],
+        'training_params': {
+            'training_policy': registry.training_policy_of(config_id),
+            'normalization': config['NORMALIZATION'],
+            'purpose': '数据库读写验证',
+        },
+    }
+
+
 def handle_cli(kind, queue_tasks=None):
     parser = argparse.ArgumentParser(description=f'V3 {kind}：默认运行；--check只检查，不训练')
     parser.add_argument('--check', action='store_true', help='只读核对配置、路径、依赖及任务，不读图片')
     parser.add_argument('--list', action='store_true', help='列出当前注册的实验')
+    if kind == 'train':
+        parser.add_argument('--verify-mysql', action='store_true',
+                            help='用当前注册配置验证测试库读写，不启动训练')
+        parser.add_argument('--register-mysql', metavar='输出根目录',
+                            help='准备新的普通训练，在测试库登记并绑定 config.json 后退出')
+        parser.add_argument('--mysql-first-epoch', metavar='输出根目录',
+                            help='登记新运行，训练并向测试库提交 epoch 0 后退出')
     if kind == 'queue':
         parser.add_argument('--smoke', action='store_true', help='队列各任务固定3轮冒烟，写入runs/_smoke')
     args = parser.parse_args()
+    if kind == 'train':
+        mysql_modes = [args.verify_mysql, args.register_mysql is not None,
+                       args.mysql_first_epoch is not None]
+        if sum(mysql_modes) > 1 or (any(mysql_modes) and (args.check or args.list)):
+            parser.error('MySQL 模式请单独使用')
     if kind == 'queue' and queue_tasks is None:
         raise ValueError('队列入口必须传入run_queue.QUEUE中的显式任务')
     if args.list:

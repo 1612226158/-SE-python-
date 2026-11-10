@@ -3,6 +3,7 @@ from pathlib import Path
 import hashlib
 import json
 import os
+from tempfile import NamedTemporaryFile
 import time
 
 if __package__:
@@ -75,9 +76,10 @@ def formal_run_directories(runs_root=None):
                   and not path.name.startswith('.'))
 
 
-def configure_process(config=None):
+def configure_process(config=None, *, runs_root=None):
     config = dict(config or load_config())
-    directory = run_directory(config['CONFIG_ID'], config['SEED'], config.get('SMOKE', False))
+    directory = run_directory(config['CONFIG_ID'], config['SEED'], config.get('SMOKE', False),
+                              runs_root=runs_root)
     if config.get('SMOKE', False):
         directory = directory.with_name(directory.name + '_' + str(time.time_ns()))
     elif config.get('RESUME', False):
@@ -86,7 +88,7 @@ def configure_process(config=None):
             raise FileNotFoundError(f'要求续跑但缺少last断点：{last}；不能回退为新训练')
     elif not config.get('RESUME', False) and directory.exists() and any(directory.iterdir()):
         raise FileExistsError(f'已有运行产物：{directory}；请选择续跑，不能静默覆盖')
-    directory.mkdir(parents=True, exist_ok=True)
+    directory.mkdir(parents=True, exist_ok=runs_root is None)
     os.environ['V3_RUN_DIR'] = str(directory)
     os.environ['V3_NORMALIZATION_SIGNATURE'] = normalization_signature(config)
     snapshot = dict(config, RUN_DIRECTORY=str(directory))
@@ -94,3 +96,39 @@ def configure_process(config=None):
     if not config.get('RESUME', False) or not snapshot_path.exists():
         snapshot_path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
     return directory
+
+
+def register_mysql_run(snapshot_path, *, model, run, database):
+    """Register a fresh run and bind its committed database identity to config.json."""
+    if __package__:
+        from .mysql_store import register_new_run
+    else:
+        from mysql_store import register_new_run
+
+    path = Path(snapshot_path)
+    snapshot = json.loads(path.read_text(encoding='utf-8'))
+    if snapshot.get('SMOKE') or snapshot.get('RESUME') or snapshot.get('LONG_SOURCE'):
+        raise ValueError('当前仅登记新的普通正式运行')
+    if 'MYSQL_RUN_ID' in snapshot or 'MYSQL_DATABASE' in snapshot:
+        raise ValueError(f'运行配置已有 MySQL 绑定：{path}')
+    if (snapshot['CONFIG_ID'] != model['config_id'] or snapshot['SEED'] != run['seed']
+            or snapshot.get('MAX_EPOCHS', model['target_epochs']) != model['target_epochs']):
+        raise ValueError(f'运行配置与待登记的模型、种子或预算不一致：{path}')
+    run_id = register_new_run(model=model, run=run, database=database)
+    snapshot.update(MYSQL_RUN_ID=run_id, MYSQL_DATABASE=database)
+    temporary = None
+    try:
+        with NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent,
+                                prefix='.config-', suffix='.tmp', delete=False) as handle:
+            temporary = Path(handle.name)
+            json.dump(snapshot, handle, ensure_ascii=False, indent=2)
+            handle.write('\n')
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+    except OSError as error:
+        raise RuntimeError(f'MySQL 已登记 run_id={run_id}，但无法绑定 {path}，请先核对该运行') from error
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return run_id
